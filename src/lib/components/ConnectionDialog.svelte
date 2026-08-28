@@ -469,8 +469,8 @@
                 placeholder="export TERM=xterm-256color&#10;cd ~/project"
                 autocomplete="off"
                 autocapitalize="none"
-                autocorrect="off"
                 spellcheck="false"
+                {...{ autocorrect: "off" }}
               ></textarea>
             </div>
           </div>
