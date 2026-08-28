@@ -51,8 +51,8 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        CFBundleShortVersionString: 1.7.3
-        CFBundleVersion: "1007003"
+        CFBundleShortVersionString: 1.7.4
+        CFBundleVersion: "1007004"
         NSLocalNetworkUsageDescription: RedTerm uses the local network to connect to SSH servers you select.
         NSMicrophoneUsageDescription: Voice input requires microphone access.
         NSSpeechRecognitionUsageDescription: Voice input requires speech recognition.

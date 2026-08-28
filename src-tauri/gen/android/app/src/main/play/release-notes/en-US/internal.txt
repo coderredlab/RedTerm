@@ -1,4 +1,4 @@
-v1.7.3
-- Store saved passwords with connection-bound Android Keystore protection
-- Harden terminal paste, SSH output, and session shutdown behavior
-- Isolate clipboard image reading for safer Android content access
+v1.7.4
+- Keep saved passwords inside native credential storage during SSH connections
+- Bind imported SSH keys and host-key approvals to verified connection targets
+- Harden terminal links, automatic responses, and high-rate SSH output handling
