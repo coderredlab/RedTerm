@@ -42,6 +42,8 @@
   let downloads = $state<Record<string, { transferred: number; total: number | null }>>({});
 
   const canBrowse = $derived(kind === "local" || Boolean(sessionId));
+  // Local browsing is scoped to home: no navigation above it.
+  const atLocalHome = $derived(kind === "local" && homePath !== null && path === homePath);
 
   $effect(() => {
     let unlisten: (() => void) | null = null;
@@ -114,8 +116,14 @@
       await navigate(homePath);
     } catch (error) {
       if (token !== loadToken) return;
-      homePath = "/";
-      await navigate("/");
+      if (kind === "local") {
+        homePath = null;
+        loading = false;
+        errorMessage = "Home directory could not be resolved.";
+      } else {
+        homePath = "/";
+        await navigate("/");
+      }
     }
   }
 
@@ -199,15 +207,17 @@
       class="path-btn"
       title="Parent directory"
       aria-label="Parent directory"
-      disabled={loading || isRootPath(path)}
+      disabled={loading || isRootPath(path) || atLocalHome}
       onclick={() => void navigate(parentPath(path))}
     >↑</button>
     <div class="path-breadcrumbs">
       {#each breadcrumbSegments(path) as segment (segment.path)}
-        <button
-          class="path-segment"
-          onclick={() => void navigate(segment.path)}
-        >{segment.label}</button>
+        {#if kind !== "local" || homePath === null || segment.path === homePath || segment.path.startsWith(`${homePath}/`)}
+          <button
+            class="path-segment"
+            onclick={() => void navigate(segment.path)}
+          >{segment.label}</button>
+        {/if}
       {/each}
     </div>
     <button

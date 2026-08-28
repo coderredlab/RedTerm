@@ -929,7 +929,7 @@ pub async fn set_keyboard_visible(app: AppHandle, visible: bool) -> Result<(), S
 }
 
 const MAX_SFTP_PREVIEW_READ_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_SFTP_PREVIEW_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+pub(crate) const MAX_SFTP_PREVIEW_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Throttled progress emitter: reports at most ~1 MiB granularity plus the
 /// final chunk so progress bars always complete.
@@ -1170,7 +1170,8 @@ pub(crate) fn sanitize_file_name(file_name: &str) -> String {
 }
 
 /// Collision-safe destination candidates: the plain name first, then
-/// "name (1)", "name (2)", … and finally a uuid fallback that always wins.
+/// "name (1)", "name (2)", … — claim_download_destination stops at the
+/// first free name and errors out after the retry budget is exhausted.
 pub(crate) fn unique_download_candidates(
     dir: &Path,
     file_name: &str,

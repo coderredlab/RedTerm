@@ -34,7 +34,9 @@ export function breadcrumbSegments(
   if (drive) {
     let accumulated = "";
     for (const part of current.split("/").filter(Boolean)) {
-      accumulated = accumulated ? `${accumulated}/${part}` : `${part}/`;
+      accumulated = accumulated
+        ? `${accumulated.replace(/\/+$/, "")}/${part}`
+        : `${part}/`;
       segments.push({ label: part, path: accumulated });
     }
     if (segments.length === 0) {

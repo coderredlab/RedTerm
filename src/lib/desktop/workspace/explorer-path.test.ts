@@ -13,14 +13,14 @@ describe("explorer path helpers", () => {
     expect(parentPath("/")).toBe("/");
     expect(parentPath("/home")).toBe("/");
     expect(parentPath("/home/coderred")).toBe("/home");
-    expect(parentPath("/home/coderred/")).toBe("/home/coderred");
+    expect(parentPath("/home/coderred/")).toBe("/home");
   });
 
   test("parentPath roots Windows drives at the drive root", () => {
     expect(parentPath("C:/")).toBe("C:/");
     expect(parentPath("C:/Users")).toBe("C:/");
     expect(parentPath("C:/Users/coderred")).toBe("C:/Users");
-    expect(parentPath("D:/projects/app/")).toBe("D:/projects/app");
+    expect(parentPath("D:/projects/app/")).toBe("D:/projects");
   });
 
   test("isRootPath detects POSIX and drive roots", () => {

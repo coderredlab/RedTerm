@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 
 use super::ssh_commands::{
     claim_download_destination, ensure_local_sftp_preview_dir, make_download_progress_emitter,
-    sanitize_file_name, SftpDownloadedFile, SftpFileContent,
+    sanitize_file_name, SftpDownloadedFile, SftpFileContent, MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
 };
 use crate::ssh::SftpDirEntry;
 
@@ -199,8 +199,8 @@ fn normalize_local_path_text(text: &str) -> String {
 fn ensure_within_home(path: &Path) -> Result<std::path::PathBuf, String> {
     let home = local_home_dir_path().ok_or("Home directory not found")?;
     let canonical_home = std::fs::canonicalize(&home)
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| home.to_string_lossy().replace('\\', "/"));
+        .map(|path| std::path::PathBuf::from(normalize_local_path_text(&path.to_string_lossy())))
+        .unwrap_or_else(|_| home.clone());
     let canonical = std::fs::canonicalize(path)
         .map(|path| std::path::PathBuf::from(normalize_local_path_text(&path.to_string_lossy())))
         .unwrap_or_else(|_| path.to_path_buf());
@@ -409,14 +409,14 @@ pub async fn local_download_file(
         uuid::Uuid::new_v4(),
         sanitize_file_name(&file_name)
     ));
-    let scoped_label = scoped.to_string_lossy().to_string();
+    let scoped_label = path.clone();
 
     let downloaded = local_download(
         &app,
         scoped.clone(),
         part_path.clone(),
         scoped_label,
-        u64::MAX,
+        MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
     )
     .await?;
     if let Err(error) = tokio::fs::rename(&part_path, &destination).await {
@@ -456,7 +456,7 @@ pub async fn local_download_to_dir(
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "download".to_string());
     let destination = claim_download_destination(&downloads_dir, &sanitize_file_name(&file_name))?;
-    let scoped_label = scoped.to_string_lossy().to_string();
+    let scoped_label = path.clone();
 
     local_download(&app, scoped, destination, scoped_label, u64::MAX).await
 }
