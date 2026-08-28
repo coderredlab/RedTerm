@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ssh-upload-clipboard-image-from-local-path"
+description = "Enables the ssh_upload_clipboard_image_from_local_path command without any pre-configured scope."
+commands.allow = ["ssh_upload_clipboard_image_from_local_path"]
+
+[[permission]]
+identifier = "deny-ssh-upload-clipboard-image-from-local-path"
+description = "Denies the ssh_upload_clipboard_image_from_local_path command without any pre-configured scope."
+commands.deny = ["ssh_upload_clipboard_image_from_local_path"]

@@ -1,0 +1,37 @@
+fn main() {
+    tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
+        tauri_build::AppManifest::new().commands(&[
+            "get_runtime_instance_id",
+            "check_voice_input_permissions",
+            "request_voice_input_permissions",
+            "list_voice_input_languages",
+            "start_voice_input",
+            "stop_voice_input",
+            "cancel_voice_input",
+            "ssh_connect",
+            "ssh_write",
+            "ssh_resize",
+            "ssh_disconnect",
+            "ssh_get_session_output",
+            "ssh_get_session_snapshot",
+            "ssh_session_exists",
+            "ssh_store_session_snapshot",
+            "ssh_upload_clipboard_image",
+            "ssh_upload_clipboard_image_from_local_path",
+            "read_clipboard_image",
+            "set_keyboard_visible",
+            "set_keep_screen_on",
+            "load_connections",
+            "ssh_check_host_key",
+            "save_connection",
+            "delete_uploaded_ssh_key",
+            "delete_connection",
+            "ssh_trust_host_key",
+            "list_known_hosts",
+            "delete_known_host",
+            "get_decrypted_password",
+            "upload_ssh_key",
+        ]),
+    ))
+    .expect("failed to build Tauri application");
+}

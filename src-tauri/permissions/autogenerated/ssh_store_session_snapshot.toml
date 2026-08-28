@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ssh-store-session-snapshot"
+description = "Enables the ssh_store_session_snapshot command without any pre-configured scope."
+commands.allow = ["ssh_store_session_snapshot"]
+
+[[permission]]
+identifier = "deny-ssh-store-session-snapshot"
+description = "Denies the ssh_store_session_snapshot command without any pre-configured scope."
+commands.deny = ["ssh_store_session_snapshot"]

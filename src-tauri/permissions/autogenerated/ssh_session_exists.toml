@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ssh-session-exists"
+description = "Enables the ssh_session_exists command without any pre-configured scope."
+commands.allow = ["ssh_session_exists"]
+
+[[permission]]
+identifier = "deny-ssh-session-exists"
+description = "Denies the ssh_session_exists command without any pre-configured scope."
+commands.deny = ["ssh_session_exists"]

@@ -1,0 +1,58 @@
+RedTerm is a mobile-first SSH terminal for Android, built for developers, system administrators, Raspberry Pi users, home lab operators, and anyone who needs reliable remote shell access from a phone or tablet.
+
+RedTerm focuses on practical terminal work: connect quickly, type comfortably on mobile, keep sessions available while switching apps, and move text or images between Android and your remote server with less friction.
+
+Key features:
+
+- SSH access to Linux servers, cloud instances, Raspberry Pi devices, home lab machines, and network equipment
+- Password and private key authentication
+- Saved connections for quick reconnect
+- Multiple terminal tabs for working with more than one SSH session
+- Passwords stored in platform-protected credential storage
+- Mobile-optimized terminal input with extra keys for common shell actions
+- Built-in voice input for dictating text before sending it to the active SSH session
+- Expect/Send startup scripts that wait for a chosen prompt or login marker before sending setup commands
+- Clipboard image upload to the remote server through SFTP
+- Inline terminal image support for Kitty and iTerm2-compatible image protocols
+- Background session persistence with foreground service notification
+- Auto-reconnect when returning from other apps
+- PTY resize support for correct terminal layout
+- Nerd Font and Powerline-style terminal output support
+- Lightweight interface focused on speed and usability
+
+Mobile-first SSH workflow
+
+RedTerm is designed around Android first. The interface is optimized for touch keyboards, small screens, tablets, viewport changes, and terminal extra keys. It is not a desktop terminal squeezed into a phone screen.
+
+The extra key bar helps with common terminal actions such as Escape, Tab, Ctrl, Alt, arrow keys, Page Up, Page Down, Home, End, Delete, Insert, Enter, Backspace, image upload, keyboard toggle, and microphone voice input.
+
+Voice input
+
+RedTerm includes app-native voice input on Android. Recognized text is shown inside the app first, so you can review it before sending it to the SSH session. This helps when typing long commands, notes, prompts, or repeated text on a mobile keyboard would be slow.
+
+Expect/Send startup scripts
+
+Startup scripts help prepare your remote shell after connecting. You can choose an Expect text, such as a visible shell prompt or login marker, and RedTerm sends your configured Send commands only after that text appears in terminal output.
+
+Use this for environment setup, terminal image protocol settings, project startup commands, or other repeated connection setup steps.
+
+Terminal images and clipboard uploads
+
+RedTerm supports image-focused SSH workflows. You can upload an Android clipboard image to the remote server through SFTP, then use terminal tools that output images through Kitty or iTerm2-compatible image protocols.
+
+This is useful for remote screenshots, generated images, previews, captures, diagrams, and command-line tools that display visual output directly in the terminal.
+
+Session behavior
+
+RedTerm is built for real mobile usage. Sessions can remain available while the app moves between foreground and background, and reconnect behavior helps when returning from other apps or after temporary interruption.
+
+Security and storage
+
+- Connection data is stored locally on your device
+- Saved passwords are protected by Android Keystore-backed credential storage
+- SSH traffic goes directly to the server you choose
+- Private keys are used locally for SSH authentication
+
+Use RedTerm for checking logs, restarting services, editing configs, managing Raspberry Pi devices, working with cloud servers, uploading screenshots to a server, testing terminal image output, using voice input for longer text, or running quick commands while away from your desk.
+
+RedTerm keeps the interface focused so you can get into a shell, do the work, and move on.

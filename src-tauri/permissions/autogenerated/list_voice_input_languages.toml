@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-voice-input-languages"
+description = "Enables the list_voice_input_languages command without any pre-configured scope."
+commands.allow = ["list_voice_input_languages"]
+
+[[permission]]
+identifier = "deny-list-voice-input-languages"
+description = "Denies the list_voice_input_languages command without any pre-configured scope."
+commands.deny = ["list_voice_input_languages"]

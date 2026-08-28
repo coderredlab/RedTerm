@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "RedTerm Desktop",
+  "identifier": "com.coderred.redterm.desktop",
+  "build": {
+    "beforeDevCommand": "bun run dev:desktop",
+    "beforeBuildCommand": "bun run build:desktop"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "RedTerm Desktop",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true
+      }
+    ]
+  }
+}

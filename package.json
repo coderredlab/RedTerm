@@ -1,0 +1,40 @@
+{
+  "name": "redterm",
+  "version": "1.7.3",
+  "description": "A cross-platform SSH terminal built with Tauri, Svelte, and Rust",
+  "repository": "https://github.com/coderredlab/RedTerm",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "dev:desktop": "VITE_REDTERM_TARGET=desktop vite dev",
+    "build:desktop": "VITE_REDTERM_TARGET=desktop vite build",
+    "preview": "vite preview",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev --config src-tauri/tauri.desktop.conf.json",
+    "desktop:build": "tauri build --config src-tauri/tauri.desktop.conf.json",
+    "tauri:android:dev": "tauri android build --debug --target aarch64",
+    "android:build": "tauri android build --target aarch64",
+    "android:bundle:release": "tauri android build --aab --target aarch64"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-opener": "^2.5.4"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.70.3",
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
+    "@tauri-apps/cli": "^2.11.4",
+    "svelte": "^5.56.10",
+    "svelte-check": "^4.7.6",
+    "typescript": "~5.6.3",
+    "vite": "^8.2.2"
+  },
+  "overrides": {
+    "cookie": "0.7.2"
+  }
+}

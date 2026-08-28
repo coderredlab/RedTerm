@@ -1,0 +1,50 @@
+/* RedTerm Theme - CSS Variables */
+
+/* Sarasa Term K Nerd Font */
+@font-face {
+  font-family: "Sarasa Term K Nerd";
+  src: url("/fonts/sarasa-term-k-regular-nerd-font.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  /* Background colors */
+  --bg-primary: #1a0f0f;
+  --bg-secondary: #2d1515;
+  --bg-tertiary: #3d2020;
+  --bg-hover: #4a2525;
+
+  /* Text colors */
+  --text-primary: #e8d4d4;
+  --text-secondary: #c4a8a8;
+  --text-muted: #8a6060;
+
+  /* Accent colors */
+  --accent-primary: #ff6b6b;
+  --accent-hover: #ff8585;
+  --accent-muted: #cc5555;
+
+  /* Status colors */
+  --status-success: #98c379;
+  --status-warning: #e5c07b;
+  --status-error: #f38ba8;
+
+  /* Border colors */
+  --border-primary: #2d1515;
+  --border-secondary: #3d2020;
+
+  /* Terminal specific */
+  --terminal-bg: #1a0f0f;
+  --terminal-fg: #e8d4d4;
+  --terminal-cursor: #ff6b6b;
+  --terminal-selection: #4a2525;
+}
+
+/* Light theme (future use) */
+/* :root[data-theme="light"] {
+  --bg-primary: #faf5f5;
+  --bg-secondary: #f0e8e8;
+  ...
+} */

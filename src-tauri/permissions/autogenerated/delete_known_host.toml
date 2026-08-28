@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-known-host"
+description = "Enables the delete_known_host command without any pre-configured scope."
+commands.allow = ["delete_known_host"]
+
+[[permission]]
+identifier = "deny-delete-known-host"
+description = "Denies the delete_known_host command without any pre-configured scope."
+commands.deny = ["delete_known_host"]

@@ -1,0 +1,26 @@
+RedTerm includes or redistributes the following third-party materials.
+
+1. Tauri Android API sources
+
+Path:
+  src-tauri/plugins/tauri-plugin-redterm-android-paste/android/.tauri/tauri-api/
+
+Copyright (c) 2017 - Present Tauri Apps Contributors.
+Licensed under the MIT License. A copy is available at:
+  src-tauri/plugins/tauri-plugin-redterm-android-paste/android/.tauri/tauri-api/LICENSE-MIT
+
+Upstream project:
+  https://github.com/tauri-apps/tauri
+
+2. Sarasa Term K Nerd Font
+
+Path:
+  static/fonts/sarasa-term-k-regular-nerd-font.ttf
+
+The font is derived from Sarasa Gothic and its upstream font components.
+It is distributed under the SIL Open Font License, Version 1.1.
+Copyright and license details are available at:
+  static/fonts/OFL.txt
+
+Upstream project:
+  https://github.com/be5invis/Sarasa-Gothic

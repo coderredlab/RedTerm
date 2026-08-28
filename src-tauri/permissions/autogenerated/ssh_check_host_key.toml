@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ssh-check-host-key"
+description = "Enables the ssh_check_host_key command without any pre-configured scope."
+commands.allow = ["ssh_check_host_key"]
+
+[[permission]]
+identifier = "deny-ssh-check-host-key"
+description = "Denies the ssh_check_host_key command without any pre-configured scope."
+commands.deny = ["ssh_check_host_key"]

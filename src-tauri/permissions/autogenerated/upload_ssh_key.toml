@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-upload-ssh-key"
+description = "Enables the upload_ssh_key command without any pre-configured scope."
+commands.allow = ["upload_ssh_key"]
+
+[[permission]]
+identifier = "deny-upload-ssh-key"
+description = "Denies the upload_ssh_key command without any pre-configured scope."
+commands.deny = ["upload_ssh_key"]

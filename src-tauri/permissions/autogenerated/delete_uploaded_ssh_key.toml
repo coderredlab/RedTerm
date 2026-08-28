@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-delete-uploaded-ssh-key"
+description = "Enables the delete_uploaded_ssh_key command without any pre-configured scope."
+commands.allow = ["delete_uploaded_ssh_key"]
+
+[[permission]]
+identifier = "deny-delete-uploaded-ssh-key"
+description = "Denies the delete_uploaded_ssh_key command without any pre-configured scope."
+commands.deny = ["delete_uploaded_ssh_key"]
