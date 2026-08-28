@@ -3,7 +3,7 @@
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import {
     deleteUploadedSshKey,
-    getDecryptedPassword,
+    MAX_SSH_KEY_BYTES,
     uploadSshKey,
     type AuthConfig,
     type SavedConnection,
@@ -28,7 +28,7 @@
   let port = $state(22);
   let username = $state("");
   let password = $state("");
-  let keyPath = $state("");
+  let keyId = $state("");
   let keyPassphrase = $state("");
   let selectedKeyName = $state("");
   let authType = $state<"password" | "key">("password");
@@ -48,10 +48,10 @@
       host = editConnection.host;
       port = editConnection.port;
       username = editConnection.username;
-      keyPath = editConnection.key_path || "";
-      selectedKeyName = getDisplayKeyName(editConnection.key_path);
+      keyId = editConnection.key_id || "";
+      selectedKeyName = editConnection.key_name || "";
       keyPassphrase = "";
-      authType = editConnection.key_path ? "key" : "password";
+      authType = editConnection.key_id ? "key" : "password";
       saveConnectionChecked = true;
       savePasswordChecked = editConnection.has_saved_password;
       startupScript = editConnection.startup_script || "";
@@ -69,7 +69,7 @@
     port = 22;
     username = "";
     password = "";
-    keyPath = "";
+    keyId = "";
     keyPassphrase = "";
     selectedKeyName = "";
     authType = "password";
@@ -82,28 +82,18 @@
     activeDialogTab = "general";
   }
 
-  function getDisplayKeyName(path?: string): string {
-    if (!path) return "";
-    const normalized = path.replace(/\\/g, "/");
-    const fileName = normalized.split("/").pop() || path;
 
-    return fileName.replace(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-(.+)$/i,
-      "$1"
-    );
+  function isPersistedKeyId(id: string): boolean {
+    return Boolean(editConnection?.key_id && id === editConnection.key_id);
   }
 
-  function isPersistedKeyPath(path: string): boolean {
-    return Boolean(editConnection?.key_path && path === editConnection.key_path);
-  }
-
-  async function cleanupTransientKey(path: string) {
-    if (!path || isPersistedKeyPath(path)) {
+  async function cleanupTransientKey(id: string) {
+    if (!id || isPersistedKeyId(id)) {
       return;
     }
 
     try {
-      await deleteUploadedSshKey(path);
+      await deleteUploadedSshKey(id);
     } catch (e) {
       console.error("Failed to delete uploaded SSH key:", e);
     }
@@ -113,10 +103,28 @@
     error = null;
     const input = event.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
-    const previousKeyPath = keyPath;
+    const previousKeyId = keyId;
     const previousKeyName = selectedKeyName;
 
     if (!file) {
+      return;
+    }
+    if (file.size > MAX_SSH_KEY_BYTES) {
+      error = "SSH key file exceeds 1 MiB";
+      input.value = "";
+      return;
+    }
+    const keyHost = host.trim();
+    const keyUsername = username.trim();
+    if (
+      !keyHost ||
+      !keyUsername ||
+      !Number.isInteger(port) ||
+      port < 1 ||
+      port > 65535
+    ) {
+      error = "Enter a valid host, port, and username before selecting an SSH key";
+      input.value = "";
       return;
     }
 
@@ -124,15 +132,21 @@
 
     try {
       const buffer = await file.arrayBuffer();
-      const result = await uploadSshKey(file.name, new Uint8Array(buffer));
-      keyPath = result.key_path;
-      selectedKeyName = getDisplayKeyName(result.file_name);
+      const result = await uploadSshKey(
+        file.name,
+        new Uint8Array(buffer),
+        keyHost,
+        port,
+        keyUsername
+      );
+      keyId = result.key_id;
+      selectedKeyName = result.file_name;
 
-      if (previousKeyPath && previousKeyPath !== result.key_path) {
-        await cleanupTransientKey(previousKeyPath);
+      if (previousKeyId && previousKeyId !== result.key_id) {
+        await cleanupTransientKey(previousKeyId);
       }
     } catch (e) {
-      keyPath = previousKeyPath;
+      keyId = previousKeyId;
       selectedKeyName = previousKeyName;
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -161,42 +175,24 @@
         throw new Error("Port must be between 1 and 65535");
       }
 
-      if (authType === "key" && !keyPath) {
+      if (authType === "key" && !keyId) {
         throw new Error("Select an SSH private key file first");
       }
 
       let connectionId: string | undefined = editConnection?.id;
-
-      // Get actual password (decrypt if using stored password)
-      let actualPassword = password;
-      const isUsingStoredPassword = password === STORED_PASSWORD_PLACEHOLDER && editConnection?.id;
+      const isUsingStoredPassword =
+        authType === "password" &&
+        password === STORED_PASSWORD_PLACEHOLDER &&
+        Boolean(editConnection?.id);
       if (authType === "password" && !isUsingStoredPassword && password.length === 0) {
         throw new Error("Password is required");
       }
-
-
-      if (isUsingStoredPassword) {
-        const decrypted = await getDecryptedPassword(editConnection.id);
-        if (!decrypted) {
-          throw new Error("Failed to decrypt stored password");
-        }
-        actualPassword = decrypted;
+      if (isUsingStoredPassword && saveConnectionChecked && !savePasswordChecked) {
+        throw new Error("Enter the password before removing secure password storage");
       }
-
-      const authPlan = buildConnectionAuthPlan(
-        authType === "password"
-          ? { authType, username: trimmedUsername, password: actualPassword }
-          : {
-              authType,
-              username: trimmedUsername,
-              keyPath,
-              passphrase: keyPassphrase,
-            }
-      );
 
       let canRestorePassword = false;
 
-      // Save connection if requested
       if (saveConnectionChecked) {
         const id = editConnection?.id || crypto.randomUUID();
         const savePlan = buildConnectionDialogSavePlan({
@@ -208,8 +204,8 @@
           username: trimmedUsername,
           authType,
           password,
-          actualPassword,
-          keyPath,
+          keyId,
+          keyName: selectedKeyName,
           saveConnectionChecked,
           savePasswordChecked,
           startupScript: startupScriptToUse,
@@ -220,8 +216,36 @@
         await connectionsStore.save(savePlan.connection, savePlan.passwordToSave);
       }
 
-      // Create tab and connect
-      tabsStore.addTab(trimmedHost, port, authPlan.auth, connectionId, canRestorePassword, startupScriptToUse, startupScriptReadyTextToUse);
+      const authPlan = buildConnectionAuthPlan(
+        authType === "key"
+          ? {
+              authType,
+              username: trimmedUsername,
+              keyId,
+              passphrase: keyPassphrase,
+            }
+          : isUsingStoredPassword
+            ? {
+                authType: "storedPassword",
+                username: trimmedUsername,
+                connectionId: connectionId!,
+              }
+            : {
+                authType,
+                username: trimmedUsername,
+                password,
+              }
+      );
+
+      tabsStore.addTab(
+        trimmedHost,
+        port,
+        authPlan.auth,
+        connectionId,
+        canRestorePassword,
+        startupScriptToUse,
+        startupScriptReadyTextToUse
+      );
 
       onClose();
       resetForm();
@@ -233,10 +257,10 @@
   }
 
   async function handleCancel() {
-    const transientKeyPath = keyPath;
+    const transientKeyId = keyId;
     resetForm();
 
-    await cleanupTransientKey(transientKeyPath);
+    await cleanupTransientKey(transientKeyId);
     onClose();
   }
 

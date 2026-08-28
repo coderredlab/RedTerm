@@ -36,7 +36,6 @@
     "allow-ssh-trust-host-key",
     "allow-list-known-hosts",
     "allow-delete-known-host",
-    "allow-get-decrypted-password",
     "allow-upload-ssh-key"
   ]
 }

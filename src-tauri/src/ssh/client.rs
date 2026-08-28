@@ -148,7 +148,12 @@ impl SshConnection {
                 .authenticate_password(&auth.username, password)
                 .await
                 .map_err(|e| SshError::AuthenticationFailed(e.to_string()))?,
-            AuthMethod::Key {
+            AuthMethod::StoredPassword { .. } => {
+                return Err(SshError::AuthenticationFailed(
+                    "Stored credentials must be resolved before SSH authentication".to_string(),
+                ));
+            }
+            AuthMethod::ResolvedKey {
                 key_path,
                 passphrase,
             } => {
@@ -165,6 +170,11 @@ impl SshConnection {
                     .authenticate_publickey(&auth.username, key)
                     .await
                     .map_err(|e| SshError::AuthenticationFailed(e.to_string()))?
+            }
+            AuthMethod::Key { .. } => {
+                return Err(SshError::AuthenticationFailed(
+                    "Managed SSH keys must be resolved before authentication".to_string(),
+                ));
             }
         };
 

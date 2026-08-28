@@ -4011,6 +4011,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-plugin-redterm-android-paste",
+ "tauri-plugin-redterm-ios-native",
  "thiserror 2.0.20",
  "tokio",
  "uuid",
@@ -5254,6 +5255,15 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-redterm-android-paste"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tauri",
+ "tauri-plugin",
+]
+
+[[package]]
+name = "tauri-plugin-redterm-ios-native"
 version = "0.1.0"
 dependencies = [
  "serde",

@@ -7,9 +7,14 @@ type ConnectionAuthPlanInput =
       password: string;
     }
   | {
+      authType: "storedPassword";
+      username: string;
+      connectionId: string;
+    }
+  | {
       authType: "key";
       username: string;
-      keyPath: string;
+      keyId: string;
       passphrase?: string;
     };
 
@@ -20,10 +25,15 @@ export function buildConnectionAuthConfig(input: ConnectionAuthPlanInput): AuthC
       method: { type: "password", password: input.password },
     };
   }
-
+  if (input.authType === "storedPassword") {
+    return {
+      username: input.username,
+      method: { type: "stored_password", connection_id: input.connectionId },
+    };
+  }
   const method: AuthConfig["method"] = {
     type: "key",
-    key_path: input.keyPath,
+    key_id: input.keyId,
   };
   if (input.passphrase && input.passphrase.length > 0) {
     method.passphrase = input.passphrase;

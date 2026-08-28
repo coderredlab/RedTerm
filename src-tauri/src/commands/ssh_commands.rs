@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
@@ -16,20 +16,32 @@ use crate::ssh::known_hosts::{
     list_known_hosts as list_known_hosts_entries, trust_host_key, HostKeyCheckResult,
     KnownHostEntry,
 };
-use crate::ssh::{AuthConfig, SshConnection, SshError, SshSession};
-use tauri_plugin_redterm_android_paste::read_clipboard_image as read_android_clipboard_image;
-use tauri_plugin_redterm_android_paste::set_keep_screen_on as set_android_keep_screen_on;
-use tauri_plugin_redterm_android_paste::set_keyboard_visible as set_android_keyboard_visible;
+use crate::ssh::{AuthConfig, AuthMethod, SshConnection, SshError, SshSession};
+use crate::storage::{load_saved_password_for_connection, resolve_uploaded_key_for_auth};
+#[cfg(not(target_os = "ios"))]
+use tauri_plugin_redterm_android_paste::{
+    read_clipboard_image as read_native_clipboard_image,
+    set_keep_screen_on as set_native_keep_screen_on,
+    set_keyboard_visible as set_native_keyboard_visible,
+    ClipboardImageResult as NativeClipboardImageResult,
+};
 #[cfg(target_os = "android")]
 use tauri_plugin_redterm_android_paste::{
     stop_foreground_service as stop_android_foreground_service,
     update_foreground_service as update_android_foreground_service,
 };
+#[cfg(target_os = "ios")]
+use tauri_plugin_redterm_ios_native::{
+    read_clipboard_image as read_native_clipboard_image,
+    set_keep_screen_on as set_native_keep_screen_on,
+    set_keyboard_visible as set_native_keyboard_visible,
+    ClipboardImageResult as NativeClipboardImageResult,
+};
 
 pub struct SessionEntry {
     pub session: SshSession,
     pub connection: Arc<SshConnection>,
-    pub recent_chunks: Arc<RwLock<VecDeque<SshDataChunk>>>,
+    recent_output: Arc<RwLock<RecentOutput>>,
     pub latest_snapshot: Arc<RwLock<Option<serde_json::Value>>>,
     pub next_seq: Arc<AtomicU64>,
 }
@@ -40,6 +52,90 @@ pub struct SessionManager {
 
 pub struct RuntimeState {
     pub instance_id: String,
+}
+
+const HOST_KEY_CHALLENGE_LIFETIME: Duration = Duration::from_secs(120);
+const MAX_PENDING_HOST_KEY_CHALLENGES: usize = 32;
+
+struct PendingHostKeyChallenge {
+    host: String,
+    port: u16,
+    public_key: String,
+    fingerprint: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+pub struct HostKeyChallengeStore {
+    pending: Mutex<HashMap<String, PendingHostKeyChallenge>>,
+}
+
+impl HostKeyChallengeStore {
+    fn issue(
+        &self,
+        host: String,
+        port: u16,
+        public_key: String,
+        fingerprint: String,
+    ) -> Result<String, String> {
+        let now = Instant::now();
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "Host key challenge store lock was poisoned".to_string())?;
+        pending.retain(|_, challenge| challenge.expires_at > now);
+        if pending.len() >= MAX_PENDING_HOST_KEY_CHALLENGES {
+            return Err("Too many pending host key challenges".to_string());
+        }
+        let token = Uuid::new_v4().to_string();
+        pending.insert(
+            token.clone(),
+            PendingHostKeyChallenge {
+                host,
+                port,
+                public_key,
+                fingerprint,
+                expires_at: now + HOST_KEY_CHALLENGE_LIFETIME,
+            },
+        );
+        Ok(token)
+    }
+
+    fn consume(&self, token: &str) -> Result<PendingHostKeyChallenge, String> {
+        Uuid::parse_str(token).map_err(|_| "Invalid host key challenge".to_string())?;
+        let challenge = self
+            .pending
+            .lock()
+            .map_err(|_| "Host key challenge store lock was poisoned".to_string())?
+            .remove(token)
+            .ok_or_else(|| "Host key challenge is unavailable or already used".to_string())?;
+        if challenge.expires_at <= Instant::now() {
+            return Err("Host key challenge expired".to_string());
+        }
+        Ok(challenge)
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "status")]
+pub enum HostKeyPreflightResponse {
+    #[serde(rename = "trusted")]
+    Trusted,
+    #[serde(rename = "unknown")]
+    Unknown {
+        algorithm: String,
+        fingerprint: String,
+        public_key: String,
+        challenge_token: String,
+    },
+    #[serde(rename = "changed")]
+    Changed {
+        algorithm: String,
+        fingerprint: String,
+        public_key: String,
+        known_fingerprints: Vec<String>,
+        challenge_token: String,
+    },
 }
 
 impl Default for SessionManager {
@@ -146,16 +242,39 @@ const MAX_SSH_EVENT_BYTES: usize = 64 * 1024;
 const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_RECENT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECENT_CHUNK_COUNT: usize = 4096;
+const SSH_EVENT_BATCH_WINDOW: Duration = Duration::from_millis(4);
 const HOST_KEY_PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(15);
 const SSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const SSH_SHELL_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn prune_recent_chunks(chunks: &mut VecDeque<SshDataChunk>) {
-    let mut total_bytes: usize = chunks.iter().map(|chunk| chunk.data.len()).sum();
+#[derive(Default)]
+struct RecentOutput {
+    chunks: VecDeque<SshDataChunk>,
+    total_bytes: usize,
+}
 
-    while chunks.len() > MAX_RECENT_CHUNK_COUNT || total_bytes > MAX_RECENT_CHUNK_BYTES {
-        if let Some(removed) = chunks.pop_front() {
-            total_bytes = total_bytes.saturating_sub(removed.data.len());
+impl RecentOutput {
+    fn push(&mut self, chunk: SshDataChunk) {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.data.len());
+        self.chunks.push_back(chunk);
+        while self.chunks.len() > MAX_RECENT_CHUNK_COUNT
+            || self.total_bytes > MAX_RECENT_CHUNK_BYTES
+        {
+            if let Some(removed) = self.chunks.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.data.len());
+            }
+        }
+    }
+
+    fn discard_through(&mut self, last_seq: u64) {
+        while self
+            .chunks
+            .front()
+            .is_some_and(|chunk| chunk.seq <= last_seq)
+        {
+            if let Some(removed) = self.chunks.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.data.len());
+            }
         }
     }
 }
@@ -229,12 +348,25 @@ fn ensure_local_clipboard_image_path(app: &AppHandle, local_path: &str) -> Resul
     Ok(canonical_candidate)
 }
 
+#[cfg(target_os = "ios")]
+fn clipboard_image_staging_directory(app: &AppHandle) -> Result<String, String> {
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| format!("Failed to resolve app cache dir: {error}"))?
+        .join("clipboard-paste");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("Failed to prepare clipboard cache dir: {error}"))?;
+    Ok(directory.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 pub async fn ssh_check_host_key(
     app: AppHandle,
+    challenge_store: State<'_, Arc<HostKeyChallengeStore>>,
     host: String,
     port: u16,
-) -> Result<HostKeyCheckResult, String> {
+) -> Result<HostKeyPreflightResponse, String> {
     let known_hosts_path = known_hosts_path(&app)?;
     let result = Arc::new(Mutex::new(None));
     let config = Config {
@@ -281,26 +413,56 @@ pub async fn ssh_check_host_key(
     let preflight_result = result
         .lock()
         .map_err(|_| "Host key preflight state was poisoned".to_string())?
-        .clone();
-    preflight_result.ok_or_else(|| "Host key preflight did not receive a server key".to_string())
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct TrustHostKeyRequest {
-    pub host: String,
-    pub port: u16,
-    pub public_key: String,
-    pub fingerprint: String,
+        .clone()
+        .ok_or_else(|| "Host key preflight did not receive a server key".to_string())?;
+    match preflight_result {
+        HostKeyCheckResult::Trusted => Ok(HostKeyPreflightResponse::Trusted),
+        HostKeyCheckResult::Unknown {
+            algorithm,
+            fingerprint,
+            public_key,
+        } => {
+            let challenge_token =
+                challenge_store.issue(host, port, public_key.clone(), fingerprint.clone())?;
+            Ok(HostKeyPreflightResponse::Unknown {
+                algorithm,
+                fingerprint,
+                public_key,
+                challenge_token,
+            })
+        }
+        HostKeyCheckResult::Changed {
+            algorithm,
+            fingerprint,
+            public_key,
+            known_fingerprints,
+        } => {
+            let challenge_token =
+                challenge_store.issue(host, port, public_key.clone(), fingerprint.clone())?;
+            Ok(HostKeyPreflightResponse::Changed {
+                algorithm,
+                fingerprint,
+                public_key,
+                known_fingerprints,
+                challenge_token,
+            })
+        }
+    }
 }
 
 #[tauri::command]
-pub fn ssh_trust_host_key(app: AppHandle, request: TrustHostKeyRequest) -> Result<(), String> {
+pub fn ssh_trust_host_key(
+    app: AppHandle,
+    challenge_store: State<'_, Arc<HostKeyChallengeStore>>,
+    challenge_token: String,
+) -> Result<(), String> {
+    let challenge = challenge_store.consume(&challenge_token)?;
     let path = known_hosts_path(&app)?;
     trust_host_key(
-        &request.host,
-        request.port,
-        &request.public_key,
-        &request.fingerprint,
+        &challenge.host,
+        challenge.port,
+        &challenge.public_key,
+        &challenge.fingerprint,
         path,
     )
     .map_err(|e| e.to_string())
@@ -328,18 +490,38 @@ pub async fn ssh_connect(
     cols: u32,
     rows: u32,
 ) -> Result<String, String> {
+    let AuthConfig { username, method } = auth;
+    let method = match method {
+        AuthMethod::StoredPassword { connection_id } => AuthMethod::Password {
+            password: load_saved_password_for_connection(
+                &app,
+                &connection_id,
+                &host,
+                port,
+                &username,
+            )?,
+        },
+        AuthMethod::Key { key_id, passphrase } => AuthMethod::ResolvedKey {
+            key_path: resolve_uploaded_key_for_auth(&app, &key_id, &host, port, &username)?,
+            passphrase,
+        },
+        AuthMethod::ResolvedKey { .. } => {
+            return Err("Resolved SSH key paths cannot be supplied by the renderer".to_string());
+        }
+        method => method,
+    };
+    let auth = AuthConfig { username, method };
     let session_id = Uuid::new_v4().to_string();
 
     let (data_tx, mut data_rx) = mpsc::channel::<Vec<u8>>(SSH_DATA_CHANNEL_CAPACITY);
     let (exit_tx, exit_rx) = oneshot::channel::<()>();
-    let recent_chunks = Arc::new(RwLock::new(VecDeque::<SshDataChunk>::new()));
+    let recent_output = Arc::new(RwLock::new(RecentOutput::default()));
     let next_seq = Arc::new(AtomicU64::new(0));
     let latest_snapshot = Arc::new(RwLock::new(None));
 
-    // Spawn data receiver task
     let app_clone = app.clone();
     let session_id_for_task = session_id.clone();
-    let recent_chunks_for_task = Arc::clone(&recent_chunks);
+    let recent_output_for_task = Arc::clone(&recent_output);
     let next_seq_for_task = Arc::clone(&next_seq);
     tokio::spawn(async move {
         let mut pending = None;
@@ -351,28 +533,37 @@ pub async fn ssh_connect(
                     None => break,
                 },
             };
+            let deadline = tokio::time::Instant::now() + SSH_EVENT_BATCH_WINDOW;
+            let mut channel_closed = false;
 
             while batch.len() < MAX_SSH_EVENT_BYTES {
-                match data_rx.try_recv() {
-                    Ok(more) if batch.len() + more.len() <= MAX_SSH_EVENT_BYTES => {
-                        batch.extend(more);
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    next = data_rx.recv() => {
+                        match next {
+                            Some(more) if batch.len() + more.len() <= MAX_SSH_EVENT_BYTES => {
+                                batch.extend(more);
+                            }
+                            Some(more) => {
+                                pending = Some(more);
+                                break;
+                            }
+                            None => {
+                                channel_closed = true;
+                                break;
+                            }
+                        }
                     }
-                    Ok(more) => {
-                        pending = Some(more);
-                        break;
-                    }
-                    Err(_) => break,
                 }
             }
 
             let seq = next_seq_for_task.fetch_add(1, Ordering::Relaxed) + 1;
             {
-                let mut chunks = recent_chunks_for_task.write().await;
-                chunks.push_back(SshDataChunk {
+                let mut output = recent_output_for_task.write().await;
+                output.push(SshDataChunk {
                     seq,
                     data: batch.clone(),
                 });
-                prune_recent_chunks(&mut chunks);
             }
             let _ = app_clone.emit(
                 &format!("ssh-data-{}", session_id_for_task),
@@ -382,6 +573,9 @@ pub async fn ssh_connect(
                     data: batch,
                 },
             );
+            if channel_closed {
+                break;
+            }
         }
     });
 
@@ -411,7 +605,7 @@ pub async fn ssh_connect(
             SessionEntry {
                 session,
                 connection: Arc::new(connection),
-                recent_chunks,
+                recent_output,
                 latest_snapshot,
                 next_seq,
             },
@@ -493,13 +687,13 @@ pub async fn ssh_store_session_snapshot(
     snapshot: serde_json::Value,
     last_seq: u64,
 ) -> Result<(), String> {
-    let (recent_chunks, latest_snapshot) = {
+    let (recent_output, latest_snapshot) = {
         let sessions = session_manager.sessions.read().await;
         sessions
             .get(&session_id)
             .map(|entry| {
                 (
-                    Arc::clone(&entry.recent_chunks),
+                    Arc::clone(&entry.recent_output),
                     Arc::clone(&entry.latest_snapshot),
                 )
             })
@@ -511,11 +705,7 @@ pub async fn ssh_store_session_snapshot(
             .map_err(|e| e.to_string())?,
     );
 
-    {
-        let mut chunks = recent_chunks.write().await;
-        chunks.retain(|chunk| chunk.seq > last_seq);
-        prune_recent_chunks(&mut chunks);
-    }
+    recent_output.write().await.discard_through(last_seq);
     Ok(())
 }
 
@@ -524,14 +714,14 @@ pub async fn ssh_get_session_snapshot(
     session_manager: State<'_, Arc<SessionManager>>,
     session_id: String,
 ) -> Result<Option<serde_json::Value>, String> {
-    let (latest_snapshot, recent_chunks, next_seq) = {
+    let (latest_snapshot, recent_output, next_seq) = {
         let sessions = session_manager.sessions.read().await;
         sessions
             .get(&session_id)
             .map(|entry| {
                 (
                     Arc::clone(&entry.latest_snapshot),
-                    Arc::clone(&entry.recent_chunks),
+                    Arc::clone(&entry.recent_output),
                     Arc::clone(&entry.next_seq),
                 )
             })
@@ -543,13 +733,16 @@ pub async fn ssh_get_session_snapshot(
         return Ok(None);
     };
 
-    // Pruning may have dropped chunks the snapshot needs for a continuous
-    // replay; restoring it would corrupt the screen, so invalidate instead.
     let snapshot_last_seq = snapshot
         .get("last_seq")
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
-    let first_retained_seq = recent_chunks.read().await.front().map(|chunk| chunk.seq);
+    let first_retained_seq = recent_output
+        .read()
+        .await
+        .chunks
+        .front()
+        .map(|chunk| chunk.seq);
     let last_emitted_seq = next_seq.load(Ordering::Relaxed);
     if first_retained_seq.unwrap_or(last_emitted_seq + 1) > snapshot_last_seq + 1 {
         *latest_snapshot.write().await = None;
@@ -564,15 +757,15 @@ pub async fn ssh_get_session_output(
     session_manager: State<'_, Arc<SessionManager>>,
     session_id: String,
 ) -> Result<Vec<SshDataChunk>, String> {
-    let recent_chunks = {
+    let recent_output = {
         let sessions = session_manager.sessions.read().await;
         sessions
             .get(&session_id)
-            .map(|entry| Arc::clone(&entry.recent_chunks))
+            .map(|entry| Arc::clone(&entry.recent_output))
             .ok_or_else(|| "Session not found".to_string())?
     };
 
-    let chunks = recent_chunks.read().await.iter().cloned().collect();
+    let chunks = recent_output.read().await.chunks.iter().cloned().collect();
     Ok(chunks)
 }
 
@@ -715,20 +908,24 @@ pub async fn ssh_upload_clipboard_image_from_local_path(
 }
 
 #[tauri::command]
-pub async fn read_clipboard_image(
-    app: AppHandle,
-) -> Result<tauri_plugin_redterm_android_paste::ClipboardImageResult, String> {
-    read_android_clipboard_image(&app)
+pub async fn read_clipboard_image(app: AppHandle) -> Result<NativeClipboardImageResult, String> {
+    #[cfg(target_os = "ios")]
+    {
+        return read_native_clipboard_image(&app, clipboard_image_staging_directory(&app)?);
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    read_native_clipboard_image(&app)
 }
 
 #[tauri::command]
 pub async fn set_keep_screen_on(app: AppHandle, enabled: bool) -> Result<(), String> {
-    set_android_keep_screen_on(&app, enabled)
+    set_native_keep_screen_on(&app, enabled)
 }
 
 #[tauri::command]
 pub async fn set_keyboard_visible(app: AppHandle, visible: bool) -> Result<(), String> {
-    set_android_keyboard_visible(&app, visible)
+    set_native_keyboard_visible(&app, visible)
 }
 
 #[cfg(test)]
@@ -737,21 +934,39 @@ mod tests {
 
     #[test]
     fn recent_ssh_output_is_pruned_by_count_and_bytes() {
-        let mut chunks = VecDeque::new();
+        let mut output = RecentOutput::default();
         for seq in 1..=5000 {
-            chunks.push_back(SshDataChunk {
+            output.push(SshDataChunk {
                 seq,
                 data: vec![0; 1024],
             });
         }
 
-        prune_recent_chunks(&mut chunks);
+        assert!(output.chunks.len() <= MAX_RECENT_CHUNK_COUNT);
+        assert!(output.total_bytes <= MAX_RECENT_CHUNK_BYTES);
+        assert_eq!(output.chunks.back().map(|chunk| chunk.seq), Some(5000));
+    }
 
-        assert!(chunks.len() <= MAX_RECENT_CHUNK_COUNT);
-        assert!(
-            chunks.iter().map(|chunk| chunk.data.len()).sum::<usize>() <= MAX_RECENT_CHUNK_BYTES
-        );
-        assert_eq!(chunks.back().map(|chunk| chunk.seq), Some(5000));
+    #[test]
+    fn host_key_challenges_are_bound_and_single_use() {
+        let store = HostKeyChallengeStore::default();
+        let token = store
+            .issue(
+                "example.com".to_string(),
+                22,
+                "ssh-ed25519 AAAAtest".to_string(),
+                "SHA256:test".to_string(),
+            )
+            .expect("challenge should be issued");
+
+        let challenge = store
+            .consume(&token)
+            .expect("challenge should be consumable once");
+        assert_eq!(challenge.host, "example.com");
+        assert_eq!(challenge.port, 22);
+        assert_eq!(challenge.public_key, "ssh-ed25519 AAAAtest");
+        assert_eq!(challenge.fingerprint, "SHA256:test");
+        assert!(store.consume(&token).is_err());
     }
 
     #[test]

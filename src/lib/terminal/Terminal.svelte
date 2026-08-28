@@ -14,7 +14,6 @@
     sshStoreSessionSnapshot,
     listenSshData,
     listenSshExit,
-    getDecryptedPassword,
     sshUploadClipboardImage,
     sshUploadClipboardImageFromLocalPath,
     readClipboardImage,
@@ -29,7 +28,7 @@
   import { ctrlKey, altKey, getArrowKeyCode } from "$lib/utils/key-mapper";
   import { settingsStore } from "$lib/stores/settings.svelte";
   import { createStartupScriptDispatcher, type StartupScriptDispatcher } from "./startup-script";
-  import { findUrlAtCell } from "./terminal-links";
+  import { findUrlAtCell, validateTerminalUrl, type SafeTerminalUrl } from "./terminal-links";
   import { extractTerminalSelection } from "./terminal-selection";
   import { formatTerminalPaste } from "./terminal-paste";
   import { SshOutputDecoder } from "./ssh-output-decoder";
@@ -110,7 +109,7 @@
   let pendingHostKeyChallenge = $state<HostKeyPromptChallenge | null>(null);
   let resolvingHostKeyTrust = $state(false);
   let hostKeyPromptResolver: ((decision: HostKeyPromptDecision) => void) | null = null;
-  let pendingKeyPassphrasePrompt = $state<{ keyPath: string } | null>(null);
+  let pendingKeyPassphrasePrompt = $state<{ keyId: string } | null>(null);
   let keyPassphraseInput = $state("");
   let keyPassphrasePromptResolver: ((passphrase: string | null) => void) | null = null;
   let keyPassphraseRetryCache = createKeyPassphraseRetryCache();
@@ -173,7 +172,7 @@
   let selectedText = $state("");
   let selectionFeedback = $state("");
   let selectionFeedbackTimer: number | null = null;
-  let pendingTerminalUrl = $state<string | null>(null);
+  let pendingTerminalUrl = $state<SafeTerminalUrl | null>(null);
   let openingTerminalUrl = $state(false);
   let pendingSelectionRefresh = false;
   let selectionStart = $state<{ row: number; col: number } | null>(null);
@@ -387,7 +386,13 @@
   }
 
   function confirmAndOpenTerminalUrl(url: string) {
-    pendingTerminalUrl = url;
+    const safeUrl = validateTerminalUrl(url);
+    if (!safeUrl) {
+      showSelectionMessage("Unsafe URL blocked");
+      focusInput();
+      return;
+    }
+    pendingTerminalUrl = safeUrl;
     openingTerminalUrl = false;
   }
 
@@ -399,11 +404,17 @@
 
   async function openPendingTerminalUrl() {
     if (!pendingTerminalUrl || openingTerminalUrl) return;
-    const url = pendingTerminalUrl;
+    const safeUrl = validateTerminalUrl(pendingTerminalUrl.url);
+    if (!safeUrl) {
+      pendingTerminalUrl = null;
+      showSelectionMessage("Unsafe URL blocked");
+      focusInput();
+      return;
+    }
     openingTerminalUrl = true;
 
     try {
-      await openUrl(url);
+      await openUrl(safeUrl.url);
       pendingTerminalUrl = null;
     } catch (error) {
       console.error("[Terminal] failed to open URL:", error);
@@ -920,6 +931,15 @@
   let compositionTimeout: number | null = null;
   let pendingWrite = "";
   let writeFlushScheduled = false;
+  const MAX_AUTOMATIC_RESPONSES_PER_SECOND = 32;
+  const MAX_AUTOMATIC_RESPONSE_QUEUE = 32;
+  const MAX_AUTOMATIC_RESPONSE_BYTES = 4096;
+  let automaticResponseQueue: string[] = [];
+  let automaticResponseBytes = 0;
+  let automaticResponseSending = false;
+  let automaticResponseWindowStartedAt = 0;
+  let automaticResponseCount = 0;
+  let protocolFloodDetected = false;
   let deferredUpdateTimer: number | null = null;
   let lastNonBottomRenderAt = 0;
   let prevScrollbackLength = 0;
@@ -1220,8 +1240,8 @@
     touchScrollAccum = 0;
   }
 
-  function promptKeyPassphrase(keyPath: string): Promise<string | null> {
-    pendingKeyPassphrasePrompt = { keyPath };
+  function promptKeyPassphrase(keyId: string): Promise<string | null> {
+    pendingKeyPassphrasePrompt = { keyId };
     keyPassphraseInput = "";
     return new Promise((resolve) => {
       keyPassphrasePromptResolver = resolve;
@@ -1248,26 +1268,12 @@
       return buildConnectionAuthConfig({
         authType: "key",
         username: auth.username,
-        keyPath: auth.method.key_path,
+        keyId: auth.method.key_id,
         passphrase: getKeyPassphraseForConnect(keyPassphraseRetryCache),
       });
     }
 
-    if (auth.method.password) return auth;
-    if (!connectionId) {
-      throw new Error("Saved password is required. Reopen connection and enter password.");
-    }
-
-    const decrypted = await getDecryptedPassword(connectionId);
-    if (!decrypted) {
-      throw new Error("Failed to restore saved password");
-    }
-
-    return buildConnectionAuthConfig({
-      authType: "password",
-      username: auth.username,
-      password: decrypted,
-    });
+    return auth;
   }
 
   async function connectWithResolvedAuth(): Promise<string> {
@@ -1291,7 +1297,7 @@
         throw error;
       }
 
-      const passphrase = await promptKeyPassphrase(auth.method.key_path);
+      const passphrase = await promptKeyPassphrase(auth.method.key_id);
       if (passphrase === null) {
         throw new Error("Key passphrase entry cancelled");
       }
@@ -1437,6 +1443,7 @@
       publicKey: result.public_key,
       fingerprint: result.fingerprint,
       knownFingerprints: result.known_fingerprints,
+      challengeToken: result.challenge_token,
     };
   }
 
@@ -1453,12 +1460,7 @@
   }
 
   async function trustPresentedHostKey(request: HostKeyTrustRequest): Promise<void> {
-    await sshTrustHostKey({
-      host: request.host,
-      port: request.port,
-      public_key: request.publicKey,
-      fingerprint: request.fingerprint,
-    });
+    await sshTrustHostKey(request.challengeToken);
   }
 
   function resolveHostKeyPrompt(decision: HostKeyPromptDecision) {
@@ -1573,9 +1575,7 @@
   function resetParser() {
     parser = new AnsiParser(cols, rows);
     parser.setResponseHandler((data: string) => {
-      if (sessionId) {
-        sshWrite(sessionId, encoder.encode(data)).catch(() => {});
-      }
+      enqueueAutomaticResponse(data);
     });
     updateBuffer();
   }
@@ -2191,6 +2191,74 @@
     }
   }
 
+  function clearAutomaticResponses() {
+    automaticResponseQueue = [];
+    automaticResponseBytes = 0;
+    automaticResponseSending = false;
+    automaticResponseWindowStartedAt = 0;
+    automaticResponseCount = 0;
+    protocolFloodDetected = false;
+  }
+
+  function stopForAutomaticResponseFlood() {
+    if (protocolFloodDetected) return;
+    protocolFloodDetected = true;
+    automaticResponseQueue = [];
+    automaticResponseBytes = 0;
+    statusMessage = "Connection closed: excessive terminal status requests";
+    void disconnect();
+  }
+
+  async function drainAutomaticResponses() {
+    if (automaticResponseSending) return;
+    automaticResponseSending = true;
+    try {
+      while (automaticResponseQueue.length > 0) {
+        const activeSessionId = sessionId;
+        if (!activeSessionId) break;
+        const response = automaticResponseQueue.shift()!;
+        automaticResponseBytes -= response.length;
+        await sshWrite(activeSessionId, encoder.encode(response));
+        if (sessionId !== activeSessionId) break;
+      }
+    } catch (error) {
+      handleWriteError(error);
+    } finally {
+      automaticResponseSending = false;
+      if (automaticResponseQueue.length > 0 && sessionId) {
+        void drainAutomaticResponses();
+      }
+    }
+  }
+
+  function enqueueAutomaticResponse(data: string) {
+    if (!sessionId || data.length === 0) return;
+    const now = performance.now();
+    if (
+      automaticResponseWindowStartedAt === 0 ||
+      now - automaticResponseWindowStartedAt >= 1000
+    ) {
+      automaticResponseWindowStartedAt = now;
+      automaticResponseCount = 0;
+    }
+    automaticResponseCount++;
+    if (automaticResponseCount > MAX_AUTOMATIC_RESPONSES_PER_SECOND) {
+      stopForAutomaticResponseFlood();
+      return;
+    }
+    if (
+      automaticResponseQueue.length >= MAX_AUTOMATIC_RESPONSE_QUEUE ||
+      automaticResponseBytes + data.length > MAX_AUTOMATIC_RESPONSE_BYTES
+    ) {
+      stopForAutomaticResponseFlood();
+      return;
+    }
+    if (automaticResponseQueue.at(-1) === data) return;
+    automaticResponseQueue.push(data);
+    automaticResponseBytes += data.length;
+    void drainAutomaticResponses();
+  }
+
   function queueWrite(data: string) {
     if (!sessionId || data.length === 0) return;
     pendingWrite += data;
@@ -2274,6 +2342,7 @@
     }
     pendingWrite = "";
     writeFlushScheduled = false;
+    clearAutomaticResponses();
     if (hiddenInput) {
       hiddenInput.removeEventListener('input', handleInput);
       hiddenInput.removeEventListener('keydown', handleKeyDown);
@@ -2327,6 +2396,7 @@
     connected = false;
     pendingWrite = "";
     writeFlushScheduled = false;
+    clearAutomaticResponses();
 
     if (unlisten) {
       unlisten();
@@ -2429,7 +2499,7 @@
         role="dialog"
         aria-modal="true"
         aria-labelledby="link-dialog-title"
-        aria-describedby="link-dialog-url"
+        aria-describedby="link-dialog-origin link-dialog-url"
         onpointerdown={swallowPointerPress}
         tabindex="-1"
       >
@@ -2437,7 +2507,8 @@
         <div class="link-dialog-content">
           <p class="link-dialog-kicker">External link</p>
           <h2 id="link-dialog-title">Open this URL?</h2>
-          <p id="link-dialog-url" class="link-dialog-url">{pendingTerminalUrl}</p>
+          <p id="link-dialog-origin" class="link-dialog-origin" dir="ltr">{pendingTerminalUrl.origin}</p>
+          <p id="link-dialog-url" class="link-dialog-url" dir="ltr">{pendingTerminalUrl.url}</p>
         </div>
         <div class="link-dialog-actions">
           <button
@@ -2550,7 +2621,7 @@
           <p id="key-passphrase-dialog-description" class="host-key-dialog-copy">
             Enter the passphrase if this private key is encrypted. Leave it blank for unencrypted keys.
           </p>
-          <p class="link-dialog-url host-key-fingerprint">{pendingKeyPassphrasePrompt.keyPath}</p>
+          <p class="link-dialog-url host-key-fingerprint">{pendingKeyPassphrasePrompt.keyId}</p>
           <input
             class="passphrase-dialog-input"
             type="password"
@@ -2778,6 +2849,17 @@
     font-size: 20px;
     line-height: 1.15;
     letter-spacing: -0.02em;
+  }
+
+  .link-dialog-origin {
+    margin: 12px 0 0;
+    color: var(--text-primary);
+    font-family: "Sarasa Term K Nerd", "JetBrains Mono", monospace;
+    font-size: 17px;
+    font-weight: 800;
+    direction: ltr;
+    unicode-bidi: isolate;
+    overflow-wrap: anywhere;
   }
 
   .link-dialog-url {

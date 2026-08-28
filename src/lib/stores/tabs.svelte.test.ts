@@ -74,7 +74,7 @@ describe("tabs store persistence", () => {
               username: "deploy",
               method: {
                 type: "key",
-                key_path: "/keys/prod_ed25519",
+                key_id: "key-1",
                 passphrase: "stale-runtime-passphrase",
               },
             },
@@ -100,7 +100,7 @@ describe("tabs store persistence", () => {
             username: "deploy",
             method: {
               type: "key",
-              key_path: "/keys/prod_ed25519",
+              key_id: "key-1",
             },
           },
           sessionId: null,
@@ -125,7 +125,7 @@ describe("tabs store persistence", () => {
       username: "deploy",
       method: {
         type: "key",
-        key_path: "/keys/prod_ed25519",
+        key_id: "key-1",
         passphrase: "runtime-only-passphrase",
       },
     } satisfies AuthConfig;
@@ -144,7 +144,7 @@ describe("tabs store persistence", () => {
             username: "deploy",
             method: {
               type: "key",
-              key_path: "/keys/prod_ed25519",
+              key_id: "key-1",
             },
           },
           sessionId: null,
@@ -153,6 +153,47 @@ describe("tabs store persistence", () => {
       ]);
       expect(persisted.activeTabId).toBe(tabId);
       expect(persisted.tabs[0].auth.method).not.toHaveProperty("passphrase");
+    } finally {
+      tabsStore.removeTab(tabId);
+    }
+  });
+
+  test("persists saved-password tabs as native credential references", async () => {
+    const storage = new MemoryStorage();
+    installBrowserStorage(storage);
+    // Dynamic import is required because the store captures browser globals during module evaluation.
+    const { tabsStore } = await import("./tabs.svelte");
+    const auth = {
+      username: "deploy",
+      method: {
+        type: "password",
+        password: "runtime-only-password",
+      },
+    } satisfies AuthConfig;
+
+    const tabId = tabsStore.addTab(
+      "prod.example.com",
+      2222,
+      auth,
+      "connection-1",
+      true
+    );
+
+    try {
+      const persisted = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null");
+      expect(persisted.tabs[0]).toEqual(
+        expect.objectContaining({
+          id: tabId,
+          auth: {
+            username: "deploy",
+            method: {
+              type: "stored_password",
+              connection_id: "connection-1",
+            },
+          },
+        })
+      );
+      expect(JSON.stringify(persisted)).not.toContain("runtime-only-password");
     } finally {
       tabsStore.removeTab(tabId);
     }

@@ -26,22 +26,38 @@ function canUseStorage(): boolean {
   return typeof window !== "undefined" && typeof localStorage !== "undefined";
 }
 
-function makePersistableAuth(auth: AuthConfig): AuthConfig {
-  if (auth.method.type === "password") {
+function makePersistableAuth(
+  auth: AuthConfig,
+  connectionId?: string,
+  canRestorePassword = false
+): AuthConfig {
+  if (auth.method.type === "key") {
     return {
       username: auth.username,
-      method: { type: "password", password: "" },
+      method: { type: "key", key_id: auth.method.key_id },
+    };
+  }
+  if (auth.method.type === "stored_password") {
+    return auth;
+  }
+  if (connectionId && canRestorePassword) {
+    return {
+      username: auth.username,
+      method: { type: "stored_password", connection_id: connectionId },
     };
   }
   return {
     username: auth.username,
-    method: { type: "key", key_path: auth.method.key_path },
+    method: { type: "password", password: "" },
   };
 }
 
 function canPersistTab(tab: Tab): boolean {
   if (tab.auth.method.type === "key") {
     return true;
+  }
+  if (tab.auth.method.type === "stored_password") {
+    return Boolean(tab.connectionId);
   }
   return Boolean(tab.sessionId || (tab.connectionId && tab.canRestorePassword));
 }
@@ -59,14 +75,22 @@ function loadPersistedState(): PersistedTabsState {
       .filter(
         (tab): tab is Tab =>
           Boolean(tab?.id && tab?.host && tab?.port && tab?.auth) &&
-          (tab.auth.method.type === "key" || Boolean(tab.sessionId || tab.canRestorePassword))
+          (
+            tab.auth.method.type === "key" ||
+            tab.auth.method.type === "stored_password" ||
+            Boolean(tab.sessionId || tab.canRestorePassword)
+          )
       )
       .map((tab) => {
         const { keyPassphraseExplicitEmpty: _keyPassphraseExplicitEmpty, ...persistedTab } =
           tab as Tab & { keyPassphraseExplicitEmpty?: boolean };
         return {
           ...persistedTab,
-          auth: makePersistableAuth(tab.auth),
+          auth: makePersistableAuth(
+            tab.auth,
+            tab.connectionId,
+            tab.canRestorePassword
+          ),
           sessionId: typeof tab.sessionId === "string" ? tab.sessionId : null,
           connected: false,
         };
@@ -90,7 +114,11 @@ function persistState(tabs: Tab[], activeTabId: string | null) {
     .filter((tab) => canPersistTab(tab))
     .map((tab) => ({
       ...tab,
-      auth: makePersistableAuth(tab.auth),
+      auth: makePersistableAuth(
+        tab.auth,
+        tab.connectionId,
+        tab.canRestorePassword
+      ),
       sessionId: tab.sessionId,
       connected: false,
     }));

@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
-  import { getDecryptedPassword, type AuthConfig, type SavedConnection } from "$lib/tauri/commands";
+  import type { AuthConfig, SavedConnection } from "$lib/tauri/commands";
 
   interface Props {
     onEdit?: (connection: SavedConnection) => void;
@@ -15,35 +15,25 @@
     connectionsStore.load();
   });
 
-  async function handleQuickConnect(connection: SavedConnection) {
-    // For key auth, connect directly
-    if (connection.key_path) {
+  function handleQuickConnect(connection: SavedConnection) {
+    if (connection.key_id) {
       const auth: AuthConfig = {
         username: connection.username,
-        method: { type: "key", key_path: connection.key_path },
+        method: { type: "key", key_id: connection.key_id },
       };
       tabsStore.addTab(connection.host, connection.port, auth, connection.id, false, connection.startup_script, connection.startup_script_ready_text);
       return;
     }
 
-    // For password auth, try to use saved password
     if (connection.has_saved_password) {
-      try {
-        const password = await getDecryptedPassword(connection.id);
-        if (password) {
-          const auth: AuthConfig = {
-            username: connection.username,
-            method: { type: "password", password },
-          };
-          tabsStore.addTab(connection.host, connection.port, auth, connection.id, true, connection.startup_script, connection.startup_script_ready_text);
-          return;
-        }
-      } catch (e) {
-        console.error("Failed to decrypt password:", e);
-      }
+      const auth: AuthConfig = {
+        username: connection.username,
+        method: { type: "stored_password", connection_id: connection.id },
+      };
+      tabsStore.addTab(connection.host, connection.port, auth, connection.id, true, connection.startup_script, connection.startup_script_ready_text);
+      return;
     }
 
-    // No saved password, open edit dialog to enter password
     onEdit?.(connection);
   }
 
@@ -85,7 +75,7 @@
               {#if connection.has_saved_password}
                 <span class="password-saved" title="Password saved">🔐</span>
               {/if}
-              {#if connection.key_path}
+              {#if connection.key_id}
                 <span class="key-auth" title="SSH Key">🔑</span>
               {/if}
             </div>

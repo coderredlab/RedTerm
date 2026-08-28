@@ -29,7 +29,6 @@ fn main() {
             "ssh_trust_host_key",
             "list_known_hosts",
             "delete_known_host",
-            "get_decrypted_password",
             "upload_ssh_key",
         ]),
     ))

@@ -15,6 +15,7 @@ export interface HostKeyChallengeResult {
   publicKey: string;
   fingerprint: string;
   knownFingerprints?: string[];
+  challengeToken: string;
 }
 
 export type HostKeyPreflightResult = HostKeyTrustedResult | HostKeyChallengeResult;
@@ -27,15 +28,13 @@ export interface HostKeyPromptChallenge {
   publicKey: string;
   fingerprint: string;
   knownFingerprints?: string[];
+  challengeToken: string;
 }
 
 export type HostKeyPromptDecision = "trust" | "cancel";
 
 export interface HostKeyTrustRequest {
-  host: string;
-  port: number;
-  publicKey: string;
-  fingerprint: string;
+  challengeToken: string;
 }
 
 export type HostKeyGateResult =
@@ -65,6 +64,7 @@ function toPromptChallenge(target: HostKeyTarget, result: HostKeyChallengeResult
     publicKey: result.publicKey,
     fingerprint: result.fingerprint,
     knownFingerprints: result.knownFingerprints,
+    challengeToken: result.challengeToken,
   };
 }
 
@@ -95,10 +95,7 @@ export async function runHostKeyGate(options: RunHostKeyGateOptions): Promise<Ho
     sessionId: await completeHostKeyTrustBeforeConnect({
       trustHostKey: () =>
         options.trustHostKey({
-          host: options.target.host,
-          port: options.target.port,
-          publicKey: preflight.publicKey,
-          fingerprint: preflight.fingerprint,
+          challengeToken: preflight.challengeToken,
         }),
       clearHostKeyPrompt: options.clearTrustedHostKeyPrompt ?? (() => {}),
       connect: options.connect,

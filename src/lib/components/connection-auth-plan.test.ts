@@ -10,13 +10,13 @@ describe("connection auth planning", () => {
     const auth = buildConnectionAuthConfig({
       authType: "key",
       username: "deploy",
-      keyPath: "/home/deploy/.ssh/id_ed25519",
+      keyId: "key-1",
       passphrase: "",
     });
 
     expect(auth).toEqual({
       username: "deploy",
-      method: { type: "key", key_path: "/home/deploy/.ssh/id_ed25519" },
+      method: { type: "key", key_id: "key-1" },
     });
     expect(Object.hasOwn(auth.method, "passphrase")).toBe(false);
   });
@@ -25,13 +25,13 @@ describe("connection auth planning", () => {
     const plan = connectionAuthPlan.buildConnectionAuthPlan({
       authType: "key",
       username: "deploy",
-      keyPath: "/home/deploy/.ssh/id_ed25519",
+      keyId: "key-1",
       passphrase: "",
     });
 
     expect(plan.auth).toEqual({
       username: "deploy",
-      method: { type: "key", key_path: "/home/deploy/.ssh/id_ed25519" },
+      method: { type: "key", key_id: "key-1" },
     });
     expect(Object.hasOwn(plan.auth.method, "passphrase")).toBe(false);
   });
@@ -42,7 +42,7 @@ describe("connection auth planning", () => {
     const plan = connectionAuthPlan.buildConnectionAuthPlan({
       authType: "key",
       username: "deploy",
-      keyPath: "/home/deploy/.ssh/id_ed25519",
+      keyId: "key-1",
       passphrase,
     });
 
@@ -50,7 +50,7 @@ describe("connection auth planning", () => {
       username: "deploy",
       method: {
         type: "key",
-        key_path: "/home/deploy/.ssh/id_ed25519",
+        key_id: "key-1",
         passphrase,
       },
     });
@@ -69,6 +69,20 @@ describe("connection auth planning", () => {
     });
   });
 
+  test("keeps saved passwords behind a native connection reference", () => {
+    const auth = buildConnectionAuthConfig({
+      authType: "storedPassword",
+      username: "deploy",
+      connectionId: "connection-1",
+    });
+
+    expect(auth).toEqual({
+      username: "deploy",
+      method: { type: "stored_password", connection_id: "connection-1" },
+    });
+    expect(auth.method).not.toHaveProperty("password");
+  });
+
   test("lets a saved key quick-connect passphrase feed auth without persisting onto the saved connection", () => {
     const savedConnection = {
       id: "conn-key-only",
@@ -76,7 +90,8 @@ describe("connection auth planning", () => {
       host: "prod.example.com",
       port: 22,
       username: "deploy",
-      key_path: "/persisted/keys/id_ed25519",
+      key_id: "key-1",
+      key_name: "id_ed25519",
       has_saved_password: false,
       use_keyboard_interactive: false,
     } satisfies SavedConnection;
@@ -85,7 +100,7 @@ describe("connection auth planning", () => {
     const auth = buildConnectionAuthConfig({
       authType: "key",
       username: savedConnection.username,
-      keyPath: savedConnection.key_path,
+      keyId: savedConnection.key_id,
       passphrase: "entered only for this connect",
     });
 
@@ -93,7 +108,7 @@ describe("connection auth planning", () => {
       username: "deploy",
       method: {
         type: "key",
-        key_path: "/persisted/keys/id_ed25519",
+        key_id: "key-1",
         passphrase: "entered only for this connect",
       },
     });
@@ -105,7 +120,7 @@ describe("connection auth planning", () => {
 describe("key passphrase retry planning", () => {
   const encryptedKeyAuth = {
     username: "deploy",
-    method: { type: "key", key_path: "/home/deploy/.ssh/id_ed25519" },
+    method: { type: "key", key_id: "key-1" },
   };
 
   test("prompts when unknown key auth fails because the private key is encrypted", () => {
@@ -145,7 +160,7 @@ describe("key passphrase retry planning", () => {
           username: "deploy",
           method: {
             type: "key",
-            key_path: "/home/deploy/.ssh/id_ed25519",
+            key_id: "key-1",
             passphrase: "already-entered",
           },
         },
@@ -181,7 +196,7 @@ describe("key passphrase retry planning", () => {
 describe("key passphrase retry cache", () => {
   const encryptedKeyAuth = {
     username: "deploy",
-    method: { type: "key", key_path: "/home/deploy/.ssh/id_ed25519" },
+    method: { type: "key", key_id: "key-1" },
   };
 
   test("keeps a prompted passphrase staged until retry connect succeeds and rolls it back after failure", () => {
@@ -194,14 +209,14 @@ describe("key passphrase retry cache", () => {
       buildConnectionAuthConfig({
         authType: "key",
         username: encryptedKeyAuth.username,
-        keyPath: encryptedKeyAuth.method.key_path,
+        keyId: encryptedKeyAuth.method.key_id,
         passphrase: connectionAuthPlan.getKeyPassphraseForConnect(stagedState),
       })
     ).toEqual({
       username: "deploy",
       method: {
         type: "key",
-        key_path: "/home/deploy/.ssh/id_ed25519",
+        key_id: "key-1",
         passphrase: "wrong-passphrase",
       },
     });

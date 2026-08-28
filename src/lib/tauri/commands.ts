@@ -10,6 +10,7 @@ import type {
 import { VOICE_INPUT_EVENT } from "$lib/voice/voice-input-controller";
 
 export const MAX_CLIPBOARD_IMAGE_BYTES = 10 * 1024 * 1024;
+export const MAX_SSH_KEY_BYTES = 1024 * 1024;
 
 export interface AuthConfig {
   username: string;
@@ -18,7 +19,8 @@ export interface AuthConfig {
 
 export type AuthMethod =
   | { type: "password"; password: string }
-  | { type: "key"; key_path: string; passphrase?: string };
+  | { type: "stored_password"; connection_id: string }
+  | { type: "key"; key_id: string; passphrase?: string };
 
 export interface SshDataEvent {
   session_id: string;
@@ -54,7 +56,7 @@ export interface ClipboardImageResult {
 
 
 export interface UploadedSshKeyResult {
-  key_path: string;
+  key_id: string;
   file_name: string;
 }
 
@@ -64,7 +66,8 @@ export interface SavedConnection {
   host: string;
   port: number;
   username: string;
-  key_path?: string;
+  key_id?: string;
+  key_name?: string;
   has_saved_password: boolean;
   use_keyboard_interactive: boolean;
   startup_script?: string;
@@ -82,19 +85,13 @@ export interface KnownHostEntry {
 export type HostKeyCheckResult =
   | { status: "trusted" }
   | {
-      status: "unknown" | "changed" | "conflict";
+      status: "unknown" | "changed";
       algorithm: string;
       fingerprint: string;
       public_key: string;
       known_fingerprints?: string[];
+      challenge_token: string;
     };
-
-export interface TrustHostKeyRequest {
-  host: string;
-  port: number;
-  public_key: string;
-  fingerprint: string;
-}
 
 export async function sshConnect(
   host: string,
@@ -110,8 +107,8 @@ export async function sshCheckHostKey(host: string, port: number): Promise<HostK
   return invoke<HostKeyCheckResult>("ssh_check_host_key", { host, port });
 }
 
-export async function sshTrustHostKey(request: TrustHostKeyRequest): Promise<void> {
-  return invoke("ssh_trust_host_key", { request });
+export async function sshTrustHostKey(challengeToken: string): Promise<void> {
+  return invoke("ssh_trust_host_key", { challengeToken });
 }
 
 export async function listKnownHosts(): Promise<KnownHostEntry[]> {
@@ -189,15 +186,26 @@ export async function sshUploadClipboardImageFromLocalPath(
   });
 }
 
-export async function uploadSshKey(fileName: string, data: Uint8Array): Promise<UploadedSshKeyResult> {
+export async function uploadSshKey(
+  fileName: string,
+  data: Uint8Array,
+  host: string,
+  port: number,
+  username: string
+): Promise<UploadedSshKeyResult> {
+  if (data.byteLength > MAX_SSH_KEY_BYTES) {
+    throw new Error("SSH key file exceeds 1 MiB");
+  }
   return invoke<UploadedSshKeyResult>("upload_ssh_key", {
     fileName,
-    data: Array.from(data),
+    data,
+    host,
+    port,
+    username,
   });
 }
-
-export async function deleteUploadedSshKey(keyPath: string): Promise<void> {
-  return invoke("delete_uploaded_ssh_key", { keyPath });
+export async function deleteUploadedSshKey(keyId: string): Promise<void> {
+  return invoke("delete_uploaded_ssh_key", { keyId });
 }
 
 export async function listenSshData(
@@ -226,9 +234,6 @@ export async function saveConnection(connection: SavedConnection, password?: str
   return invoke("save_connection", { connection, password });
 }
 
-export async function getDecryptedPassword(connectionId: string): Promise<string | null> {
-  return invoke<string | null>("get_decrypted_password", { connectionId });
-}
 
 export async function deleteConnection(id: string): Promise<void> {
   return invoke("delete_connection", { id });

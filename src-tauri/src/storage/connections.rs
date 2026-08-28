@@ -4,6 +4,7 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,8 +14,10 @@ pub struct SavedConnection {
     pub host: String,
     pub port: u16,
     pub username: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_name: Option<String>,
     #[serde(default)]
     pub has_saved_password: bool,
     #[serde(default)]
@@ -24,6 +27,27 @@ pub struct SavedConnection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_script_ready_text: Option<String>,
 }
+const MANAGED_SSH_KEY_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ManagedSshKeyMetadata {
+    version: u8,
+    key_id: String,
+    file_name: String,
+    host: String,
+    port: u16,
+    username: String,
+}
+
+impl ManagedSshKeyMetadata {
+    fn matches_target(&self, host: &str, port: u16, username: &str) -> bool {
+        self.version == MANAGED_SSH_KEY_VERSION
+            && self.host == normalize_credential_host(host)
+            && self.port == port
+            && self.username == username
+    }
+}
+
 const STORED_CREDENTIAL_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,12 +92,25 @@ pub struct ConnectionsStore {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadedSshKeyResult {
-    pub key_path: String,
+    pub key_id: String,
     pub file_name: String,
 }
 
 const PUBLIC_KEY_UPLOAD_ERROR: &str =
     "Please choose a private key file. Public keys cannot be used for SSH authentication.";
+const MAX_SSH_KEY_BYTES: usize = 1024 * 1024;
+const MAX_MANAGED_SSH_KEYS: usize = 20;
+const MAX_MANAGED_SSH_KEY_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_CONNECTIONS: usize = 100;
+const MAX_CONNECTION_STORE_BYTES: usize = 1024 * 1024;
+const MAX_CONNECTION_ID_BYTES: usize = 64;
+const MAX_CONNECTION_NAME_BYTES: usize = 256;
+const MAX_HOST_BYTES: usize = 253;
+const MAX_USERNAME_BYTES: usize = 256;
+const MAX_STARTUP_SCRIPT_BYTES: usize = 64 * 1024;
+const MAX_SAVED_PASSWORD_BYTES: usize = 64 * 1024;
+static SSH_KEY_STORE_LOCK: Mutex<()> = Mutex::new(());
+static CONNECTION_STORE_LOCK: Mutex<()> = Mutex::new(());
 
 fn is_public_ssh_key_algorithm(algorithm: &str) -> bool {
     let base_algorithm = algorithm
@@ -121,7 +158,7 @@ fn get_app_data_dir(app: &AppHandle) -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const CREDENTIAL_SERVICE: &str = "com.coderred.redterm.saved-connections";
 
 #[cfg(target_os = "android")]
@@ -133,7 +170,16 @@ fn store_secure_value(app: &AppHandle, connection_id: &str, value: &str) -> Resu
     )
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "ios")]
+fn store_secure_value(app: &AppHandle, connection_id: &str, value: &str) -> Result<(), String> {
+    tauri_plugin_redterm_ios_native::store_credential(
+        app,
+        connection_id.to_string(),
+        value.to_string(),
+    )
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn store_secure_value(_app: &AppHandle, connection_id: &str, value: &str) -> Result<(), String> {
     keyring::Entry::new(CREDENTIAL_SERVICE, connection_id)
         .and_then(|entry| entry.set_password(value))
@@ -145,7 +191,12 @@ fn load_secure_value(app: &AppHandle, connection_id: &str) -> Result<Option<Stri
     tauri_plugin_redterm_android_paste::get_credential(app, connection_id.to_string())
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "ios")]
+fn load_secure_value(app: &AppHandle, connection_id: &str) -> Result<Option<String>, String> {
+    tauri_plugin_redterm_ios_native::get_credential(app, connection_id.to_string())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn load_secure_value(_app: &AppHandle, connection_id: &str) -> Result<Option<String>, String> {
     let entry = keyring::Entry::new(CREDENTIAL_SERVICE, connection_id)
         .map_err(|error| error.to_string())?;
@@ -161,7 +212,12 @@ fn delete_secure_value(app: &AppHandle, connection_id: &str) -> Result<(), Strin
     tauri_plugin_redterm_android_paste::delete_credential(app, connection_id.to_string())
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "ios")]
+fn delete_secure_value(app: &AppHandle, connection_id: &str) -> Result<(), String> {
+    tauri_plugin_redterm_ios_native::delete_credential(app, connection_id.to_string())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn delete_secure_value(_app: &AppHandle, connection_id: &str) -> Result<(), String> {
     let entry = keyring::Entry::new(CREDENTIAL_SERVICE, connection_id)
         .map_err(|error| error.to_string())?;
@@ -217,11 +273,16 @@ impl ConnectionsStore {
     pub fn load(app: &AppHandle) -> Result<Self, String> {
         let path = Self::get_config_path(app);
         let store = if path.exists() {
+            let metadata = fs::metadata(&path).map_err(|error| error.to_string())?;
+            if metadata.len() > MAX_CONNECTION_STORE_BYTES as u64 {
+                return Err("Saved connection storage exceeds 1 MiB".to_string());
+            }
             let json = fs::read_to_string(&path).map_err(|error| error.to_string())?;
             serde_json::from_str(&json).map_err(|error| error.to_string())?
         } else {
             Self::default()
         };
+        validate_connection_store(&store)?;
 
         Ok(store)
     }
@@ -229,6 +290,9 @@ impl ConnectionsStore {
     pub fn save(&self, app: &AppHandle) -> Result<(), String> {
         let path = Self::get_config_path(app);
         let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        if json.len() > MAX_CONNECTION_STORE_BYTES {
+            return Err("Saved connection storage exceeds 1 MiB".to_string());
+        }
 
         #[cfg(unix)]
         {
@@ -286,74 +350,185 @@ fn get_ssh_keys_dir(app: &AppHandle) -> Result<PathBuf, String> {
     fs::canonicalize(dir).map_err(|e| e.to_string())
 }
 
-fn resolve_managed_ssh_key_path(keys_dir: &Path, key_path: &str) -> Result<PathBuf, String> {
-    let canonical_keys_dir = fs::canonicalize(keys_dir).map_err(|e| e.to_string())?;
-    let candidate = PathBuf::from(key_path);
-    let file_name = candidate
-        .file_name()
-        .ok_or_else(|| "Invalid managed SSH key path".to_string())?;
-    let expected_path = canonical_keys_dir.join(file_name);
+fn validate_managed_ssh_key_id(key_id: &str) -> Result<(), String> {
+    let parsed = uuid::Uuid::parse_str(key_id)
+        .map_err(|_| "Invalid managed SSH key identifier".to_string())?;
+    if parsed.to_string() != key_id {
+        return Err("Invalid managed SSH key identifier".to_string());
+    }
+    Ok(())
+}
 
-    if candidate != expected_path {
-        return Err("SSH key path is outside the managed key directory".to_string());
+fn managed_ssh_key_path(keys_dir: &Path, key_id: &str) -> Result<PathBuf, String> {
+    validate_managed_ssh_key_id(key_id)?;
+    Ok(keys_dir.join(format!("{key_id}.key")))
+}
+
+fn managed_ssh_key_metadata_path(keys_dir: &Path, key_id: &str) -> Result<PathBuf, String> {
+    validate_managed_ssh_key_id(key_id)?;
+    Ok(keys_dir.join(format!("{key_id}.json")))
+}
+
+fn resolve_managed_ssh_key_path(
+    keys_dir: &Path,
+    key_id: &str,
+    host: &str,
+    port: u16,
+    username: &str,
+) -> Result<PathBuf, String> {
+    let canonical_keys_dir = fs::canonicalize(keys_dir).map_err(|e| e.to_string())?;
+    let candidate = managed_ssh_key_path(&canonical_keys_dir, key_id)?;
+    let metadata = fs::symlink_metadata(&candidate).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => "Managed SSH key is unavailable".to_string(),
+        _ => error.to_string(),
+    })?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err("Managed SSH key is not a regular file".to_string());
     }
 
-    let metadata = match fs::symlink_metadata(&candidate) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(expected_path),
-        Err(error) => return Err(error.to_string()),
-    };
-    if metadata.file_type().is_symlink() {
-        return Err("Managed SSH key path cannot be a symbolic link".to_string());
+    let metadata_path = managed_ssh_key_metadata_path(&canonical_keys_dir, key_id)?;
+    let metadata_bytes = fs::read(&metadata_path)
+        .map_err(|_| "Managed SSH key metadata is unavailable".to_string())?;
+    if metadata_bytes.len() > 4096 {
+        return Err("Managed SSH key metadata is invalid".to_string());
+    }
+    let key_metadata: ManagedSshKeyMetadata = serde_json::from_slice(&metadata_bytes)
+        .map_err(|_| "Managed SSH key metadata is invalid".to_string())?;
+    if key_metadata.key_id != key_id || !key_metadata.matches_target(host, port, username) {
+        return Err(
+            "Managed SSH key does not match this host, port, and username. Please select the key again."
+                .to_string(),
+        );
     }
 
     let canonical_candidate = fs::canonicalize(&candidate).map_err(|e| e.to_string())?;
     if canonical_candidate.parent() != Some(canonical_keys_dir.as_path()) {
-        return Err("SSH key path is outside the managed key directory".to_string());
+        return Err("Managed SSH key is outside the managed key directory".to_string());
     }
-
     Ok(canonical_candidate)
 }
 
-fn delete_managed_ssh_key_file(app: &AppHandle, key_path: &str) -> Result<(), String> {
-    let keys_dir = get_ssh_keys_dir(app)?;
-    let safe_path = resolve_managed_ssh_key_path(&keys_dir, key_path)?;
-
-    match fs::remove_file(safe_path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.to_string()),
+fn managed_ssh_key_usage(keys_dir: &Path) -> Result<(usize, u64), String> {
+    let mut key_count = 0;
+    let mut total_bytes = 0_u64;
+    for entry in fs::read_dir(keys_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err("Managed SSH key directory contains an invalid entry".to_string());
+        }
+        match path.extension().and_then(|value| value.to_str()) {
+            Some("key") => key_count += 1,
+            Some("json") => {}
+            _ => return Err("Managed SSH key directory contains an invalid entry".to_string()),
+        }
+        total_bytes = total_bytes.saturating_add(metadata.len());
     }
+    Ok((key_count, total_bytes))
+}
+
+fn delete_managed_ssh_key_file(app: &AppHandle, key_id: &str) -> Result<(), String> {
+    let _guard = SSH_KEY_STORE_LOCK
+        .lock()
+        .map_err(|_| "Managed SSH key store lock was poisoned".to_string())?;
+    let keys_dir = get_ssh_keys_dir(app)?;
+    let key_path = managed_ssh_key_path(&keys_dir, key_id)?;
+    let metadata_path = managed_ssh_key_metadata_path(&keys_dir, key_id)?;
+    for path in [key_path, metadata_path] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
+            {
+                fs::remove_file(path).map_err(|e| e.to_string())?;
+            }
+            Ok(_) => return Err("Managed SSH key is not a regular file".to_string()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
 }
 
 fn store_uploaded_ssh_key(
     keys_dir: &Path,
     file_name: &str,
     data: &[u8],
+    host: &str,
+    port: u16,
+    username: &str,
 ) -> Result<UploadedSshKeyResult, String> {
     if data.is_empty() {
         return Err("SSH key file is empty".to_string());
+    }
+    if data.len() > MAX_SSH_KEY_BYTES {
+        return Err("SSH key file exceeds 1 MiB".to_string());
+    }
+    if file_name.len() > 255 {
+        return Err("SSH key file name is too long".to_string());
+    }
+    if host.trim().is_empty()
+        || host.len() > MAX_HOST_BYTES
+        || username.trim().is_empty()
+        || username.len() > MAX_USERNAME_BYTES
+    {
+        return Err("SSH key target metadata is invalid".to_string());
     }
     if is_public_ssh_key_content(data) {
         return Err(PUBLIC_KEY_UPLOAD_ERROR.to_string());
     }
 
     let safe_name = sanitize_file_name(file_name);
-    let file_path = keys_dir.join(format!("{}-{}", uuid::Uuid::new_v4(), safe_name));
+    let key_id = uuid::Uuid::new_v4().to_string();
+    let key_metadata = ManagedSshKeyMetadata {
+        version: MANAGED_SSH_KEY_VERSION,
+        key_id: key_id.clone(),
+        file_name: safe_name.clone(),
+        host: normalize_credential_host(host),
+        port,
+        username: username.to_string(),
+    };
+    let metadata_bytes = serde_json::to_vec(&key_metadata).map_err(|error| error.to_string())?;
+    let (key_count, total_bytes) = managed_ssh_key_usage(keys_dir)?;
+    if key_count >= MAX_MANAGED_SSH_KEYS
+        || total_bytes
+            .saturating_add(data.len() as u64)
+            .saturating_add(metadata_bytes.len() as u64)
+            > MAX_MANAGED_SSH_KEY_BYTES
+    {
+        return Err("Managed SSH key storage limit reached".to_string());
+    }
+
+    let key_path = managed_ssh_key_path(keys_dir, &key_id)?;
+    let metadata_path = managed_ssh_key_metadata_path(keys_dir, &key_id)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
 
-    let mut file = options.open(&file_path).map_err(|e| e.to_string())?;
-    if let Err(error) = file.write_all(data) {
-        drop(file);
-        let _ = fs::remove_file(&file_path);
+    let mut key_file = options.open(&key_path).map_err(|e| e.to_string())?;
+    if let Err(error) = key_file.write_all(data) {
+        drop(key_file);
+        let _ = fs::remove_file(&key_path);
+        return Err(error.to_string());
+    }
+    drop(key_file);
+
+    let mut metadata_options = OpenOptions::new();
+    metadata_options.write(true).create_new(true);
+    #[cfg(unix)]
+    metadata_options.mode(0o600);
+    let metadata_result = metadata_options
+        .open(&metadata_path)
+        .and_then(|mut file| file.write_all(&metadata_bytes));
+    if let Err(error) = metadata_result {
+        let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(&metadata_path);
         return Err(error.to_string());
     }
 
     Ok(UploadedSshKeyResult {
-        key_path: file_path.to_string_lossy().into_owned(),
+        key_id,
         file_name: safe_name,
     })
 }
@@ -363,14 +538,71 @@ pub fn upload_ssh_key(
     app: AppHandle,
     file_name: String,
     data: Vec<u8>,
+    host: String,
+    port: u16,
+    username: String,
 ) -> Result<UploadedSshKeyResult, String> {
+    let _guard = SSH_KEY_STORE_LOCK
+        .lock()
+        .map_err(|_| "Managed SSH key store lock was poisoned".to_string())?;
     let keys_dir = get_ssh_keys_dir(&app)?;
-    store_uploaded_ssh_key(&keys_dir, &file_name, &data)
+    store_uploaded_ssh_key(&keys_dir, &file_name, &data, &host, port, &username)
 }
 
 #[tauri::command]
-pub fn delete_uploaded_ssh_key(app: AppHandle, key_path: String) -> Result<(), String> {
-    delete_managed_ssh_key_file(&app, &key_path)
+pub fn delete_uploaded_ssh_key(app: AppHandle, key_id: String) -> Result<(), String> {
+    delete_managed_ssh_key_file(&app, &key_id)
+}
+
+fn validate_saved_connection(
+    connection: &SavedConnection,
+    password: Option<&str>,
+) -> Result<(), String> {
+    let parsed_id = uuid::Uuid::parse_str(&connection.id)
+        .map_err(|_| "Connection identifier is invalid".to_string())?;
+    if parsed_id.to_string() != connection.id || connection.id.len() > MAX_CONNECTION_ID_BYTES {
+        return Err("Connection identifier is invalid".to_string());
+    }
+    if connection.name.trim().is_empty()
+        || connection.name.len() > MAX_CONNECTION_NAME_BYTES
+        || connection.host.trim().is_empty()
+        || connection.host.len() > MAX_HOST_BYTES
+        || connection.username.trim().is_empty()
+        || connection.username.len() > MAX_USERNAME_BYTES
+    {
+        return Err("Connection metadata exceeds the allowed size".to_string());
+    }
+    if connection
+        .startup_script
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_STARTUP_SCRIPT_BYTES)
+        || connection
+            .startup_script_ready_text
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_STARTUP_SCRIPT_BYTES)
+    {
+        return Err("Startup script exceeds 64 KiB".to_string());
+    }
+    match (&connection.key_id, &connection.key_name) {
+        (Some(_), Some(name)) if name.len() <= 255 && sanitize_file_name(name) == *name => {}
+        (None, None) => {}
+        _ => return Err("Managed SSH key metadata is invalid".to_string()),
+    }
+    if password.is_some_and(|value| value.len() > MAX_SAVED_PASSWORD_BYTES) {
+        return Err("Saved password exceeds 64 KiB".to_string());
+    }
+    Ok(())
+}
+
+fn validate_connection_store(store: &ConnectionsStore) -> Result<(), String> {
+    if store.connections.len() > MAX_CONNECTIONS {
+        return Err("Saved connection limit reached".to_string());
+    }
+    let serialized = serde_json::to_vec(store).map_err(|error| error.to_string())?;
+    if serialized.len() > MAX_CONNECTION_STORE_BYTES {
+        return Err("Saved connection storage exceeds 1 MiB".to_string());
+    }
+    Ok(())
 }
 
 // Tauri commands for connections
@@ -385,13 +617,35 @@ pub fn save_connection(
     mut connection: SavedConnection,
     password: Option<String>,
 ) -> Result<(), String> {
+    let _guard = CONNECTION_STORE_LOCK
+        .lock()
+        .map_err(|_| "Connection store lock was poisoned".to_string())?;
+    if password.as_ref().is_some_and(|value| !value.is_empty()) {
+        connection.has_saved_password = true;
+    }
+    validate_saved_connection(&connection, password.as_deref())?;
+
+    if let Some(key_id) = connection.key_id.as_deref() {
+        let keys_dir = get_ssh_keys_dir(&app)?;
+        resolve_managed_ssh_key_path(
+            &keys_dir,
+            key_id,
+            &connection.host,
+            connection.port,
+            &connection.username,
+        )?;
+    }
+
     let connection_id = connection.id.clone();
-    let mut store = ConnectionsStore::load(&app)?;
+    let store = ConnectionsStore::load(&app)?;
     let existing_connection = store
         .connections
         .iter()
         .find(|stored| stored.id == connection_id);
-    let existing_key_path = existing_connection.and_then(|stored| stored.key_path.clone());
+    if existing_connection.is_none() && store.connections.len() >= MAX_CONNECTIONS {
+        return Err("Saved connection limit reached".to_string());
+    }
+    let existing_key_id = existing_connection.and_then(|stored| stored.key_id.clone());
     let previous_credential = if existing_connection.is_some_and(|stored| stored.has_saved_password)
     {
         load_secure_password(&app, &connection_id)?
@@ -399,11 +653,14 @@ pub fn save_connection(
         None
     };
 
+    let mut candidate_store = store.clone();
+    candidate_store.add_connection(connection.clone());
+    validate_connection_store(&candidate_store)?;
+
     match password {
         Some(password) if !password.is_empty() => {
             let credential = StoredCredential::new(&connection, password);
             store_secure_password(&app, &connection_id, &credential)?;
-            connection.has_saved_password = true;
         }
         Some(_) => return Err("Saved password cannot be empty".to_string()),
         None if connection.has_saved_password && previous_credential.is_none() => {
@@ -426,8 +683,7 @@ pub fn save_connection(
         None => {}
     }
 
-    store.add_connection(connection);
-    if let Err(save_error) = store.save(&app) {
+    if let Err(save_error) = candidate_store.save(&app) {
         let rollback_error =
             restore_secure_password(&app, &connection_id, previous_credential.as_ref()).err();
         return Err(match rollback_error {
@@ -438,39 +694,42 @@ pub fn save_connection(
         });
     }
 
-    if let Some(old_key_path) = existing_key_path {
-        let new_key_path = store
-            .connections
-            .iter()
-            .find(|conn| conn.id == connection_id)
-            .and_then(|conn| conn.key_path.as_deref());
-
-        if new_key_path != Some(old_key_path.as_str()) {
-            delete_managed_ssh_key_file(&app, &old_key_path)?;
+    if let Some(old_key_id) = existing_key_id {
+        if connection.key_id.as_deref() != Some(old_key_id.as_str()) {
+            delete_managed_ssh_key_file(&app, &old_key_id)?;
         }
     }
 
     Ok(())
 }
 
-#[tauri::command]
-pub fn get_decrypted_password(
-    app: AppHandle,
-    connection_id: String,
-) -> Result<Option<String>, String> {
-    let store = ConnectionsStore::load(&app)?;
-    let Some(connection) = store
+pub(crate) fn load_saved_password_for_connection(
+    app: &AppHandle,
+    connection_id: &str,
+    host: &str,
+    port: u16,
+    username: &str,
+) -> Result<String, String> {
+    let store = ConnectionsStore::load(app)?;
+    let connection = store
         .connections
         .iter()
         .find(|stored| stored.id == connection_id)
-    else {
-        return Ok(None);
-    };
+        .ok_or_else(|| "Saved connection is unavailable".to_string())?;
     if !connection.has_saved_password {
-        return Ok(None);
+        return Err("Saved password is unavailable".to_string());
+    }
+    if normalize_credential_host(&connection.host) != normalize_credential_host(host)
+        || connection.port != port
+        || connection.username != username
+    {
+        return Err(
+            "Saved credential does not match this host, port, and username. Please re-enter the password."
+                .to_string(),
+        );
     }
 
-    let credential = load_secure_password(&app, &connection_id)?.ok_or_else(|| {
+    let credential = load_secure_password(app, connection_id)?.ok_or_else(|| {
         "Saved password is unavailable in the platform credential store".to_string()
     })?;
     if !credential.matches(connection) {
@@ -479,17 +738,35 @@ pub fn get_decrypted_password(
                 .to_string(),
         );
     }
-    Ok(Some(credential.password))
+    Ok(credential.password)
+}
+
+pub(crate) fn resolve_uploaded_key_for_auth(
+    app: &AppHandle,
+    key_id: &str,
+    host: &str,
+    port: u16,
+    username: &str,
+) -> Result<String, String> {
+    let keys_dir = get_ssh_keys_dir(app)?;
+    Ok(
+        resolve_managed_ssh_key_path(&keys_dir, key_id, host, port, username)?
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 #[tauri::command]
 pub fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
+    let _guard = CONNECTION_STORE_LOCK
+        .lock()
+        .map_err(|_| "Connection store lock was poisoned".to_string())?;
     let mut store = ConnectionsStore::load(&app)?;
     let existing_connection = store
         .connections
         .iter()
         .find(|connection| connection.id == id);
-    let key_path = existing_connection.and_then(|connection| connection.key_path.clone());
+    let key_id = existing_connection.and_then(|connection| connection.key_id.clone());
     let previous_credential =
         if existing_connection.is_some_and(|connection| connection.has_saved_password) {
             load_secure_password(&app, &id)?
@@ -511,8 +788,8 @@ pub fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
         });
     }
 
-    if let Some(key_path) = key_path {
-        delete_managed_ssh_key_file(&app, &key_path)?;
+    if let Some(key_id) = key_id {
+        delete_managed_ssh_key_file(&app, &key_id)?;
     }
 
     Ok(())
@@ -521,17 +798,15 @@ pub fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn assert_no_uploaded_key_with_name(keys_dir: &Path, safe_name: &str) {
-        let copied_files: Vec<_> = fs::read_dir(keys_dir)
+    fn assert_key_store_empty(keys_dir: &Path) {
+        let files: Vec<_> = fs::read_dir(keys_dir)
             .expect("failed to list ssh-keys dir")
             .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().ends_with(safe_name))
             .map(|entry| entry.path())
             .collect();
-
         assert!(
-            copied_files.is_empty(),
-            "public key content must be rejected before copying into ssh-keys; found {copied_files:?}"
+            files.is_empty(),
+            "rejected key must not create files: {files:?}"
         );
     }
 
@@ -543,7 +818,8 @@ mod tests {
             host: "Example.COM.".to_string(),
             port: 22,
             username: "deploy".to_string(),
-            key_path: None,
+            key_id: None,
+            key_name: None,
             has_saved_password: true,
             use_keyboard_interactive: false,
             startup_script: None,
@@ -573,46 +849,95 @@ mod tests {
     }
 
     #[test]
-    fn managed_key_path_rejects_traversal_nested_paths_and_symlinks() {
+    fn connection_storage_enforces_field_count_and_total_budgets() {
+        let connection = SavedConnection {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Production".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "deploy".to_string(),
+            key_id: None,
+            key_name: None,
+            has_saved_password: false,
+            use_keyboard_interactive: false,
+            startup_script: None,
+            startup_script_ready_text: None,
+        };
+        assert!(validate_saved_connection(&connection, None).is_ok());
+
+        let mut oversized = connection.clone();
+        oversized.startup_script = Some("x".repeat(MAX_STARTUP_SCRIPT_BYTES + 1));
+        assert!(validate_saved_connection(&oversized, None).is_err());
+        assert!(validate_saved_connection(
+            &connection,
+            Some(&"x".repeat(MAX_SAVED_PASSWORD_BYTES + 1)),
+        )
+        .is_err());
+
+        let mut store = ConnectionsStore::default();
+        for _ in 0..=MAX_CONNECTIONS {
+            let mut item = connection.clone();
+            item.id = uuid::Uuid::new_v4().to_string();
+            store.connections.push(item);
+        }
+        assert!(validate_connection_store(&store).is_err());
+    }
+
+    #[test]
+    fn managed_key_ids_are_opaque_and_bound_to_the_connection_target() {
         let root =
             std::env::temp_dir().join(format!("redterm-managed-key-test-{}", uuid::Uuid::new_v4()));
         let keys_dir = root.join("ssh-keys");
         fs::create_dir_all(&keys_dir).expect("failed to create managed key test dir");
-        let canonical_keys_dir =
-            fs::canonicalize(&keys_dir).expect("failed to canonicalize managed key test dir");
+        let uploaded = store_uploaded_ssh_key(
+            &keys_dir,
+            "id_ed25519",
+            b"private-key",
+            "Example.COM.",
+            22,
+            "deploy",
+        )
+        .expect("failed to store managed key fixture");
 
-        let valid_key = canonical_keys_dir.join("valid-key");
-        fs::write(&valid_key, b"private-key").expect("failed to write managed key fixture");
+        let resolved =
+            resolve_managed_ssh_key_path(&keys_dir, &uploaded.key_id, "example.com", 22, "deploy")
+                .expect("bound key should resolve");
         assert_eq!(
-            resolve_managed_ssh_key_path(&canonical_keys_dir, valid_key.to_str().unwrap()).unwrap(),
-            valid_key
+            resolved,
+            fs::canonicalize(keys_dir.join(format!("{}.key", uploaded.key_id))).unwrap()
         );
-
-        let traversal = canonical_keys_dir.join("../connections.json");
-        assert!(
-            resolve_managed_ssh_key_path(&canonical_keys_dir, traversal.to_str().unwrap()).is_err()
-        );
-
-        let nested_dir = canonical_keys_dir.join("nested");
-        fs::create_dir_all(&nested_dir).expect("failed to create nested key dir");
-        let nested_key = nested_dir.join("key");
-        fs::write(&nested_key, b"private-key").expect("failed to write nested key fixture");
-        assert!(
-            resolve_managed_ssh_key_path(&canonical_keys_dir, nested_key.to_str().unwrap())
-                .is_err()
-        );
+        assert!(resolve_managed_ssh_key_path(
+            &keys_dir,
+            &uploaded.key_id,
+            "attacker.example",
+            22,
+            "deploy",
+        )
+        .is_err());
+        assert!(resolve_managed_ssh_key_path(
+            &keys_dir,
+            "../connections.json",
+            "example.com",
+            22,
+            "deploy",
+        )
+        .is_err());
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::symlink;
 
+            let key_path = keys_dir.join(format!("{}.key", uploaded.key_id));
+            fs::remove_file(&key_path).expect("failed to remove managed key fixture");
             let outside_file = root.join("outside");
             fs::write(&outside_file, b"outside").expect("failed to write outside fixture");
-            let key_symlink = canonical_keys_dir.join("key-link");
-            symlink(&outside_file, &key_symlink).expect("failed to create key symlink fixture");
+            symlink(&outside_file, &key_path).expect("failed to create key symlink fixture");
             assert!(resolve_managed_ssh_key_path(
-                &canonical_keys_dir,
-                key_symlink.to_str().unwrap()
+                &keys_dir,
+                &uploaded.key_id,
+                "example.com",
+                22,
+                "deploy",
             )
             .is_err());
         }
@@ -643,6 +968,21 @@ mod tests {
             std::env::temp_dir().join(format!("redterm-upload-key-test-{}", uuid::Uuid::new_v4()));
         let keys_dir = root.join("ssh-keys");
         fs::create_dir_all(&keys_dir).expect("failed to create SSH key test dir");
+        let oversized_key = vec![0_u8; MAX_SSH_KEY_BYTES + 1];
+        assert_eq!(
+            store_uploaded_ssh_key(
+                &keys_dir,
+                "oversized-key",
+                &oversized_key,
+                "example.com",
+                22,
+                "deploy",
+            )
+            .unwrap_err(),
+            "SSH key file exceeds 1 MiB"
+        );
+        assert_key_store_empty(&keys_dir);
+
         let public_key_cases = [
             (
                 "public-ed25519-redterm-test.pub",
@@ -687,26 +1027,20 @@ mod tests {
         ];
 
         for (file_name, content) in public_key_cases {
-            let safe_name = sanitize_file_name(file_name);
-            let result = store_uploaded_ssh_key(&keys_dir, file_name, content.as_bytes());
+            let result = store_uploaded_ssh_key(
+                &keys_dir,
+                file_name,
+                content.as_bytes(),
+                "example.com",
+                22,
+                "deploy",
+            );
 
-            match result {
-                Ok(uploaded) => {
-                    let _ = fs::remove_file(&uploaded.key_path);
-                    panic!(
-                        "expected public key content in {file_name} to be rejected before upload, but it was stored at {}",
-                        uploaded.key_path
-                    );
-                }
-                Err(message) => {
-                    assert_eq!(
-                        message,
-                        "Please choose a private key file. Public keys cannot be used for SSH authentication."
-                    );
-                }
-            }
-
-            assert_no_uploaded_key_with_name(&keys_dir, &safe_name);
+            assert_eq!(
+                result.unwrap_err(),
+                "Please choose a private key file. Public keys cannot be used for SSH authentication."
+            );
+            assert_key_store_empty(&keys_dir);
         }
 
         let private_key_cases = [
@@ -733,24 +1067,72 @@ mod tests {
         ];
 
         for (file_name, content) in private_key_cases {
-            let result = store_uploaded_ssh_key(&keys_dir, file_name, content.as_bytes())
-                .expect("private key headers should be accepted for upload");
+            let result = store_uploaded_ssh_key(
+                &keys_dir,
+                file_name,
+                content.as_bytes(),
+                "example.com",
+                22,
+                "deploy",
+            )
+            .expect("private key headers should be accepted for upload");
 
             assert_eq!(result.file_name, sanitize_file_name(file_name));
-            let stored = fs::read(&result.key_path).expect("uploaded key should be copied");
+            let key_path = keys_dir.join(format!("{}.key", result.key_id));
+            let metadata_path = keys_dir.join(format!("{}.json", result.key_id));
+            let stored = fs::read(&key_path).expect("uploaded key should be copied");
             assert_eq!(stored, content.as_bytes());
+            let metadata: ManagedSshKeyMetadata = serde_json::from_slice(
+                &fs::read(&metadata_path).expect("managed key metadata should exist"),
+            )
+            .expect("managed key metadata should deserialize");
+            assert!(metadata.matches_target("EXAMPLE.COM.", 22, "deploy"));
 
             #[cfg(unix)]
             {
-                let permissions = fs::metadata(&result.key_path)
+                let permissions = fs::metadata(&key_path)
                     .expect("uploaded key metadata should be readable")
                     .permissions();
                 assert_eq!(permissions.mode() & 0o777, 0o600);
             }
 
-            fs::remove_file(&result.key_path).expect("failed to remove uploaded key fixture");
+            fs::remove_file(key_path).expect("failed to remove uploaded key fixture");
+            fs::remove_file(metadata_path).expect("failed to remove uploaded key metadata");
         }
 
         fs::remove_dir_all(root).expect("failed to remove SSH key test dir");
+    }
+    #[test]
+    fn managed_key_storage_enforces_aggregate_file_limit() {
+        let root =
+            std::env::temp_dir().join(format!("redterm-key-quota-test-{}", uuid::Uuid::new_v4()));
+        let keys_dir = root.join("ssh-keys");
+        fs::create_dir_all(&keys_dir).expect("failed to create SSH key quota dir");
+
+        for index in 0..MAX_MANAGED_SSH_KEYS {
+            store_uploaded_ssh_key(
+                &keys_dir,
+                &format!("key-{index}"),
+                b"private-key",
+                "example.com",
+                22,
+                "deploy",
+            )
+            .expect("key within aggregate quota should be stored");
+        }
+        assert_eq!(
+            store_uploaded_ssh_key(
+                &keys_dir,
+                "key-over-limit",
+                b"private-key",
+                "example.com",
+                22,
+                "deploy",
+            )
+            .unwrap_err(),
+            "Managed SSH key storage limit reached"
+        );
+
+        fs::remove_dir_all(root).expect("failed to remove SSH key quota dir");
     }
 }

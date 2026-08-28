@@ -6,6 +6,11 @@ export interface TerminalUrlMatch {
   endCol: number;
 }
 
+export interface SafeTerminalUrl {
+  url: string;
+  origin: string;
+}
+
 const URL_PATTERN = /https?:\/\/[^\s<>"'`]+/gi;
 const URL_CONTINUATION_PATTERN = /^[A-Za-z0-9/?#%&=._~:+-]/;
 const TRAILING_PROSE_PUNCTUATION: Record<string, true> = {
@@ -21,6 +26,7 @@ const CLOSING_DELIMITERS: Record<string, string> = {
   "]": "[",
   "}": "{",
 };
+const UNSAFE_URL_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u;
 
 
 function countChar(value: string, target: string): number {
@@ -59,6 +65,30 @@ function trimUrlCandidate(candidate: string): string {
   return candidate.slice(0, end);
 }
 
+export function validateTerminalUrl(candidate: string): SafeTerminalUrl | null {
+  if (UNSAFE_URL_CONTROLS.test(candidate)) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    return null;
+  }
+  if (
+    (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+    !parsed.hostname ||
+    parsed.username ||
+    parsed.password
+  ) {
+    return null;
+  }
+
+  return {
+    url: parsed.href,
+    origin: parsed.port ? `${parsed.hostname}:${parsed.port}` : parsed.hostname,
+  };
+}
+
 export function findUrlAtCell(
   buffer: Cell[][],
   point: { row: number; col: number },
@@ -85,7 +115,11 @@ export function findUrlAtCell(
     }
 
     if (point.col >= startCol && point.col <= endCol) {
-      return { url, startCol, endCol };
+      if (row.slice(startCol, endCol + 1).some((cell) => cell.style.hidden)) {
+        return null;
+      }
+      const safeUrl = validateTerminalUrl(url);
+      return safeUrl ? { url: safeUrl.url, startCol, endCol } : null;
     }
   }
 

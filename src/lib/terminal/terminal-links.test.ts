@@ -2,7 +2,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { DEFAULT_STYLE, type Cell } from "./ansi-parser";
-import { findUrlAtCell } from "./terminal-links";
+import { findUrlAtCell, validateTerminalUrl } from "./terminal-links";
 
 function bufferFromRows(...texts: string[]): Cell[][] {
   return texts.map((text) =>
@@ -71,4 +71,30 @@ describe("findUrlAtCell", () => {
     expect(findUrlAtCell(buffer, { row: 0, col: firstRow.indexOf("example") })).toBeNull();
   });
 
+
+  test("does not make URLs with hidden cells clickable", () => {
+    const url = "https://example.com/path";
+    const buffer = bufferFromRows(url);
+    buffer[0]["https://".length + 2].style = { ...DEFAULT_STYLE, hidden: true };
+
+    expect(findUrlAtCell(buffer, { row: 0, col: 10 })).toBeNull();
+  });
+});
+
+describe("validateTerminalUrl", () => {
+  test("normalizes safe HTTP origins for confirmation and opening", () => {
+    expect(validateTerminalUrl("HTTPS://EXAMPLE.COM:443/path?q=1")).toEqual({
+      url: "https://example.com/path?q=1",
+      origin: "example.com",
+    });
+    expect(validateTerminalUrl("http://example.com:8080/")).toEqual({
+      url: "http://example.com:8080/",
+      origin: "example.com:8080",
+    });
+  });
+
+  test("rejects userinfo and bidirectional control characters", () => {
+    expect(validateTerminalUrl("https://trusted.example@evil.example/")).toBeNull();
+    expect(validateTerminalUrl("https://evil.example/\u202etrusted.example")).toBeNull();
+  });
 });

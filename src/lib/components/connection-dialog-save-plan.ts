@@ -13,8 +13,8 @@ interface BuildConnectionDialogSavePlanInput {
   username: string;
   authType: ConnectionDialogAuthType;
   password: string;
-  actualPassword: string;
-  keyPath: string;
+  keyId: string;
+  keyName: string;
   saveConnectionChecked: boolean;
   savePasswordChecked: boolean;
   startupScript?: string;
@@ -36,8 +36,8 @@ export function buildConnectionDialogSavePlan({
   username,
   authType,
   password,
-  actualPassword,
-  keyPath,
+  keyId,
+  keyName,
   saveConnectionChecked,
   savePasswordChecked,
   startupScript,
@@ -45,7 +45,7 @@ export function buildConnectionDialogSavePlan({
 }: BuildConnectionDialogSavePlanInput): ConnectionDialogSavePlan {
   const isUsingStoredPassword = password === STORED_PASSWORD_PLACEHOLDER && Boolean(editConnection?.id);
   const passwordToSave = authType === "password" && savePasswordChecked && !isUsingStoredPassword
-    ? actualPassword
+    ? password
     : undefined;
 
   return {
@@ -55,7 +55,8 @@ export function buildConnectionDialogSavePlan({
       host,
       port,
       username,
-      key_path: authType === "key" ? keyPath : undefined,
+      key_id: authType === "key" ? keyId : undefined,
+      key_name: authType === "key" ? keyName : undefined,
       has_saved_password:
         authType === "password" && saveConnectionChecked && savePasswordChecked,
       use_keyboard_interactive: false,

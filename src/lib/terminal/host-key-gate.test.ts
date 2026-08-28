@@ -14,6 +14,7 @@ const presentedKey = {
   algorithm: "ssh-ed25519",
   publicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMhTestPresentedKey redterm-test",
   fingerprint: "SHA256:presented-key-fingerprint",
+  challengeToken: "challenge-presented-key",
 };
 
 function unknownPreflight(): HostKeyPreflightResult {
@@ -94,7 +95,7 @@ describe("host key gate planning", () => {
     promptDecision.resolve("trust");
 
     await expect(resultPromise).resolves.toEqual({ status: "connected", sessionId: "session-approved" });
-    expect(trustWrites).toEqual([{ host: target.host, port: target.port, publicKey: presentedKey.publicKey, fingerprint: presentedKey.fingerprint }]);
+    expect(trustWrites).toEqual([{ challengeToken: presentedKey.challengeToken }]);
     expect(connects).toEqual(["connect"]);
   });
 
@@ -189,6 +190,7 @@ describe("host key gate planning", () => {
         publicKey: `ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIChangedApproval${status} redterm-test`,
         fingerprint: `SHA256:${status}-presented-key-fingerprint`,
         knownFingerprints: [`SHA256:${status}-previously-trusted-key`],
+        challengeToken: `challenge-${status}`,
       } satisfies HostKeyPreflightResult;
       const prompts: HostKeyPromptChallenge[] = [];
       const trustWrites: HostKeyTrustRequest[] = [];
@@ -227,6 +229,7 @@ describe("host key gate planning", () => {
           publicKey: preflight.publicKey,
           fingerprint: preflight.fingerprint,
           knownFingerprints: preflight.knownFingerprints,
+          challengeToken: preflight.challengeToken,
         },
       ]);
       expect(trustWrites).toEqual([]);
@@ -238,10 +241,7 @@ describe("host key gate planning", () => {
 
       expect(trustWrites).toEqual([
         {
-          host: target.host,
-          port: target.port,
-          publicKey: preflight.publicKey,
-          fingerprint: preflight.fingerprint,
+          challengeToken: preflight.challengeToken,
         },
       ]);
       expect(connects).toEqual([]);
