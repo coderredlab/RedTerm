@@ -1,6 +1,7 @@
 <script lang="ts">
   import ConnectionList from "$lib/components/ConnectionList.svelte";
   import type { SavedConnection } from "$lib/tauri/commands";
+  import FileExplorer from "./FileExplorer.svelte";
   import {
     desktopPrefsStore,
     MAX_SIDEBAR_WIDTH,
@@ -10,20 +11,26 @@
   interface Props {
     collapsed: boolean;
     width: number;
+    activeSessionId: string | null;
     onToggleCollapsed: () => void;
     onWidthChange: (width: number) => void;
     onEdit: (connection: SavedConnection) => void;
     onNewConnection: () => void;
+    onPreview: (entry: { name: string; path: string; size: number }) => void;
   }
 
   let {
     collapsed,
     width,
+    activeSessionId,
     onToggleCollapsed,
     onWidthChange,
     onEdit,
     onNewConnection,
+    onPreview,
   }: Props = $props();
+
+  let view = $state<"connections" | "files">("connections");
 
   let panelEl: HTMLElement | null = $state(null);
 
@@ -81,7 +88,30 @@
       </button>
     </div>
 
-    <ConnectionList onEdit={onEdit} onNewConnection={onNewConnection} />
+    <div class="view-toggle">
+      <button
+        class="view-tab"
+        class:active={view === "connections"}
+        onclick={() => (view = "connections")}
+      >
+        Connections
+      </button>
+      <button
+        class="view-tab"
+        class:active={view === "files"}
+        disabled={!activeSessionId}
+        title={activeSessionId ? "" : "Requires a connected session"}
+        onclick={() => (view = "files")}
+      >
+        Files
+      </button>
+    </div>
+
+    {#if view === "connections"}
+      <ConnectionList onEdit={onEdit} onNewConnection={onNewConnection} />
+    {:else}
+      <FileExplorer sessionId={activeSessionId} {onPreview} />
+    {/if}
   {/if}
 
   {#if !collapsed}
@@ -168,6 +198,44 @@
   .panel-collapse:hover {
     background: var(--bg-tertiary);
     color: var(--text-primary);
+  }
+
+  .view-toggle {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 2px;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--border-secondary);
+  }
+
+  .view-tab {
+    flex: 1;
+    padding: 4px 8px;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+
+  .view-tab:hover:not(:disabled) {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  .view-tab.active {
+    border-color: var(--accent-primary);
+    color: var(--accent-primary);
+  }
+
+  .view-tab:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
 
   .rail-expand {

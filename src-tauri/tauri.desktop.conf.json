@@ -17,6 +17,12 @@
         "minHeight": 600,
         "center": true
       }
-    ]
+    ],
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPCACHE/sftp-preview/**"]
+      }
+    }
   }
 }

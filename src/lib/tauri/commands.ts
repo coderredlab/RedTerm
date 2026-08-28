@@ -251,6 +251,52 @@ export async function setKeyboardVisible(visible: boolean): Promise<void> {
   return invoke("set_keyboard_visible", { visible });
 }
 
+export interface SftpDirEntry {
+  name: string;
+  is_dir: boolean;
+  size: number;
+  mtime: number;
+}
+
+export interface SftpFileContent {
+  path: string;
+  content_base64: string;
+  size: number;
+}
+
+export interface SftpDownloadedFile {
+  remote_path: string;
+  local_path: string;
+  size: number;
+}
+
+export const MAX_SFTP_READ_BYTES = 2 * 1024 * 1024;
+export const MAX_SFTP_DOWNLOAD_BYTES = 200 * 1024 * 1024;
+
+export async function sftpListDir(
+  sessionId: string,
+  path: string
+): Promise<SftpDirEntry[]> {
+  return invoke<SftpDirEntry[]>("sftp_list_dir", { sessionId, path });
+}
+
+export async function sftpReadFile(
+  sessionId: string,
+  path: string
+): Promise<SftpFileContent> {
+  return invoke<SftpFileContent>("sftp_read_file", { sessionId, path });
+}
+
+export async function sftpDownloadFile(
+  sessionId: string,
+  remotePath: string
+): Promise<SftpDownloadedFile> {
+  return invoke<SftpDownloadedFile>("sftp_download_file", {
+    sessionId,
+    remotePath,
+  });
+}
+
 
 export async function checkVoiceInputPermissions(): Promise<{ microphone?: VoicePermissionState }> {
   return invoke<{ microphone?: VoicePermissionState }>("check_voice_input_permissions");

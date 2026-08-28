@@ -13,6 +13,7 @@
   import PaneView from "./workspace/PaneView.svelte";
   import TabStrip from "./workspace/TabStrip.svelte";
   import SettingsModal from "./workspace/SettingsModal.svelte";
+  import FileViewer from "./workspace/FileViewer.svelte";
   import { desktopPrefsStore } from "./workspace/desktop-prefs.svelte";
   import {
     dragTargets,
@@ -35,6 +36,14 @@
       ? "48px"
       : `${desktopPrefsStore.prefs.sidebarWidth}px`
   );
+
+  let previewEntry = $state<{
+    name: string;
+    path: string;
+    size: number;
+  } | null>(null);
+
+  const activeSessionId = $derived(tabsStore.getActivePane()?.sessionId ?? null);
 
   $effect(() => {
     dragTargets.workspace = workspaceEl;
@@ -321,10 +330,12 @@
   <Sidebar
     collapsed={desktopPrefsStore.prefs.sidebarCollapsed}
     width={desktopPrefsStore.prefs.sidebarWidth}
+    activeSessionId={activeSessionId}
     onToggleCollapsed={() => desktopPrefsStore.toggleSidebar()}
     onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
     onEdit={handleEdit}
     onNewConnection={handleNewConnection}
+    onPreview={(entry) => (previewEntry = entry)}
   />
 
   <section class="workspace">
@@ -392,6 +403,12 @@
   />
 
   <SettingsModal open={settingsOpen} onClose={() => (settingsOpen = false)} />
+
+  <FileViewer
+    entry={previewEntry}
+    sessionId={activeSessionId}
+    onClose={() => (previewEntry = null)}
+  />
 
   {#if tabDrag.active}
     <div

@@ -3,11 +3,12 @@ use russh::keys::{load_secret_key, PrivateKey, PrivateKeyWithHashAlg, PublicKeyO
 use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, OpenFlags};
+use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::known_hosts::{classify_public_key, HostKeyClassification};
@@ -111,6 +112,14 @@ impl client::Handler for ClientHandler {
             ))),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SftpDirEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: i64,
 }
 
 pub struct SshConnection {
@@ -288,11 +297,7 @@ impl SshConnection {
         Ok("unknown".to_string())
     }
 
-    pub async fn upload_file_via_sftp(
-        &self,
-        extension: &str,
-        data: &[u8],
-    ) -> Result<String, SshError> {
+    async fn open_sftp(&self) -> Result<SftpSession, SshError> {
         let channel = self
             .handle
             .channel_open_session()
@@ -304,9 +309,17 @@ impl SshConnection {
             .await
             .map_err(|e| SshError::SessionError(e.to_string()))?;
 
-        let sftp = SftpSession::new(channel.into_stream())
+        SftpSession::new(channel.into_stream())
             .await
-            .map_err(|e| SshError::SessionError(e.to_string()))?;
+            .map_err(|e| SshError::SessionError(e.to_string()))
+    }
+
+    pub async fn upload_file_via_sftp(
+        &self,
+        extension: &str,
+        data: &[u8],
+    ) -> Result<String, SshError> {
+        let sftp = self.open_sftp().await?;
         let remote_path = format!("/tmp/redterm-{}.{}", uuid::Uuid::new_v4(), extension);
         let file_permissions = FileAttributes {
             permissions: Some(0o600),
@@ -336,6 +349,120 @@ impl SshConnection {
         }
 
         Ok(remote_path)
+    }
+
+    pub async fn list_dir_via_sftp(
+        &self,
+        path: &str,
+    ) -> Result<Vec<SftpDirEntry>, SshError> {
+        let sftp = self.open_sftp().await?;
+        let mut entries = Vec::new();
+        for entry in sftp
+            .read_dir(path)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?
+        {
+            let name = entry.file_name();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let metadata = entry.metadata();
+            entries.push(SftpDirEntry {
+                is_dir: entry.file_type().is_dir(),
+                name,
+                size: metadata.size.unwrap_or(0),
+                mtime: metadata.mtime.map(|value| value as i64).unwrap_or(0),
+            });
+        }
+        entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        Ok(entries)
+    }
+
+    pub async fn read_file_via_sftp(
+        &self,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, SshError> {
+        let sftp = self.open_sftp().await?;
+        if let Some(size) = sftp
+            .metadata(path)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?
+            .size
+        {
+            if size > max_bytes {
+                return Err(SshError::SessionError(format!(
+                    "File is too large to preview ({} bytes exceeds the {} byte limit)",
+                    size, max_bytes
+                )));
+            }
+        }
+        sftp.read(path)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))
+    }
+
+    pub async fn download_file_via_sftp(
+        &self,
+        remote_path: &str,
+        destination: &Path,
+        max_bytes: u64,
+    ) -> Result<u64, SshError> {
+        let sftp = self.open_sftp().await?;
+        if let Some(size) = sftp
+            .metadata(remote_path)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?
+            .size
+        {
+            if size > max_bytes {
+                return Err(SshError::SessionError(format!(
+                    "File is too large to preview ({} bytes exceeds the {} byte limit)",
+                    size, max_bytes
+                )));
+            }
+        }
+
+        let mut remote_file = sftp
+            .open(remote_path)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        let mut local_file = tokio::fs::File::create(destination)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+
+        let mut buffer = vec![0_u8; 256 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let read = remote_file
+                .read(&mut buffer)
+                .await
+                .map_err(|e| SshError::SessionError(e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            total += read as u64;
+            if total > max_bytes {
+                return Err(SshError::SessionError(format!(
+                    "Download exceeded the {} byte preview limit",
+                    max_bytes
+                )));
+            }
+            local_file
+                .write_all(&buffer[..read])
+                .await
+                .map_err(|e| SshError::SessionError(e.to_string()))?;
+        }
+        local_file
+            .flush()
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+
+        Ok(total)
     }
 }
 

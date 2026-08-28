@@ -16,7 +16,9 @@ use crate::ssh::known_hosts::{
     list_known_hosts as list_known_hosts_entries, trust_host_key, HostKeyCheckResult,
     KnownHostEntry,
 };
-use crate::ssh::{AuthConfig, AuthMethod, SshConnection, SshError, SshSession};
+use crate::ssh::{
+    AuthConfig, AuthMethod, SftpDirEntry, SshConnection, SshError, SshSession,
+};
 use crate::storage::{load_saved_password_for_connection, resolve_uploaded_key_for_auth};
 #[cfg(not(target_os = "ios"))]
 use tauri_plugin_redterm_android_paste::{
@@ -926,6 +928,113 @@ pub async fn set_keep_screen_on(app: AppHandle, enabled: bool) -> Result<(), Str
 #[tauri::command]
 pub async fn set_keyboard_visible(app: AppHandle, visible: bool) -> Result<(), String> {
     set_native_keyboard_visible(&app, visible)
+}
+
+const MAX_SFTP_PREVIEW_READ_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SFTP_PREVIEW_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+
+#[derive(Clone, serde::Serialize)]
+pub struct SftpFileContent {
+    pub path: String,
+    pub content_base64: String,
+    pub size: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct SftpDownloadedFile {
+    pub remote_path: String,
+    pub local_path: String,
+    pub size: u64,
+}
+
+async fn sftp_connection_for_session(
+    session_manager: &State<'_, Arc<SessionManager>>,
+    session_id: &str,
+) -> Result<Arc<SshConnection>, String> {
+    let sessions = session_manager.sessions.read().await;
+    sessions
+        .get(session_id)
+        .map(|entry| Arc::clone(&entry.connection))
+        .ok_or_else(|| "Session not found".to_string())
+}
+
+fn ensure_local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let base_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("Failed to resolve app cache dir: {}", e))?
+        .join("sftp-preview");
+
+    std::fs::create_dir_all(&base_dir)
+        .map_err(|e| format!("Failed to prepare preview cache dir: {}", e))?;
+    Ok(base_dir)
+}
+
+#[tauri::command]
+pub async fn sftp_list_dir(
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    path: String,
+) -> Result<Vec<SftpDirEntry>, String> {
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+    connection
+        .list_dir_via_sftp(&path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn sftp_read_file(
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    path: String,
+) -> Result<SftpFileContent, String> {
+    use base64::Engine as _;
+
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+    let data = connection
+        .read_file_via_sftp(&path, MAX_SFTP_PREVIEW_READ_BYTES)
+        .await
+        .map_err(|e| e.to_string())?;
+    let size = data.len() as u64;
+    Ok(SftpFileContent {
+        path,
+        content_base64: base64::engine::general_purpose::STANDARD.encode(&data),
+        size,
+    })
+}
+
+#[tauri::command]
+pub async fn sftp_download_file(
+    app: AppHandle,
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    remote_path: String,
+) -> Result<SftpDownloadedFile, String> {
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+
+    let file_name = remote_path
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download");
+    let safe_name: String = file_name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/')
+        .collect();
+    let destination = ensure_local_sftp_preview_dir(&app)?
+        .join(format!("{}-{}", Uuid::new_v4(), safe_name));
+
+    let size = connection
+        .download_file_via_sftp(&remote_path, &destination, MAX_SFTP_PREVIEW_DOWNLOAD_BYTES)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(SftpDownloadedFile {
+        remote_path,
+        local_path: destination.to_string_lossy().to_string(),
+        size,
+    })
 }
 
 #[cfg(test)]

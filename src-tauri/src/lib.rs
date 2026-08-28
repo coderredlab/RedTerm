@@ -8,9 +8,10 @@ mod storage;
 use commands::{
     cancel_voice_input, check_voice_input_permissions, delete_known_host, get_runtime_instance_id,
     list_known_hosts, list_voice_input_languages, read_clipboard_image,
-    request_voice_input_permissions, set_keep_screen_on, set_keyboard_visible, ssh_check_host_key,
-    ssh_connect, ssh_disconnect, ssh_get_session_output, ssh_get_session_snapshot, ssh_resize,
-    ssh_session_exists, ssh_store_session_snapshot, ssh_trust_host_key, ssh_upload_clipboard_image,
+    request_voice_input_permissions, set_keep_screen_on, set_keyboard_visible, sftp_download_file,
+    sftp_list_dir, sftp_read_file, ssh_check_host_key, ssh_connect, ssh_disconnect,
+    ssh_get_session_output, ssh_get_session_snapshot, ssh_resize, ssh_session_exists,
+    ssh_store_session_snapshot, ssh_trust_host_key, ssh_upload_clipboard_image,
     ssh_upload_clipboard_image_from_local_path, ssh_write, start_voice_input, stop_voice_input,
     HostKeyChallengeStore, RuntimeState, SessionManager,
 };
@@ -54,6 +55,9 @@ pub fn run() {
             ssh_session_exists,
             ssh_store_session_snapshot,
             ssh_upload_clipboard_image,
+            sftp_list_dir,
+            sftp_read_file,
+            sftp_download_file,
             ssh_upload_clipboard_image_from_local_path,
             read_clipboard_image,
             set_keyboard_visible,
