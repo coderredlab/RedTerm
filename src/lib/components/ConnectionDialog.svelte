@@ -331,6 +331,10 @@
                 id="host"
                 bind:value={host}
                 placeholder="192.168.1.1"
+                autocomplete="off"
+                autocapitalize="none"
+                autocorrect="off"
+                spellcheck="false"
                 required
               />
             </div>
@@ -350,13 +354,17 @@
 
           <div class="form-group">
             <label for="username">Username</label>
-            <input
-              type="text"
-              id="username"
-              bind:value={username}
-              placeholder="root"
-              required
-            />
+              <input
+                type="text"
+                id="username"
+                bind:value={username}
+                placeholder="root"
+                autocomplete="username"
+                autocapitalize="none"
+                autocorrect="off"
+                spellcheck="false"
+                required
+              />
           </div>
 
           <div class="form-group">
@@ -444,6 +452,10 @@
                 id="startupScriptReadyText"
                 bind:value={startupScriptReadyText}
                 placeholder="user@host:~$"
+                autocomplete="off"
+                autocapitalize="none"
+                autocorrect="off"
+                spellcheck="false"
               />
             </div>
 
@@ -455,6 +467,10 @@
                 bind:value={startupScript}
                 rows="7"
                 placeholder="export TERM=xterm-256color&#10;cd ~/project"
+                autocomplete="off"
+                autocapitalize="none"
+                autocorrect="off"
+                spellcheck="false"
               ></textarea>
             </div>
           </div>
