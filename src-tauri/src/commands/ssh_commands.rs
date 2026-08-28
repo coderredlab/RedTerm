@@ -1173,23 +1173,28 @@ pub(crate) fn unique_download_path(dir: &Path, file_name: &str) -> PathBuf {
     dir.join(format!("{} ({}){}", stem, Uuid::new_v4(), extension))
 }
 
-/// Explicit user download: stream the remote file into the user's Downloads
-/// directory under its own name. No size cap — the user picked the file.
+/// Explicit user download: stream the remote file into a user-chosen
+/// directory (defaults to Downloads) under its own name. No size cap — the
+/// user picked the file.
 #[tauri::command]
-pub async fn sftp_download_to_downloads(
+pub async fn sftp_download_to_dir(
     app: AppHandle,
     session_manager: State<'_, Arc<SessionManager>>,
     session_id: String,
     remote_path: String,
+    destination_dir: Option<String>,
 ) -> Result<SftpDownloadedFile, String> {
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
 
-    let downloads_dir = app
-        .path()
-        .download_dir()
-        .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?;
+    let downloads_dir = match destination_dir.as_deref().map(str::trim) {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => app
+            .path()
+            .download_dir()
+            .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?,
+    };
     std::fs::create_dir_all(&downloads_dir)
-        .map_err(|e| format!("Failed to prepare Downloads directory: {}", e))?;
+        .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
 
     let file_name = remote_path
         .rsplit('/')

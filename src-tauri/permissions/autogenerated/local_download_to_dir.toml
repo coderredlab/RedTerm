@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-local-download-to-dir"
+description = "Enables the local_download_to_dir command without any pre-configured scope."
+commands.allow = ["local_download_to_dir"]
+
+[[permission]]
+identifier = "deny-local-download-to-dir"
+description = "Denies the local_download_to_dir command without any pre-configured scope."
+commands.deny = ["local_download_to_dir"]

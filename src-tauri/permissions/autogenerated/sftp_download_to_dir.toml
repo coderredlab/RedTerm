@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-sftp-download-to-dir"
+description = "Enables the sftp_download_to_dir command without any pre-configured scope."
+commands.allow = ["sftp_download_to_dir"]
+
+[[permission]]
+identifier = "deny-sftp-download-to-dir"
+description = "Denies the sftp_download_to_dir command without any pre-configured scope."
+commands.deny = ["sftp_download_to_dir"]

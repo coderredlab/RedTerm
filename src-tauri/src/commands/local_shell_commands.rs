@@ -419,22 +419,26 @@ pub async fn local_download_file(
     })
 }
 
-/// Copy a local file into the user's Downloads directory.
+/// Copy a local file into a user-chosen directory (defaults to Downloads).
 #[tauri::command]
-pub async fn local_download_to_downloads(
+pub async fn local_download_to_dir(
     app: AppHandle,
     path: String,
+    destination_dir: Option<String>,
 ) -> Result<SftpDownloadedFile, String> {
     let source = std::path::PathBuf::from(&path);
     if !source.is_file() {
         return Err("File not found".to_string());
     }
-    let downloads_dir = app
-        .path()
-        .download_dir()
-        .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?;
+    let downloads_dir = match destination_dir.as_deref().map(str::trim) {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => app
+            .path()
+            .download_dir()
+            .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?,
+    };
     std::fs::create_dir_all(&downloads_dir)
-        .map_err(|e| format!("Failed to prepare Downloads directory: {}", e))?;
+        .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
 
     let file_name = source
         .file_name()

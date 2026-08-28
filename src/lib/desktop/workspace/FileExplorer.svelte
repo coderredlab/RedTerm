@@ -1,10 +1,11 @@
 <script lang="ts">
   import {
     listenDownloadProgress,
-    localDownloadToDownloads,
+    chooseDownloadDirectory,
+    localDownloadToDir,
     localHomeDir,
     localListDir,
-    sftpDownloadToDownloads,
+    sftpDownloadToDir,
     sftpHomeDir,
     sftpListDir,
     type SftpDirEntry,
@@ -139,13 +140,22 @@
   async function downloadEntry(entry: SftpDirEntry) {
     const target = joinPath(path, entry.name);
     if (!canBrowse || downloadingPaths.includes(target)) return;
+    // Pick the destination folder before anything starts transferring.
+    let directory: string | null = null;
+    try {
+      directory = await chooseDownloadDirectory();
+    } catch {
+      directory = null;
+    }
+    if (!directory) return;
+    if (downloadingPaths.includes(target)) return;
     downloadingPaths = [...downloadingPaths, target];
     downloads[target] = { transferred: 0, total: entry.size || null };
     try {
       const saved =
         kind === "local"
-          ? await localDownloadToDownloads(target)
-          : await sftpDownloadToDownloads(sessionId!, target);
+          ? await localDownloadToDir(target, directory)
+          : await sftpDownloadToDir(sessionId!, target, directory);
       showStatus(`Saved to ${saved.local_path}`);
     } catch (error) {
       showStatus(

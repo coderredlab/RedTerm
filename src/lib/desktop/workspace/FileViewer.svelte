@@ -7,12 +7,13 @@
   import {
     MAX_SFTP_DOWNLOAD_BYTES,
     MAX_SFTP_READ_BYTES,
+    chooseDownloadDirectory,
     listenDownloadProgress,
     localDownloadFile,
-    localDownloadToDownloads,
+    localDownloadToDir,
     localReadFile,
     sftpDownloadFile,
-    sftpDownloadToDownloads,
+    sftpDownloadToDir,
     sftpReadFile,
   } from "$lib/tauri/commands";
   import {
@@ -205,13 +206,21 @@
 
   async function downloadToDownloads() {
     if (!entry || (boundKind === "ssh" && !boundSessionId) || downloading) return;
+    // Pick the destination folder before anything starts transferring.
+    let directory: string | null = null;
+    try {
+      directory = await chooseDownloadDirectory();
+    } catch {
+      directory = null;
+    }
+    if (!directory) return;
     downloading = true;
     savedHint = false;
     try {
       const saved =
         boundKind === "local"
-          ? await localDownloadToDownloads(entry.path)
-          : await sftpDownloadToDownloads(boundSessionId!, entry.path);
+          ? await localDownloadToDir(entry.path, directory)
+          : await sftpDownloadToDir(boundSessionId!, entry.path, directory);
       savedHint = true;
       setTimeout(() => {
         savedHint = false;

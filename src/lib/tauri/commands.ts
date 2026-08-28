@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { TerminalSnapshot } from "$lib/terminal/ansi-parser";
@@ -301,13 +302,15 @@ export async function sftpHomeDir(sessionId: string): Promise<string> {
   return invoke<string>("sftp_home_dir", { sessionId });
 }
 
-export async function sftpDownloadToDownloads(
+export async function sftpDownloadToDir(
   sessionId: string,
-  remotePath: string
+  remotePath: string,
+  destinationDir?: string | null
 ): Promise<SftpDownloadedFile> {
-  return invoke<SftpDownloadedFile>("sftp_download_to_downloads", {
+  return invoke<SftpDownloadedFile>("sftp_download_to_dir", {
     sessionId,
     remotePath,
+    destinationDir: destinationDir ?? null,
   });
 }
 
@@ -327,8 +330,27 @@ export async function localDownloadFile(path: string): Promise<SftpDownloadedFil
   return invoke<SftpDownloadedFile>("local_download_file", { path });
 }
 
-export async function localDownloadToDownloads(path: string): Promise<SftpDownloadedFile> {
-  return invoke<SftpDownloadedFile>("local_download_to_downloads", { path });
+export async function localDownloadToDir(
+  path: string,
+  destinationDir?: string | null
+): Promise<SftpDownloadedFile> {
+  return invoke<SftpDownloadedFile>("local_download_to_dir", {
+    path,
+    destinationDir: destinationDir ?? null,
+  });
+}
+
+/** Open a native folder picker so the user chooses where a download lands. */
+export async function chooseDownloadDirectory(): Promise<string | null> {
+  const result = await open({
+    directory: true,
+    multiple: false,
+    title: "Choose download folder",
+  });
+  if (Array.isArray(result)) {
+    return result[0] ?? null;
+  }
+  return result ?? null;
 }
 
 export interface DownloadProgressEvent {

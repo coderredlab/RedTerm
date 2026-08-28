@@ -8,10 +8,10 @@ mod storage;
 use commands::{
     cancel_voice_input, check_voice_input_permissions, delete_known_host, get_runtime_instance_id,
     list_known_hosts, list_voice_input_languages, local_download_file,
-    local_download_to_downloads, local_home_dir, local_list_dir, local_read_file,
+    local_download_to_dir, local_home_dir, local_list_dir, local_read_file,
     local_shell_disconnect, local_shell_resize, local_shell_start, local_shell_write,
     read_clipboard_image, request_voice_input_permissions, set_keep_screen_on,
-    set_keyboard_visible, sftp_download_file, sftp_download_to_downloads, sftp_home_dir,
+    set_keyboard_visible, sftp_download_file, sftp_download_to_dir, sftp_home_dir,
     sftp_list_dir, sftp_read_file, ssh_check_host_key, ssh_connect, ssh_disconnect,
     ssh_get_session_output, ssh_get_session_snapshot, ssh_resize, ssh_session_exists,
     ssh_store_session_snapshot, ssh_trust_host_key, ssh_upload_clipboard_image,
@@ -32,6 +32,7 @@ pub fn run() {
     let host_key_challenges = Arc::new(HostKeyChallengeStore::default());
 
     let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_redterm_android_paste::init());
 
@@ -63,7 +64,7 @@ pub fn run() {
             sftp_list_dir,
             sftp_read_file,
             sftp_download_file,
-            sftp_download_to_downloads,
+            sftp_download_to_dir,
             sftp_home_dir,
             local_shell_start,
             local_shell_write,
@@ -73,7 +74,7 @@ pub fn run() {
             local_list_dir,
             local_read_file,
             local_download_file,
-            local_download_to_downloads,
+            local_download_to_dir,
             ssh_upload_clipboard_image_from_local_path,
             read_clipboard_image,
             set_keyboard_visible,
