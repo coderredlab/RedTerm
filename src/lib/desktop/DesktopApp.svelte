@@ -1,17 +1,19 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import ConnectionDialog from "$lib/components/ConnectionDialog.svelte";
-  import ConnectionList from "$lib/components/ConnectionList.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import type { SavedConnection } from "$lib/tauri/commands";
   import {
-    getRuntimeInstanceId,
-    sshSessionExists,
-  } from "$lib/tauri/commands";
+    loadRuntimeInstanceId,
+    resolveRecovery,
+  } from "$lib/session/reconcile";
   import Terminal from "$lib/terminal/Terminal.svelte";
   import { handleDesktopShortcuts } from "./shortcuts";
+  import Sidebar from "./workspace/Sidebar.svelte";
   import PaneView from "./workspace/PaneView.svelte";
   import TabStrip from "./workspace/TabStrip.svelte";
+  import SettingsModal from "./workspace/SettingsModal.svelte";
+  import { desktopPrefsStore } from "./workspace/desktop-prefs.svelte";
   import {
     dragTargets,
     tabDrag,
@@ -27,6 +29,12 @@
   let workspaceEl: HTMLElement | null = $state(null);
 
   const terminals = new Map<string, Terminal>();
+
+  const sidebarColumn = $derived(
+    desktopPrefsStore.prefs.sidebarCollapsed
+      ? "48px"
+      : `${desktopPrefsStore.prefs.sidebarWidth}px`
+  );
 
   $effect(() => {
     dragTargets.workspace = workspaceEl;
@@ -52,33 +60,28 @@
   }
 
   async function reconcilePersistedSessions() {
-    try {
-      runtimeInstanceId = await getRuntimeInstanceId();
-    } catch (error) {
-      console.error("Failed to load runtime instance id:", error);
+    runtimeInstanceId = await loadRuntimeInstanceId();
+    if (runtimeInstanceId === null) {
       sessionsReconciled = true;
       return;
     }
 
     for (const tab of [...tabsStore.tabs]) {
       for (const pane of [...tab.panes]) {
-        if (!pane.sessionId) continue;
-
-        const sameRuntime = pane.runtimeInstanceId === runtimeInstanceId;
-        const sessionAlive = sameRuntime
-          ? await sshSessionExists(pane.sessionId).catch(() => false)
-          : false;
-
-        if (sessionAlive) continue;
-
-        if (
-          pane.connection.auth.method.type === "password" &&
-          !pane.connection.canRestorePassword
-        ) {
+        const verdict = await resolveRecovery(
+          {
+            sessionId: pane.sessionId,
+            runtimeInstanceId: pane.runtimeInstanceId,
+            auth: pane.connection.auth,
+            canRestorePassword: pane.connection.canRestorePassword,
+          },
+          runtimeInstanceId
+        );
+        if (verdict === "keep") continue;
+        if (verdict === "remove") {
           tabsStore.closePane(tab.id, pane.id);
           continue;
         }
-
         tabsStore.setPaneDisconnected(tab.id, pane.id);
       }
     }
@@ -311,18 +314,18 @@
   <title>RedTerm Desktop</title>
 </svelte:head>
 
-<div class="desktop-app">
-  <aside class="connections-panel">
-    <div class="product-mark">
-      <div class="product-glyph" aria-hidden="true">&gt;_</div>
-      <div>
-        <div class="product-name">RedTerm</div>
-        <div class="product-edition">Desktop workspace</div>
-      </div>
-    </div>
-
-    <ConnectionList onEdit={handleEdit} onNewConnection={handleNewConnection} />
-  </aside>
+<div
+  class="desktop-app"
+  style:grid-template-columns="{sidebarColumn} minmax(0, 1fr)"
+>
+  <Sidebar
+    collapsed={desktopPrefsStore.prefs.sidebarCollapsed}
+    width={desktopPrefsStore.prefs.sidebarWidth}
+    onToggleCollapsed={() => desktopPrefsStore.toggleSidebar()}
+    onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
+    onEdit={handleEdit}
+    onNewConnection={handleNewConnection}
+  />
 
   <section class="workspace">
     <TabStrip
@@ -331,6 +334,8 @@
       onOpenSettings={() => {
         settingsOpen = true;
       }}
+      onToggleSidebar={() => desktopPrefsStore.toggleSidebar()}
+      sidebarCollapsed={desktopPrefsStore.prefs.sidebarCollapsed}
       onDropToWorkspace={(sourceTabId, zone) =>
         void handleTabDropIntoWorkspace(sourceTabId, zone)}
     />
@@ -386,6 +391,8 @@
     onClose={handleCloseDialog}
   />
 
+  <SettingsModal open={settingsOpen} onClose={() => (settingsOpen = false)} />
+
   {#if tabDrag.active}
     <div
       class="drag-ghost"
@@ -424,56 +431,8 @@
     min-height: 520px;
     overflow: hidden;
     background: var(--bg-primary);
-  }
-
-  .connections-panel {
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    border-right: 1px solid var(--border-primary);
-    background: color-mix(in srgb, var(--bg-secondary) 78%, var(--bg-primary));
-  }
-
-  .product-mark {
-    height: 68px;
-    flex: 0 0 auto;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 0 18px;
-    border-bottom: 1px solid var(--border-primary);
-  }
-
-  .product-glyph {
-    width: 34px;
-    height: 34px;
-    display: grid;
-    place-items: center;
-    border: 1px solid var(--accent-primary);
-    color: var(--accent-primary);
-    font-size: 13px;
-    font-weight: 700;
-    letter-spacing: -1px;
-  }
-
-  .product-name {
-    color: var(--text-primary);
-    font-size: 15px;
-    font-weight: 700;
-    letter-spacing: 0.02em;
-  }
-
-  .product-edition {
-    margin-top: 3px;
-    color: var(--text-muted);
-    font-size: 10px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-  }
-
-  .connections-panel :global(.connection-list) {
-    min-height: 0;
-    background: transparent;
+    /* Widen the shared ConnectionDialog for desktop. */
+    --dialog-max-width: 560px;
   }
 
   .workspace {

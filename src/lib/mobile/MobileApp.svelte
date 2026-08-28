@@ -9,7 +9,8 @@
   import ConnectionDialog from "$lib/components/ConnectionDialog.svelte";
   import ConnectionList from "$lib/components/ConnectionList.svelte";
   import SettingsScreen from "$lib/components/SettingsScreen.svelte";
-  import { cancelVoiceInput, checkVoiceInputPermissions, getRuntimeInstanceId, listenVoiceInput, listVoiceInputLanguages, requestVoiceInputPermissions, setKeyboardVisible, sshDisconnect, sshSessionExists, sshWrite, startVoiceInput, stopVoiceInput } from "$lib/tauri/commands";
+  import { cancelVoiceInput, checkVoiceInputPermissions, listenVoiceInput, listVoiceInputLanguages, requestVoiceInputPermissions, setKeyboardVisible, sshDisconnect, sshWrite, startVoiceInput, stopVoiceInput } from "$lib/tauri/commands";
+  import { loadRuntimeInstanceId, resolveRecovery } from "$lib/session/reconcile";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import { terminalModesStore } from "$lib/stores/terminal-modes.svelte";
   import { settingsStore } from "$lib/stores/settings.svelte";
@@ -116,29 +117,19 @@
   }
 
   async function reconcilePersistedSessions() {
-    try {
-      runtimeInstanceId = await getRuntimeInstanceId();
-    } catch (e) {
-      console.error("Failed to load runtime instance id:", e);
+    runtimeInstanceId = await loadRuntimeInstanceId();
+    if (runtimeInstanceId === null) {
       sessionsReconciled = true;
       return;
     }
 
     for (const tab of [...tabsStore.tabs]) {
-      if (!tab.sessionId) continue;
-
-      const sameRuntime = tab.runtimeInstanceId === runtimeInstanceId;
-      const sessionAlive = sameRuntime
-        ? await sshSessionExists(tab.sessionId).catch(() => false)
-        : false;
-
-      if (sessionAlive) continue;
-
-      if (tab.auth.method.type === "password" && !tab.canRestorePassword) {
+      const verdict = await resolveRecovery(tab, runtimeInstanceId);
+      if (verdict === "keep") continue;
+      if (verdict === "remove") {
         tabsStore.removeTab(tab.id);
         continue;
       }
-
       tabsStore.setDisconnected(tab.id);
     }
 

@@ -493,7 +493,8 @@
     border-radius: 12px;
     padding: 24px;
     width: 100%;
-    max-width: 400px;
+    /* Shells can widen for desktop via --dialog-max-width. */
+    max-width: var(--dialog-max-width, 400px);
     max-height: 90vh;
     overflow-y: auto;
   }

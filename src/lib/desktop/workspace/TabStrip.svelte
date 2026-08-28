@@ -12,11 +12,19 @@
     onNewConnection: () => void;
     onCloseTab: (tabId: string) => void;
     onOpenSettings: () => void;
+    onToggleSidebar: () => void;
+    sidebarCollapsed: boolean;
     onDropToWorkspace: (sourceTabId: string, zone: DropZone) => void;
   }
 
-  let { onNewConnection, onCloseTab, onOpenSettings, onDropToWorkspace }: Props =
-    $props();
+  let {
+    onNewConnection,
+    onCloseTab,
+    onOpenSettings,
+    onToggleSidebar,
+    sidebarCollapsed,
+    onDropToWorkspace,
+  }: Props = $props();
 
   let stripEl: HTMLDivElement | null = $state(null);
   let suppressClick = false;
@@ -124,6 +132,18 @@
 </script>
 
 <div class="tabstrip" bind:this={stripEl}>
+  <button
+    class="strip-action sidebar-toggle"
+    title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
+    aria-label={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
+    onclick={onToggleSidebar}
+  >
+    <svg viewBox="0 0 16 16" aria-hidden="true">
+      <rect x="1.5" y="2.5" width="13" height="11" rx="1" />
+      <line x1="6" y1="2.5" x2="6" y2="13.5" />
+    </svg>
+  </button>
+
   <div class="tabs" role="tablist" aria-label="Terminal sessions">
     {#each tabsStore.tabs as tab, index (tab.id)}
       <div
@@ -339,6 +359,12 @@
     background: transparent;
     color: var(--text-secondary);
     cursor: pointer;
+  }
+
+  .strip-action.sidebar-toggle {
+    border-left: 0;
+    border-right: 1px solid var(--border-primary);
+    width: 40px;
   }
 
   .strip-action:hover {

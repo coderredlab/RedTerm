@@ -1,0 +1,319 @@
+<script lang="ts">
+  import { THEMES } from "$lib/styles/themes";
+  import { settingsStore } from "$lib/stores/settings.svelte";
+
+  interface Props {
+    open: boolean;
+    onClose: () => void;
+  }
+
+  let { open, onClose }: Props = $props();
+
+  const SHORTCUTS: Array<{ keys: string; action: string }> = [
+    { keys: "Ctrl/Cmd + T", action: "New connection" },
+    { keys: "Ctrl/Cmd + W", action: "Close pane" },
+    { keys: "Ctrl/Cmd + Shift + W", action: "Close tab" },
+    { keys: "Ctrl/Cmd + Tab", action: "Next tab" },
+    { keys: "Ctrl/Cmd + Shift + Tab", action: "Previous tab" },
+    { keys: "Ctrl + PageUp / PageDown", action: "Previous / next tab" },
+    { keys: "Ctrl/Cmd + 1…9", action: "Select tab by number" },
+    { keys: "Ctrl/Cmd + \\", action: "Split right" },
+    { keys: "Ctrl/Cmd + Shift + \\", action: "Split down" },
+    { keys: "Ctrl + Alt + Arrows", action: "Move pane focus" },
+    { keys: "Ctrl/Cmd + ,", action: "Settings" },
+  ];
+
+  function stepFontSize(delta: number) {
+    settingsStore.setFontSize(settingsStore.fontSize + delta);
+  }
+
+  function handleKeydown(event: KeyboardEvent) {
+    if (event.key === "Escape") {
+      onClose();
+    }
+  }
+</script>
+
+<svelte:window onkeydown={open ? handleKeydown : undefined} />
+
+{#if open}
+  <div
+    class="settings-overlay"
+    role="dialog"
+    aria-modal="true"
+    aria-label="Settings"
+  >
+    <div class="settings-backdrop" onclick={onClose} aria-hidden="true"></div>
+    <div class="settings-modal">
+      <header class="settings-header">
+        <h2>Settings</h2>
+        <button
+          class="settings-close"
+          title="Close settings"
+          aria-label="Close settings"
+          onclick={onClose}
+        >×</button>
+      </header>
+
+      <div class="settings-body">
+        <section class="settings-section">
+          <div class="section-label">Terminal font size</div>
+          <div class="font-stepper">
+            <button
+              title="Decrease font size"
+              aria-label="Decrease font size"
+              onclick={() => stepFontSize(-1)}
+            >−</button>
+            <span class="font-value">{settingsStore.fontSize}px</span>
+            <button
+              title="Increase font size"
+              aria-label="Increase font size"
+              onclick={() => stepFontSize(1)}
+            >+</button>
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <div class="section-label">Theme</div>
+          <div class="theme-grid">
+            {#each THEMES as theme (theme.id)}
+              <button
+                class="theme-card"
+                class:active={settingsStore.theme === theme.id}
+                onclick={() => settingsStore.setTheme(theme.id)}
+              >
+                <div class="theme-swatches">
+                  <div
+                    class="swatch"
+                    style:background={theme.colors.terminalBg}
+                  ></div>
+                  <div
+                    class="swatch"
+                    style:background={theme.colors.accentPrimary}
+                  ></div>
+                  <div
+                    class="swatch"
+                    style:background={theme.colors.terminalFg}
+                  ></div>
+                  <div
+                    class="swatch"
+                    style:background={theme.colors.statusSuccess}
+                  ></div>
+                </div>
+                <div class="theme-name">{theme.name}</div>
+              </button>
+            {/each}
+          </div>
+        </section>
+
+        <section class="settings-section">
+          <div class="section-label">Keyboard shortcuts</div>
+          <div class="shortcut-list">
+            {#each SHORTCUTS as shortcut (shortcut.keys)}
+              <div class="shortcut-row">
+                <kbd>{shortcut.keys}</kbd>
+                <span>{shortcut.action}</span>
+              </div>
+            {/each}
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<style>
+  .settings-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: grid;
+    place-items: center;
+  }
+
+  .settings-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+  }
+
+  .settings-modal {
+    position: relative;
+    width: min(640px, calc(100vw - 48px));
+    max-height: min(680px, calc(100vh - 64px));
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+    overflow: hidden;
+  }
+
+  .settings-header {
+    height: 52px;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 10px 0 18px;
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  h2 {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+  }
+
+  .settings-close {
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .settings-close:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  .settings-body {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 18px;
+  }
+
+  .settings-section + .settings-section {
+    margin-top: 22px;
+  }
+
+  .section-label {
+    margin-bottom: 10px;
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+
+  .font-stepper {
+    display: inline-flex;
+    align-items: center;
+    gap: 14px;
+    padding: 4px 6px;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+  }
+
+  .font-stepper button {
+    width: 28px;
+    height: 28px;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 16px;
+    cursor: pointer;
+  }
+
+  .font-stepper button:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  .font-value {
+    min-width: 44px;
+    text-align: center;
+    color: var(--text-primary);
+    font-size: 12px;
+  }
+
+  .theme-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(136px, 1fr));
+    gap: 10px;
+  }
+
+  .theme-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--bg-secondary);
+    cursor: pointer;
+  }
+
+  .theme-card:hover {
+    border-color: var(--accent-muted);
+  }
+
+  .theme-card.active {
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 1px var(--accent-primary);
+  }
+
+  .theme-swatches {
+    display: flex;
+    gap: 4px;
+  }
+
+  .swatch {
+    width: 18px;
+    height: 18px;
+    border-radius: 3px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+  }
+
+  .theme-name {
+    color: var(--text-secondary);
+    font-size: 11px;
+    text-align: left;
+  }
+
+  .theme-card.active .theme-name {
+    color: var(--text-primary);
+  }
+
+  .shortcut-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .shortcut-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 6px 10px;
+    border: 1px solid var(--border-secondary);
+    border-radius: 3px;
+  }
+
+  .shortcut-row kbd {
+    color: var(--accent-primary);
+    font-family: inherit;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
+  .shortcut-row span {
+    color: var(--text-secondary);
+    font-size: 11px;
+    text-align: right;
+  }
+</style>
