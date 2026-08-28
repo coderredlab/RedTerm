@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-local-shell-disconnect"
+description = "Enables the local_shell_disconnect command without any pre-configured scope."
+commands.allow = ["local_shell_disconnect"]
+
+[[permission]]
+identifier = "deny-local-shell-disconnect"
+description = "Denies the local_shell_disconnect command without any pre-configured scope."
+commands.deny = ["local_shell_disconnect"]

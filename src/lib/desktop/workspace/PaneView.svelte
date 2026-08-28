@@ -241,6 +241,7 @@
           interactive={focused}
           refocusOnBlur={activePaneId === node.paneId}
           disconnectOnDestroy={!pane.preserveSessionOnMove}
+          kind={pane.kind ?? "ssh"}
           onConnected={(sessionId) =>
             workspace.paneConnected(tabId, node.paneId, sessionId)}
           onDisconnected={() => workspace.paneDisconnected(tabId, node.paneId)}

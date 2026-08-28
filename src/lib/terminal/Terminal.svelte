@@ -19,6 +19,12 @@
     readClipboardImage,
     sshCheckHostKey,
     sshTrustHostKey,
+    localShellStart,
+    localShellWrite,
+    localShellResize,
+    localShellDisconnect,
+    listenLocalData,
+    listenLocalExit,
     type AuthConfig,
     type HostKeyCheckResult,
   } from "$lib/tauri/commands";
@@ -61,6 +67,8 @@
     interactive?: boolean;
     refocusOnBlur?: boolean;
     disconnectOnDestroy?: boolean;
+    /** "local" spawns the machine's own shell instead of an SSH session. */
+    kind?: "ssh" | "local";
     startupScript?: string;
     startupScriptReadyText?: string;
     onConnected?: (sessionId: string) => void;
@@ -79,6 +87,7 @@
     interactive = true,
     refocusOnBlur = true,
     disconnectOnDestroy = true,
+    kind = "ssh",
     onConnected,
     onDisconnected,
     onError
@@ -450,13 +459,13 @@
     if (parser.isSgrMouseEncoding()) {
       const code = pressed ? button : 3;
       const suffix = pressed ? 'M' : 'm';
-      sshWrite(sessionId, encoder.encode(`\x1b[<${code};${col};${row}${suffix}`)).catch(() => {});
+      sendSessionData(encoder.encode(`\x1b[<${code};${col};${row}${suffix}`), true);
       return;
     }
 
     const code = pressed ? button : 3;
     const payload = `\x1b[M${String.fromCharCode(32 + code, 32 + col, 32 + row)}`;
-    sshWrite(sessionId, encoder.encode(payload)).catch(() => {});
+    sendSessionData(encoder.encode(payload), true);
   }
 
   function beginSelectionAt(e: PointerEvent) {
@@ -566,7 +575,7 @@
 
 
   async function uploadClipboardImageBytes(bytes: Uint8Array) {
-    if (!sessionId) return;
+    if (!sessionId || kind === "local") return;
 
     const prevStatusMessage = statusMessage;
     statusMessage = "Uploading pasted image...";
@@ -583,7 +592,7 @@
   }
 
   async function uploadClipboardImageFromLocalPath(localPath: string) {
-    if (!sessionId) return;
+    if (!sessionId || kind === "local") return;
 
     const prevStatusMessage = statusMessage;
     statusMessage = "Uploading pasted image...";
@@ -857,7 +866,7 @@
     }
 
     if (sessionId) {
-      sshResize(sessionId, cols, rows).catch(console.error);
+      resizeSessionRemote();
     }
 
     // resize 후 커서가 보이도록 스크롤 조정
@@ -1208,7 +1217,7 @@
         data.push(`\x1b[M${String.fromCharCode(32 + button, 32 + col, 32 + row)}`);
       }
     }
-    sshWrite(sessionId, encoder.encode(data.join(''))).catch(() => {});
+    sendSessionData(encoder.encode(data.join('')), true);
   }
 
   function handleTouchStart(e: TouchEvent) {
@@ -1488,7 +1497,89 @@
     hostKeyPromptResolver = null;
   }
 
+  function sendSessionData(bytes: Uint8Array, silent = false) {
+    if (!sessionId) return;
+    if (kind === "local") {
+      localShellWrite(sessionId, bytes).catch(silent ? () => {} : handleWriteError);
+    } else {
+      sshWrite(sessionId, bytes).catch(silent ? () => {} : handleWriteError);
+    }
+  }
+
+  function resizeSessionRemote() {
+    if (!sessionId) return;
+    if (kind === "local") {
+      localShellResize(sessionId, cols, rows).catch(console.error);
+    } else {
+      sshResize(sessionId, cols, rows).catch(console.error);
+    }
+  }
+
+  async function disconnectSessionRemote(sid: string) {
+    if (kind === "local") {
+      await localShellDisconnect(sid);
+    } else {
+      await sshDisconnect(sid);
+    }
+  }
+
+  async function bindLocalSessionListener(nextSessionId: string) {
+    sshDataPaused = false;
+    if (unlisten) {
+      unlisten();
+      unlisten = null;
+    }
+    if (unlistenExit) {
+      unlistenExit();
+      unlistenExit = null;
+    }
+
+    let localSeq = lastProcessedSeq;
+    unlisten = await listenLocalData(nextSessionId, (data) => {
+      const text = sshOutputDecoder.decode(data);
+      if (parser) {
+        enqueuePendingOutput(++localSeq, text);
+        updateBuffer();
+      }
+    });
+
+    unlistenExit = await listenLocalExit(nextSessionId, () => {
+      if (sessionId !== nextSessionId || disconnectRequested) return;
+      connected = false;
+      sessionId = null;
+      statusMessage = "Local shell exited";
+      onDisconnected?.();
+    });
+  }
+
+  async function connectLocalSession(showError = true): Promise<boolean> {
+    sshOutputDecoder.reset();
+    statusMessage = "Starting local shell...";
+    try {
+      const nextSessionId = await localShellStart(cols, rows);
+      sessionId = nextSessionId;
+      connected = true;
+      statusMessage = "";
+      terminalModesStore.setAppCursorMode(nextSessionId, false);
+      await bindLocalSessionListener(nextSessionId);
+      onConnected?.(nextSessionId);
+      return true;
+    } catch (e) {
+      connected = false;
+      sessionId = null;
+      const message = e instanceof Error ? e.message : String(e);
+      statusMessage = `Failed to start local shell: ${message}`;
+      if (showError) {
+        onError?.(message);
+      }
+      return false;
+    }
+  }
+
   async function connectNewSession(showError = true): Promise<boolean> {
+    if (kind === "local") {
+      return connectLocalSession(showError);
+    }
     sshOutputDecoder.reset();
     statusMessage = `Connecting to ${host}:${port}...`;
     let nextSessionId: string | null = null;
@@ -1606,7 +1697,7 @@
       terminalModesStore.clearSession(oldSessionId);
       clearSessionSnapshot(oldSessionId);
       try {
-        await sshDisconnect(oldSessionId);
+        await disconnectSessionRemote(oldSessionId);
       } catch {
         // old session may already be gone
       }
@@ -1630,6 +1721,8 @@
 
   async function probeAndReconnect() {
     if (disconnectRequested || reconnecting) return;
+    // Local shells need no liveness probe or history replay on resume.
+    if (kind === "local") return;
 
     if (!sessionId) {
       // Session was lost while backgrounded, try to reconnect
@@ -1648,6 +1741,7 @@
   }
 
   function pauseSshDataForBackground() {
+    if (kind === "local") return;
     if (!sessionId || !connected || !parser || !unlisten || sshDataPaused) return;
 
     pauseSshDataSource();
@@ -1706,6 +1800,7 @@
   }
 
   async function resumeAfterBackground() {
+    if (kind === "local") return;
     if (resumingSshData) return;
     if (!sshDataPaused || !sessionId || !parser || reconnecting) {
       await probeAndReconnect();
@@ -2222,7 +2317,7 @@
         if (!activeSessionId) break;
         const response = automaticResponseQueue.shift()!;
         automaticResponseBytes -= response.length;
-        await sshWrite(activeSessionId, encoder.encode(response));
+        sendSessionData(encoder.encode(response));
         if (sessionId !== activeSessionId) break;
       }
     } catch (error) {
@@ -2275,7 +2370,7 @@
 
       const payload = pendingWrite;
       pendingWrite = "";
-      sshWrite(sessionId, encoder.encode(payload)).catch(handleWriteError);
+      sendSessionData(encoder.encode(payload));
     });
   }
 
@@ -2303,7 +2398,7 @@
     const isBackgroundTeardown =
       typeof document !== "undefined" && document.visibilityState === "hidden";
 
-    if (activeSessionId && isBackgroundTeardown) {
+    if (activeSessionId && isBackgroundTeardown && kind === "ssh") {
       if (parser) {
         void sshStoreSessionSnapshot(activeSessionId, parser.createSnapshot(), lastProcessedSeq).catch((e) => {
           console.error("Store session snapshot error:", e);
@@ -2316,7 +2411,7 @@
     // re-attach with existingSessionId.
     if (activeSessionId && !isBackgroundTeardown && disconnectOnDestroy) {
       disconnectRequested = true;
-      void sshDisconnect(activeSessionId).catch((e) => {
+      void disconnectSessionRemote(activeSessionId).catch((e) => {
         console.error("Disconnect on destroy error:", e);
       });
     }
@@ -2381,7 +2476,7 @@
     ) {
       terminalModesStore.clearSession(activeSessionId);
       clearSessionSnapshot(activeSessionId);
-      void sshDisconnect(activeSessionId).catch((e) => {
+      void disconnectSessionRemote(activeSessionId).catch((e) => {
         console.error("Unmount disconnect error:", e);
       });
       onDisconnected?.();
@@ -2394,7 +2489,7 @@
       if (typeof data === "string") {
         queueWrite(data);
       } else {
-        sshWrite(sessionId, data).catch(handleWriteError);
+        sendSessionData(data);
       }
     }
   }
@@ -2422,7 +2517,7 @@
       terminalModesStore.clearSession(activeSessionId);
       clearSessionSnapshot(activeSessionId);
       try {
-        await sshDisconnect(activeSessionId);
+        await disconnectSessionRemote(activeSessionId);
       } catch (e) {
         console.error("Disconnect error:", e);
       }

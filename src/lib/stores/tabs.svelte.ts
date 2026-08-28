@@ -21,6 +21,8 @@ export interface Pane {
   sessionId: string | null;
   runtimeInstanceId?: string | null;
   connected: boolean;
+  /** "local" runs the machine's own shell; connection fields are unused. */
+  kind?: "ssh" | "local";
   /** When true, Terminal teardown must keep the remote session alive (desktop pane move). */
   preserveSessionOnMove?: boolean;
 }
@@ -102,6 +104,10 @@ function makePersistableAuth(
 }
 
 function canPersistPane(pane: Pane): boolean {
+  // Local shells die with the app process; there is nothing to restore.
+  if (pane.kind === "local") {
+    return false;
+  }
   const auth = pane.connection.auth;
   if (auth.method.type === "key") {
     return Boolean(auth.method.key_id);
@@ -643,6 +649,28 @@ function createTabsStore() {
         startupScriptReadyText,
       };
       const pane = makePane(id, connection);
+      const tab = buildTab(id, [pane], leaf(pane.id), pane.id);
+
+      tabs = [...tabs, tab];
+      activeTabId = id;
+      commit();
+
+      return id;
+    },
+
+    /** Open a tab running the local machine's own shell (never persisted). */
+    addLocalTab(): string {
+      const id = crypto.randomUUID();
+      const connection: PaneConnection = {
+        host: "local",
+        port: 0,
+        auth: { username: "local", method: { type: "password", password: "" } },
+      };
+      const pane: Pane = {
+        ...makePane(id, connection),
+        kind: "local",
+        title: "Local Shell",
+      };
       const tab = buildTab(id, [pane], leaf(pane.id), pane.id);
 
       tabs = [...tabs, tab];

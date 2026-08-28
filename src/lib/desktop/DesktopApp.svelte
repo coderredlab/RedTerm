@@ -359,6 +359,7 @@
   <section class="workspace">
     <TabStrip
       onNewConnection={handleNewConnection}
+      onOpenLocal={() => void tabsStore.addLocalTab()}
       onCloseTab={(tabId) => void closeTabById(tabId)}
       onOpenSettings={() => {
         settingsOpen = true;
@@ -381,6 +382,9 @@
           </p>
           <button class="empty-action" onclick={handleNewConnection}>
             New connection
+          </button>
+          <button class="empty-action secondary" onclick={() => void tabsStore.addLocalTab()}>
+            Open local shell
           </button>
         </div>
       {:else if !sessionsReconciled}
@@ -638,6 +642,12 @@
   .empty-action:hover {
     background: var(--accent-hover);
     border-color: var(--accent-hover);
+  }
+
+  .empty-action.secondary {
+    margin-left: 12px;
+    background: transparent;
+    color: var(--accent-primary);
   }
 
   .session-restore-loader {

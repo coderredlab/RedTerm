@@ -311,6 +311,44 @@ export async function sftpDownloadToDownloads(
   });
 }
 
+export async function localShellStart(cols: number, rows: number): Promise<string> {
+  return invoke<string>("local_shell_start", { cols, rows });
+}
+
+export async function localShellWrite(sessionId: string, data: Uint8Array): Promise<void> {
+  return invoke("local_shell_write", { sessionId, data: Array.from(data) });
+}
+
+export async function localShellResize(sessionId: string, cols: number, rows: number): Promise<void> {
+  return invoke("local_shell_resize", { sessionId, cols, rows });
+}
+
+export async function localShellDisconnect(sessionId: string): Promise<void> {
+  return invoke("local_shell_disconnect", { sessionId });
+}
+
+export interface LocalShellDataEvent {
+  payload: number[];
+}
+
+export async function listenLocalData(
+  sessionId: string,
+  callback: (data: Uint8Array) => void
+): Promise<UnlistenFn> {
+  return listen<number[]>(`local-data-${sessionId}`, (event) => {
+    callback(new Uint8Array(event.payload));
+  });
+}
+
+export async function listenLocalExit(
+  sessionId: string,
+  callback: () => void
+): Promise<UnlistenFn> {
+  return listen(`local-exit-${sessionId}`, () => {
+    callback();
+  });
+}
+
 
 export async function checkVoiceInputPermissions(): Promise<{ microphone?: VoicePermissionState }> {
   return invoke<{ microphone?: VoicePermissionState }>("check_voice_input_permissions");

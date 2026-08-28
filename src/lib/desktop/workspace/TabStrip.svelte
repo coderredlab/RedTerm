@@ -10,6 +10,7 @@
 
   interface Props {
     onNewConnection: () => void;
+    onOpenLocal: () => void;
     onCloseTab: (tabId: string) => void;
     onOpenSettings: () => void;
     onToggleSidebar: () => void;
@@ -19,6 +20,7 @@
 
   let {
     onNewConnection,
+    onOpenLocal,
     onCloseTab,
     onOpenSettings,
     onToggleSidebar,
@@ -221,6 +223,11 @@
     New connection
   </button>
 
+  <button class="local-session" title="Open a local shell" onclick={onOpenLocal}>
+    <span aria-hidden="true">&gt;_</span>
+    Local
+  </button>
+
   <button
     class="strip-action"
     title="Settings"
@@ -381,6 +388,31 @@
   }
 
   .new-session:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+
+  .local-session {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 14px;
+    border: 0;
+    border-left: 1px solid var(--border-primary);
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .local-session span {
+    color: var(--status-success);
+    font-weight: 700;
+  }
+
+  .local-session:hover {
     background: var(--bg-secondary);
     color: var(--text-primary);
   }
