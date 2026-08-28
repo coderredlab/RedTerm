@@ -114,6 +114,7 @@
     mediaUrl = "";
     codeEl = null;
     downloadProgress = null;
+    saveError = "";
   }
 
   async function openEntry(target: PreviewEntry) {
@@ -203,6 +204,7 @@
 
   let downloading = $state(false);
   let savedHint = $state(false);
+  let saveError = $state("");
 
   async function downloadToDownloads() {
     if (!entry || (boundKind === "ssh" && !boundSessionId) || downloading) return;
@@ -216,6 +218,7 @@
     if (!directory) return;
     downloading = true;
     savedHint = false;
+    saveError = "";
     try {
       const saved =
         boundKind === "local"
@@ -226,8 +229,7 @@
         savedHint = false;
       }, 4000);
     } catch (error) {
-      loadState = "error";
-      errorMessage = error instanceof Error ? error.message : String(error);
+      saveError = error instanceof Error ? error.message : String(error);
     } finally {
       downloading = false;
     }
@@ -248,8 +250,8 @@
         <div class="viewer-actions">
           <button
             class="viewer-download"
-            title="Download to local Downloads folder"
-            aria-label="Download to local Downloads folder"
+            title="Choose a folder and download"
+            aria-label="Choose a folder and download"
             disabled={downloading}
             onclick={() => void downloadToDownloads()}
           >{downloading ? "Downloading…" : savedHint ? "Saved ✓" : "⭳ Download"}</button>
@@ -261,6 +263,9 @@
           >×</button>
         </div>
       </header>
+      {#if saveError}
+        <div class="viewer-save-error" role="status">{saveError}</div>
+      {/if}
 
       <div class="viewer-body">
         {#if loadState === "loading"}
@@ -457,6 +462,14 @@
   .viewer-close:hover {
     background: var(--bg-tertiary);
     color: var(--text-primary);
+  }
+
+  .viewer-save-error {
+    flex: 0 0 auto;
+    padding: 6px 16px;
+    border-bottom: 1px solid var(--border-secondary);
+    color: var(--status-error);
+    font-size: 11px;
   }
 
   .viewer-body {

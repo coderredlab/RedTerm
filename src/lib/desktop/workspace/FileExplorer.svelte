@@ -15,6 +15,12 @@
     formatTimestamp,
     previewKindOf,
   } from "./file-kinds";
+  import {
+    breadcrumbSegments,
+    isRootPath,
+    joinPath,
+    parentPath,
+  } from "./explorer-path";
 
   interface Props {
     kind: "ssh" | "local" | null;
@@ -169,27 +175,6 @@
     }
   }
 
-  function parentPath(current: string): string {
-    if (current === "/") return "/";
-    const trimmed = current.replace(/\/+$/, "");
-    const cut = trimmed.lastIndexOf("/");
-    return cut <= 0 ? "/" : trimmed.slice(0, cut);
-  }
-
-  function joinPath(dir: string, name: string): string {
-    return dir === "/" ? `/${name}` : `${dir}/${name}`;
-  }
-
-  function breadcrumbSegments(current: string): Array<{ label: string; path: string }> {
-    const segments = [{ label: "/", path: "/" }];
-    let accumulated = "";
-    for (const part of current.split("/").filter(Boolean)) {
-      accumulated += `/${part}`;
-      segments.push({ label: part, path: accumulated });
-    }
-    return segments;
-  }
-
   function fileIconOf(name: string, isDir: boolean): string {
     if (isDir) return "▸";
     const kind = previewKindOf(name);
@@ -207,14 +192,14 @@
       class="path-btn"
       title="Home"
       aria-label="Home directory"
-      disabled={loading || !sessionId}
+      disabled={loading || !canBrowse}
       onclick={() => void openHome()}
     >⌂</button>
     <button
       class="path-btn"
       title="Parent directory"
       aria-label="Parent directory"
-      disabled={loading || path === "/"}
+      disabled={loading || isRootPath(path)}
       onclick={() => void navigate(parentPath(path))}
     >↑</button>
     <div class="path-breadcrumbs">
@@ -323,7 +308,7 @@
               title={
                 downloadingPaths.includes(joinPath(path, entry.name))
                   ? "Downloading…"
-                  : "Download to local Downloads folder"
+                  : "Choose a folder and download"
               }
               aria-label={`Download ${entry.name}`}
               onclick={(event) => {

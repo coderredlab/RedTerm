@@ -8,7 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 use super::ssh_commands::{
-    ensure_local_sftp_preview_dir, unique_download_path, SftpDownloadedFile, SftpFileContent,
+    ensure_local_sftp_preview_dir, make_download_progress_emitter, sanitize_file_name,
+    unique_download_path, SftpDownloadedFile, SftpFileContent,
 };
 use crate::ssh::SftpDirEntry;
 
@@ -171,22 +172,6 @@ pub async fn local_shell_disconnect(
     Ok(())
 }
 
-fn sanitize_file_name(file_name: &str) -> String {
-    let safe_name: String = file_name
-        .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !std::path::is_separator(*c)
-                && !matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*')
-        })
-        .collect();
-    if safe_name.is_empty() {
-        "download".to_string()
-    } else {
-        safe_name
-    }
-}
-
 fn unix_mtime(metadata: &std::fs::Metadata) -> i64 {
     metadata
         .modified()
@@ -196,19 +181,57 @@ fn unix_mtime(metadata: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// Strip the Windows verbatim prefix (`\\?\C:\...`) that canonicalize
+/// returns — Win32 does not normalize forward slashes after it, so the
+/// frontend's slash-based path model would break.
+fn normalize_local_path_text(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!("/{}", rest.replace('\\', "/"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.replace('\\', "/")
+    } else {
+        text.replace('\\', "/")
+    }
+}
+
+/// Local browsing is scoped to the user's home directory so a compromised
+/// webview cannot read or write arbitrary locations.
+fn ensure_within_home(path: &Path) -> Result<std::path::PathBuf, String> {
+    let home = local_home_dir_path().ok_or("Home directory not found")?;
+    let canonical_home = std::fs::canonicalize(&home)
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| home.to_string_lossy().replace('\\', "/"));
+    let canonical = std::fs::canonicalize(path)
+        .map(|path| std::path::PathBuf::from(normalize_local_path_text(&path.to_string_lossy())))
+        .unwrap_or_else(|_| path.to_path_buf());
+    if !canonical.starts_with(&canonical_home) {
+        return Err("Path is outside the home directory".to_string());
+    }
+    Ok(canonical)
+}
+
+fn local_home_dir_command() -> Result<String, String> {
+    let home = local_home_dir_path().ok_or("Home directory not found")?;
+    let canonical = std::fs::canonicalize(&home).unwrap_or(home);
+    Ok(normalize_local_path_text(&canonical.to_string_lossy()))
+}
+
 /// Forward-slash normalized so the frontend breadcrumb model is
 /// platform-agnostic (Windows accepts forward slashes in std::fs).
 #[tauri::command]
 pub async fn local_home_dir() -> Result<String, String> {
-    let home = local_home_dir_path().ok_or("Home directory not found")?;
-    let canonical = std::fs::canonicalize(&home)
-        .map(|path| path.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| home.to_string_lossy().replace('\\', "/"));
-    Ok(canonical)
+    local_home_dir_command()
 }
 
 #[tauri::command]
 pub async fn local_list_dir(path: String) -> Result<Vec<SftpDirEntry>, String> {
+    // Windows: a bare drive ("C:") reads the process CWD; make it the root.
+    let path = if path.len() == 2 && path.as_bytes()[1] == b':' {
+        format!("{}/", path)
+    } else {
+        path.replace('\\', "/")
+    };
+    ensure_within_home(Path::new(&path))?;
     let mut read_dir = tokio::fs::read_dir(&path)
         .await
         .map_err(|e| format!("Failed to read directory: {}", e))?;
@@ -249,9 +272,14 @@ pub async fn local_list_dir(path: String) -> Result<Vec<SftpDirEntry>, String> {
 pub async fn local_read_file(path: String) -> Result<SftpFileContent, String> {
     use base64::Engine as _;
 
-    let metadata = tokio::fs::metadata(&path)
+    let scoped = ensure_within_home(Path::new(&path))?;
+    let metadata = tokio::fs::metadata(&scoped)
         .await
         .map_err(|e| format!("Failed to read file: {}", e))?;
+    // Regular files only: a FIFO would otherwise block the read loop forever.
+    if !metadata.file_type().is_file() {
+        return Err("Not a regular file".to_string());
+    }
     if metadata.len() > MAX_LOCAL_PREVIEW_READ_BYTES {
         return Err(format!(
             "File is too large to preview ({} bytes exceeds the {} byte limit)",
@@ -260,7 +288,7 @@ pub async fn local_read_file(path: String) -> Result<SftpFileContent, String> {
         ));
     }
 
-    let mut file = tokio::fs::File::open(&path)
+    let mut file = tokio::fs::File::open(&scoped)
         .await
         .map_err(|e| format!("Failed to read file: {}", e))?;
     let mut data = Vec::new();
@@ -293,6 +321,7 @@ pub async fn local_read_file(path: String) -> Result<SftpFileContent, String> {
 async fn copy_with_progress(
     from: &Path,
     to: &Path,
+    max_bytes: u64,
     on_progress: &(dyn Fn(u64) + Send + Sync),
 ) -> Result<u64, String> {
     let mut source = tokio::fs::File::open(from)
@@ -311,11 +340,14 @@ async fn copy_with_progress(
         if read == 0 {
             break;
         }
+        total += read as u64;
+        if total > max_bytes {
+            return Err(format!("Download exceeded the {} byte limit", max_bytes));
+        }
         destination
             .write_all(&buffer[..read])
             .await
             .map_err(|e| format!("Failed to write file: {}", e))?;
-        total += read as u64;
         on_progress(total);
     }
     destination
@@ -330,13 +362,14 @@ async fn local_download(
     source: std::path::PathBuf,
     destination: std::path::PathBuf,
     remote_path_label: String,
+    max_bytes: u64,
 ) -> Result<SftpDownloadedFile, String> {
     let total = tokio::fs::metadata(&source)
         .await
         .ok()
         .map(|metadata| metadata.len());
-    let on_progress = make_progress_emitter_local(app.clone(), remote_path_label.clone(), total);
-    let size = match copy_with_progress(&source, &destination, &on_progress).await {
+    let on_progress = make_download_progress_emitter(app.clone(), remote_path_label.clone(), total);
+    let size = match copy_with_progress(&source, &destination, max_bytes, &on_progress).await {
         Ok(size) => size,
         Err(error) => {
             let _ = tokio::fs::remove_file(&destination).await;
@@ -350,28 +383,6 @@ async fn local_download(
     })
 }
 
-fn make_progress_emitter_local(
-    app: AppHandle,
-    path: String,
-    total: Option<u64>,
-) -> impl Fn(u64) + Send + Sync {
-    move |transferred: u64| {
-        let should_emit = transferred == 0
-            || total.is_some_and(|size| transferred >= size)
-            || transferred % (1 << 20) < 256 * 1024;
-        if should_emit {
-            let _ = app.emit(
-                "sftp-download-progress",
-                serde_json::json!({
-                    "path": path,
-                    "transferred": transferred,
-                    "total": total,
-                }),
-            );
-        }
-    }
-}
-
 /// Copy a local file into the preview cache so it can be streamed through
 /// the asset protocol (media playback).
 #[tauri::command]
@@ -379,35 +390,35 @@ pub async fn local_download_file(
     app: AppHandle,
     path: String,
 ) -> Result<SftpDownloadedFile, String> {
-    let source = std::path::PathBuf::from(&path);
-    if !source.is_file() {
+    let scoped = ensure_within_home(Path::new(&path))?;
+    if !scoped.is_file() {
         return Err("File not found".to_string());
     }
     let preview_dir = ensure_local_sftp_preview_dir(&app)?;
+    let file_name = scoped
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
     let part_path = preview_dir.join(format!(
         "{}-{}.part",
         uuid::Uuid::new_v4(),
-        sanitize_file_name(
-            source
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_default()
-                .as_str()
-        )
+        sanitize_file_name(&file_name)
     ));
     let destination = preview_dir.join(format!(
         "{}-{}",
         uuid::Uuid::new_v4(),
-        sanitize_file_name(
-            source
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_default()
-                .as_str()
-        )
+        sanitize_file_name(&file_name)
     ));
+    let scoped_label = scoped.to_string_lossy().to_string();
 
-    let downloaded = local_download(&app, source, part_path.clone(), path).await?;
+    let downloaded = local_download(
+        &app,
+        scoped.clone(),
+        part_path.clone(),
+        scoped_label,
+        u64::MAX,
+    )
+    .await?;
     if let Err(error) = tokio::fs::rename(&part_path, &destination).await {
         let _ = tokio::fs::remove_file(&part_path).await;
         return Err(format!("Failed to finalize preview download: {}", error));
@@ -426,8 +437,8 @@ pub async fn local_download_to_dir(
     path: String,
     destination_dir: Option<String>,
 ) -> Result<SftpDownloadedFile, String> {
-    let source = std::path::PathBuf::from(&path);
-    if !source.is_file() {
+    let scoped = ensure_within_home(Path::new(&path))?;
+    if !scoped.is_file() {
         return Err("File not found".to_string());
     }
     let downloads_dir = match destination_dir.as_deref().map(str::trim) {
@@ -440,11 +451,12 @@ pub async fn local_download_to_dir(
     std::fs::create_dir_all(&downloads_dir)
         .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
 
-    let file_name = source
+    let file_name = scoped
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "download".to_string());
     let destination = unique_download_path(&downloads_dir, &sanitize_file_name(&file_name));
+    let scoped_label = scoped.to_string_lossy().to_string();
 
-    local_download(&app, source, destination, path).await
+    local_download(&app, scoped, destination, scoped_label, u64::MAX).await
 }

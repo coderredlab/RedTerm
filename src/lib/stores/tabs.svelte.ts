@@ -786,7 +786,7 @@ function createTabsStore() {
         ...source.connection,
         auth: { ...source.connection.auth },
       };
-      const pane = makePane(tabId, connection);
+      const pane: Pane = { ...makePane(tabId, connection), kind: source.kind };
       let newPaneId: string | null = null;
 
       await withPreservedLayout([tabId], () => {

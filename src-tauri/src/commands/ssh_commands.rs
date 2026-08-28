@@ -1083,21 +1083,7 @@ pub async fn sftp_download_file(
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
-    let safe_name: String = file_name
-        .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !std::path::is_separator(*c)
-                // Windows-reserved characters (':' would form an NTFS
-                // alternate data stream); harmless to drop everywhere.
-                && !matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*')
-        })
-        .collect();
-    let safe_name = if safe_name.is_empty() {
-        "download".to_string()
-    } else {
-        safe_name
-    };
+    let safe_name = sanitize_file_name(file_name);
 
     let preview_dir = ensure_local_sftp_preview_dir(&app)?;
     let part_path = preview_dir.join(format!("{}-{}.part", Uuid::new_v4(), safe_name));
@@ -1151,6 +1137,38 @@ pub async fn sftp_home_dir(
         .map_err(|e| e.to_string())
 }
 
+const WINDOWS_RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Strip characters that are invalid or dangerous in destination file names
+/// (separators, controls, Windows-reserved) so a remote name can never
+/// traverse or form an NTFS alternate data stream.
+pub(crate) fn sanitize_file_name(file_name: &str) -> String {
+    let safe_name: String = file_name
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !std::path::is_separator(*c)
+                // ':' would form an NTFS alternate data stream; harmless to
+                // drop everywhere.
+                && !matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*')
+        })
+        .collect();
+    let safe_name = if safe_name.is_empty() {
+        "download".to_string()
+    } else {
+        safe_name
+    };
+    let stem = safe_name.split('.').next().unwrap_or("").to_uppercase();
+    if WINDOWS_RESERVED_NAMES.contains(&stem.as_str()) {
+        format!("file-{}", safe_name)
+    } else {
+        safe_name
+    }
+}
+
 pub(crate) fn unique_download_path(dir: &Path, file_name: &str) -> PathBuf {
     let candidate = dir.join(file_name);
     if !candidate.exists() {
@@ -1201,19 +1219,7 @@ pub async fn sftp_download_to_dir(
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
-    let safe_name: String = file_name
-        .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !std::path::is_separator(*c)
-                && !matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*')
-        })
-        .collect();
-    let safe_name = if safe_name.is_empty() {
-        "download".to_string()
-    } else {
-        safe_name
-    };
+    let safe_name = sanitize_file_name(file_name);
 
     let destination = unique_download_path(&downloads_dir, &safe_name);
     if !destination.starts_with(&downloads_dir) {
