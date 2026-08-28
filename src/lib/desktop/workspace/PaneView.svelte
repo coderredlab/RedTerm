@@ -50,6 +50,15 @@
     liveRatio = node.ratio;
 
     let settled = false;
+    const capturedPointerId = event.pointerId;
+    const windowUp = (e: PointerEvent) => {
+      if (e.pointerId !== capturedPointerId) return;
+      finish();
+    };
+    const windowCancel = (e: PointerEvent) => {
+      if (e.pointerId !== capturedPointerId) return;
+      cancel();
+    };
     const teardown = (commit: boolean) => {
       if (settled) return;
       settled = true;
@@ -58,8 +67,8 @@
       divider.removeEventListener("pointercancel", cancel);
       // Window-level backstop: capture is lost if the divider unmounts
       // mid-gesture, and without this the drag would strand.
-      window.removeEventListener("pointerup", finish, true);
-      window.removeEventListener("pointercancel", cancel, true);
+      window.removeEventListener("pointerup", windowUp, true);
+      window.removeEventListener("pointercancel", windowCancel, true);
       tabsStore.updateSplitRatio(tabId, node.id, commit ? liveRatio : node.ratio);
     };
     const onMove = (moveEvent: PointerEvent) => {
@@ -74,8 +83,8 @@
     divider.addEventListener("pointermove", onMove);
     divider.addEventListener("pointerup", finish);
     divider.addEventListener("pointercancel", cancel);
-    window.addEventListener("pointerup", finish, true);
-    window.addEventListener("pointercancel", cancel, true);
+    window.addEventListener("pointerup", windowUp, true);
+    window.addEventListener("pointercancel", windowCancel, true);
     divider.setPointerCapture(event.pointerId);
   }
 
@@ -87,6 +96,15 @@
     const startY = event.clientY;
     let armed = false;
     let settled = false;
+    const capturedPointerId = event.pointerId;
+    const windowUp = (e: PointerEvent) => {
+      if (e.pointerId !== capturedPointerId) return;
+      finish(true);
+    };
+    const windowCancel = (e: PointerEvent) => {
+      if (e.pointerId !== capturedPointerId) return;
+      finish(false);
+    };
 
     const onMove = (moveEvent: PointerEvent) => {
       if (
@@ -115,8 +133,8 @@
       header.removeEventListener("pointerup", finishUp);
       header.removeEventListener("pointercancel", cancel);
       // Window-level backstop in case the header unmounts mid-gesture.
-      window.removeEventListener("pointerup", finishUp, true);
-      window.removeEventListener("pointercancel", cancel, true);
+      window.removeEventListener("pointerup", windowUp, true);
+      window.removeEventListener("pointercancel", windowCancel, true);
       if (armed && drop) {
         workspace.paneDragDropped(tabId, paneId);
       }
@@ -127,8 +145,8 @@
     header.addEventListener("pointermove", onMove);
     header.addEventListener("pointerup", finishUp);
     header.addEventListener("pointercancel", cancel);
-    window.addEventListener("pointerup", finishUp, true);
-    window.addEventListener("pointercancel", cancel, true);
+    window.addEventListener("pointerup", windowUp, true);
+    window.addEventListener("pointercancel", windowCancel, true);
     header.setPointerCapture(event.pointerId);
   }
 </script>

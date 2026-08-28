@@ -41,7 +41,15 @@
     const startX = event.clientX;
     const startWidth = width;
     let settled = false;
-
+    const capturedPointerId = event.pointerId;
+    const windowUp = (e: PointerEvent) => {
+      if (e.pointerId !== capturedPointerId) return;
+      finish(false);
+    };
+    const windowCancel = (e: PointerEvent) => {
+      if (e.pointerId !== capturedPointerId) return;
+      finish(true);
+    };
     const onMove = (moveEvent: PointerEvent) => {
       const delta = moveEvent.clientX - startX;
       const next = Math.min(
@@ -56,8 +64,8 @@
       handle.removeEventListener("pointermove", onMove);
       handle.removeEventListener("pointerup", finishUp);
       handle.removeEventListener("pointercancel", cancel);
-      window.removeEventListener("pointerup", finishUp, true);
-      window.removeEventListener("pointercancel", cancel, true);
+      window.removeEventListener("pointerup", windowUp, true);
+      window.removeEventListener("pointercancel", windowCancel, true);
       if (restore) {
         onWidthChange(startWidth);
       }
@@ -67,8 +75,8 @@
     handle.addEventListener("pointermove", onMove);
     handle.addEventListener("pointerup", finishUp);
     handle.addEventListener("pointercancel", cancel);
-    window.addEventListener("pointerup", finishUp, true);
-    window.addEventListener("pointercancel", cancel, true);
+    window.addEventListener("pointerup", windowUp, true);
+    window.addEventListener("pointercancel", windowCancel, true);
     handle.setPointerCapture(event.pointerId);
   }
 </script>
