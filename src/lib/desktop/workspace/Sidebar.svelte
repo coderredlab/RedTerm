@@ -153,6 +153,7 @@
   .connections-panel {
     position: relative;
     min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     border-right: 1px solid var(--border-primary);

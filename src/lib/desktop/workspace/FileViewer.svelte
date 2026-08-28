@@ -8,6 +8,7 @@
     MAX_SFTP_DOWNLOAD_BYTES,
     MAX_SFTP_READ_BYTES,
     sftpDownloadFile,
+    sftpDownloadToDownloads,
     sftpReadFile,
   } from "$lib/tauri/commands";
   import {
@@ -156,6 +157,27 @@
       onClose();
     }
   }
+
+  let downloading = $state(false);
+  let savedHint = $state(false);
+
+  async function downloadToDownloads() {
+    if (!entry || !boundSessionId || downloading) return;
+    downloading = true;
+    savedHint = false;
+    try {
+      await sftpDownloadToDownloads(boundSessionId, entry.path);
+      savedHint = true;
+      setTimeout(() => {
+        savedHint = false;
+      }, 4000);
+    } catch (error) {
+      loadState = "error";
+      errorMessage = error instanceof Error ? error.message : String(error);
+    } finally {
+      downloading = false;
+    }
+  }
 </script>
 
 <svelte:window onkeydown={entry ? handleKeydown : undefined} />
@@ -169,12 +191,21 @@
           <span class="viewer-name">{entry.name}</span>
           <span class="viewer-size">{formatBytes(entry.size)}</span>
         </div>
-        <button
-          class="viewer-close"
-          title="Close preview"
-          aria-label="Close preview"
-          onclick={onClose}
-        >×</button>
+        <div class="viewer-actions">
+          <button
+            class="viewer-download"
+            title="Download to local Downloads folder"
+            aria-label="Download to local Downloads folder"
+            disabled={downloading}
+            onclick={() => void downloadToDownloads()}
+          >{downloading ? "Downloading…" : savedHint ? "Saved ✓" : "⭳ Download"}</button>
+          <button
+            class="viewer-close"
+            title="Close preview"
+            aria-label="Close preview"
+            onclick={onClose}
+          >×</button>
+        </div>
       </header>
 
       <div class="viewer-body">
@@ -299,6 +330,37 @@
     color: var(--text-muted);
     font-size: 11px;
     flex: 0 0 auto;
+  }
+
+  .viewer-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 0 0 auto;
+  }
+
+  .viewer-download {
+    height: 24px;
+    padding: 0 10px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 10px;
+    cursor: pointer;
+  }
+
+  .viewer-download:hover:not(:disabled) {
+    border-color: var(--accent-primary);
+    color: var(--accent-primary);
+  }
+
+  .viewer-download:disabled {
+    opacity: 0.5;
+    cursor: progress;
   }
 
   .viewer-close {

@@ -28,6 +28,8 @@
     "allow-sftp-list-dir",
     "allow-sftp-read-file",
     "allow-sftp-download-file",
+    "allow-sftp-download-to-downloads",
+    "allow-sftp-home-dir",
     "allow-read-clipboard-image",
     "allow-set-keyboard-visible",
     "allow-set-keep-screen-on",

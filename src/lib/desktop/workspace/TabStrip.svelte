@@ -325,15 +325,26 @@
   }
 
   .close-tab {
-    width: 20px;
-    height: 20px;
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
     display: grid;
     place-items: center;
+    border: 0;
     border-radius: 3px;
+    background: transparent;
     color: var(--text-muted);
-    font-size: 16px;
+    font-size: 14px;
     line-height: 1;
     cursor: pointer;
+    opacity: 0;
+    transition: opacity 100ms ease;
+  }
+
+  .session-tab:hover .close-tab,
+  .session-tab.active .close-tab,
+  .close-tab:focus-visible {
+    opacity: 1;
   }
 
   .close-tab:hover {

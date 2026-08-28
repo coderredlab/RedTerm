@@ -297,6 +297,20 @@ export async function sftpDownloadFile(
   });
 }
 
+export async function sftpHomeDir(sessionId: string): Promise<string> {
+  return invoke<string>("sftp_home_dir", { sessionId });
+}
+
+export async function sftpDownloadToDownloads(
+  sessionId: string,
+  remotePath: string
+): Promise<SftpDownloadedFile> {
+  return invoke<SftpDownloadedFile>("sftp_download_to_downloads", {
+    sessionId,
+    remotePath,
+  });
+}
+
 
 export async function checkVoiceInputPermissions(): Promise<{ microphone?: VoicePermissionState }> {
   return invoke<{ microphone?: VoicePermissionState }>("check_voice_input_permissions");

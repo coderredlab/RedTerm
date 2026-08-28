@@ -463,6 +463,9 @@
     inset: 0;
     display: grid;
     grid-template-columns: 280px minmax(0, 1fr);
+    /* Pin the row height so tall sidebar content (file list) scrolls
+       inside its own flex column instead of growing the row. */
+    grid-template-rows: minmax(0, 1fr);
     min-width: 760px;
     min-height: 520px;
     overflow: hidden;

@@ -1095,6 +1095,99 @@ pub async fn sftp_download_file(
     })
 }
 
+#[tauri::command]
+pub async fn sftp_home_dir(
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+) -> Result<String, String> {
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+    connection.home_dir_via_sftp().await.map_err(|e| e.to_string())
+}
+
+fn unique_download_path(dir: &Path, file_name: &str) -> PathBuf {
+    let candidate = dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = Path::new(file_name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_name.to_string());
+    let extension = Path::new(file_name)
+        .extension()
+        .map(|s| format!(".{}", s.to_string_lossy()))
+        .unwrap_or_default();
+    for index in 1..1000u32 {
+        let candidate = dir.join(format!("{} ({}){}", stem, index, extension));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    dir.join(format!(
+        "{} ({}){}",
+        stem,
+        Uuid::new_v4(),
+        extension
+    ))
+}
+
+/// Explicit user download: stream the remote file into the user's Downloads
+/// directory under its own name. No size cap — the user picked the file.
+#[tauri::command]
+pub async fn sftp_download_to_downloads(
+    app: AppHandle,
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    remote_path: String,
+) -> Result<SftpDownloadedFile, String> {
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+
+    let downloads_dir = app
+        .path()
+        .download_dir()
+        .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?;
+    std::fs::create_dir_all(&downloads_dir)
+        .map_err(|e| format!("Failed to prepare Downloads directory: {}", e))?;
+
+    let file_name = remote_path
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("download");
+    let safe_name: String = file_name
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !std::path::is_separator(*c)
+                && !matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*')
+        })
+        .collect();
+    let safe_name = if safe_name.is_empty() {
+        "download".to_string()
+    } else {
+        safe_name
+    };
+
+    let destination = unique_download_path(&downloads_dir, &safe_name);
+    if !destination.starts_with(&downloads_dir) {
+        return Err("Invalid download destination path".to_string());
+    }
+
+    let size = connection
+        .download_file_via_sftp(&remote_path, &destination, u64::MAX)
+        .await
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&destination);
+            error.to_string()
+        })?;
+
+    Ok(SftpDownloadedFile {
+        remote_path,
+        local_path: destination.to_string_lossy().to_string(),
+        size,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

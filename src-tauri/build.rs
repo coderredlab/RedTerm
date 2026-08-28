@@ -21,6 +21,8 @@ fn main() {
             "sftp_list_dir",
             "sftp_read_file",
             "sftp_download_file",
+            "sftp_download_to_downloads",
+            "sftp_home_dir",
             "read_clipboard_image",
             "set_keyboard_visible",
             "set_keep_screen_on",

@@ -352,6 +352,13 @@ impl SshConnection {
         Ok(remote_path)
     }
 
+    pub async fn home_dir_via_sftp(&self) -> Result<String, SshError> {
+        let sftp = self.open_sftp().await?;
+        sftp.canonicalize(".")
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))
+    }
+
     pub async fn list_dir_via_sftp(&self, path: &str) -> Result<Vec<SftpDirEntry>, SshError> {
         let sftp = self.open_sftp().await?;
         let mut entries = Vec::new();
