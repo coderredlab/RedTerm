@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import ConnectionDialog from "$lib/components/ConnectionDialog.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import type { SavedConnection } from "$lib/tauri/commands";
@@ -53,6 +53,26 @@
         dragTargets.workspace = null;
       }
     };
+  });
+
+  // Keep keyboard focus on the focused pane's terminal. Tab clicks, pane
+  // clicks, shortcuts, and overlay dismissal all funnel through here so the
+  // focus never stays stranded on chrome (tab strip buttons, dialogs).
+  $effect(() => {
+    const tab = tabsStore.activeTab;
+    const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
+    const overlayFree =
+      !showDialog && !settingsOpen && !previewEntry && sessionsReconciled;
+    if (!tab || !paneId || !overlayFree) return;
+
+    void (async () => {
+      // Let newly mounted panes register their terminal first.
+      await tick();
+      const currentPaneId =
+        tabsStore.activeTab?.activePaneId ?? tabsStore.activeTab?.panes[0]?.id;
+      if (currentPaneId !== paneId) return;
+      terminals.get(paneId)?.focus();
+    })();
   });
 
   onMount(() => {
