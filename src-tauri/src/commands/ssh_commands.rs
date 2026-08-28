@@ -16,9 +16,7 @@ use crate::ssh::known_hosts::{
     list_known_hosts as list_known_hosts_entries, trust_host_key, HostKeyCheckResult,
     KnownHostEntry,
 };
-use crate::ssh::{
-    AuthConfig, AuthMethod, SftpDirEntry, SshConnection, SshError, SshSession,
-};
+use crate::ssh::{AuthConfig, AuthMethod, SftpDirEntry, SshConnection, SshError, SshSession};
 use crate::storage::{load_saved_password_for_connection, resolve_uploaded_key_for_auth};
 #[cfg(not(target_os = "ios"))]
 use tauri_plugin_redterm_android_paste::{
@@ -967,7 +965,40 @@ fn ensure_local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
     std::fs::create_dir_all(&base_dir)
         .map_err(|e| format!("Failed to prepare preview cache dir: {}", e))?;
+    prune_stale_sftp_previews(&base_dir);
     Ok(base_dir)
+}
+
+const SFTP_PREVIEW_PART_MAX_AGE_SECS: u64 = 60 * 60;
+const SFTP_PREVIEW_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+fn prune_stale_sftp_previews(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let age: Option<u64> = match metadata.modified() {
+            Ok(modified) => now.duration_since(modified).ok().map(|d| d.as_secs()),
+            Err(_) => continue,
+        };
+        let stale_part = entry.file_name().to_string_lossy().ends_with(".part")
+            && age
+                .map(|secs| secs > SFTP_PREVIEW_PART_MAX_AGE_SECS)
+                .unwrap_or(true);
+        let stale = age
+            .map(|secs| secs > SFTP_PREVIEW_MAX_AGE_SECS)
+            .unwrap_or(false);
+        if stale_part || stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 #[tauri::command]
@@ -1020,15 +1051,36 @@ pub async fn sftp_download_file(
         .unwrap_or("download");
     let safe_name: String = file_name
         .chars()
-        .filter(|c| !c.is_control() && *c != '/')
+        .filter(|c| !c.is_control() && !std::path::is_separator(*c))
         .collect();
-    let destination = ensure_local_sftp_preview_dir(&app)?
-        .join(format!("{}-{}", Uuid::new_v4(), safe_name));
+    let safe_name = if safe_name.is_empty() {
+        "download".to_string()
+    } else {
+        safe_name
+    };
 
-    let size = connection
-        .download_file_via_sftp(&remote_path, &destination, MAX_SFTP_PREVIEW_DOWNLOAD_BYTES)
+    let preview_dir = ensure_local_sftp_preview_dir(&app)?;
+    let part_path = preview_dir.join(format!("{}-{}.part", Uuid::new_v4(), safe_name));
+    let destination = preview_dir.join(format!("{}-{}", Uuid::new_v4(), safe_name));
+    if !destination.starts_with(&preview_dir) || !part_path.starts_with(&preview_dir) {
+        return Err("Invalid preview destination path".to_string());
+    }
+
+    let size = match connection
+        .download_file_via_sftp(&remote_path, &part_path, MAX_SFTP_PREVIEW_DOWNLOAD_BYTES)
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        Ok(size) => size,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(error.to_string());
+        }
+    };
+
+    if let Err(error) = tokio::fs::rename(&part_path, &destination).await {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        return Err(format!("Failed to finalize preview download: {}", error));
+    }
 
     Ok(SftpDownloadedFile {
         remote_path,

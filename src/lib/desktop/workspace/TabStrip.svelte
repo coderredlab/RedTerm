@@ -54,7 +54,8 @@
   }
 
   function beginDrag(event: PointerEvent, tabId: string) {
-    if (event.button !== 0) return;
+    const tabEl = event.currentTarget as HTMLElement | null;
+    if (event.button !== 0 || !tabEl) return;
     dragArmed = true;
     dragTabId = tabId;
     startX = event.clientX;
@@ -98,21 +99,23 @@
       }
     };
 
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
+    const finish = (drop: boolean) => {
+      tabEl.removeEventListener("pointermove", onMove);
+      tabEl.removeEventListener("pointerup", finishUp);
+      tabEl.removeEventListener("pointercancel", cancel);
       if (tabDrag.active && dragTabId) {
         suppressClick = true;
         setTimeout(() => {
           suppressClick = false;
         }, 0);
-        if (tabDrag.overTabStrip && tabDrag.insertIndex !== null) {
+        if (drop && tabDrag.overTabStrip && tabDrag.insertIndex !== null) {
           const sourceIndex = findTabIndex(dragTabId!);
           let target = tabDrag.insertIndex;
           if (target > sourceIndex) target -= 1;
           if (target !== sourceIndex) {
             tabsStore.moveTab(dragTabId!, target);
           }
-        } else if (tabDrag.dropZone && dragTargets.workspace) {
+        } else if (drop && tabDrag.dropZone && dragTargets.workspace) {
           onDropToWorkspace(dragTabId!, tabDrag.dropZone);
         }
       }
@@ -120,9 +123,13 @@
       dragTabId = null;
       resetTabDrag();
     };
+    const finishUp = () => finish(true);
+    const cancel = () => finish(false);
 
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp, { once: true });
+    tabEl.addEventListener("pointermove", onMove);
+    tabEl.addEventListener("pointerup", finishUp, { once: true });
+    tabEl.addEventListener("pointercancel", cancel, { once: true });
+    tabEl.setPointerCapture(event.pointerId);
   }
 
   function activate(tabId: string) {

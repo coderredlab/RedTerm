@@ -1,3 +1,4 @@
+import { tick } from "svelte";
 import type { AuthConfig } from "$lib/tauri/commands";
 
 /** Connection target owned by a single terminal pane. */
@@ -355,13 +356,17 @@ function loadV2State(parsed: Partial<PersistedTabsStateV2>): PersistedTabsStateV
     const validIds = new Set(panes.map((pane) => pane.id));
     const layout =
       validateLayout(rawTab.layout, validIds) ?? leaf(panes[0]!.id);
-    const aliveIds = new Set(collectPaneIds(layout));
+    const layoutIds = new Set(collectPaneIds(layout));
+    // Drop panes that survived validation but are unreachable from the
+    // (possibly pruned) layout tree.
+    const livePanes = panes.filter((pane) => layoutIds.has(pane.id));
+    if (livePanes.length === 0) continue;
     const activePaneId =
       typeof rawTab.activePaneId === "string" &&
-      aliveIds.has(rawTab.activePaneId)
+      layoutIds.has(rawTab.activePaneId)
         ? rawTab.activePaneId
         : collectPaneIds(layout)[0]!;
-    tabs.push(buildTab(rawTab.id as string, panes, layout, activePaneId));
+    tabs.push(buildTab(rawTab.id as string, livePanes, layout, activePaneId));
   }
   if (tabs.length === 0) return null;
   const activeTabId =
@@ -465,18 +470,21 @@ function persistState(tabs: Tab[], activeTabId: string | null) {
 
   const persistableTabs: Tab[] = [];
   for (const tab of tabs) {
-    const alivePanes = tab.panes.filter(canPersistPane).map((pane) => ({
-      ...pane,
-      connection: {
-        ...pane.connection,
-        auth: makePersistableAuth(
-          pane.connection.auth,
-          pane.connection.connectionId,
-          Boolean(pane.connection.canRestorePassword)
-        ),
-      },
-      connected: false,
-    }));
+    const alivePanes = tab.panes.filter(canPersistPane).map((pane) => {
+      const { preserveSessionOnMove: _transient, ...cleanPane } = pane;
+      return {
+        ...cleanPane,
+        connection: {
+          ...pane.connection,
+          auth: makePersistableAuth(
+            pane.connection.auth,
+            pane.connection.connectionId,
+            Boolean(pane.connection.canRestorePassword)
+          ),
+        },
+        connected: false,
+      };
+    });
     if (alivePanes.length === 0) continue;
     const aliveIds = new Set(alivePanes.map((pane) => pane.id));
     const layout = pruneLayout(tab.layout, aliveIds);
@@ -532,6 +540,39 @@ function createTabsStore() {
     if (!tab) return;
     mutate(tab);
     syncTabFromPanes(tab);
+    tabs = [...tabs];
+    commit();
+  }
+
+  /**
+   * Apply a layout mutation while keeping live SSH sessions alive. Any pane
+   * of the involved tabs may unmount and remount as the tree reshapes, so
+   * every Terminal gets the disconnectOnDestroy opt-out for the duration and
+   * re-attaches through its persisted sessionId afterwards.
+   */
+  async function withPreservedLayout(
+    involvedTabIds: string[],
+    mutate: () => void
+  ) {
+    const involved = new Set(involvedTabIds);
+    for (const tab of tabs) {
+      if (!involved.has(tab.id)) continue;
+      for (const pane of tab.panes) {
+        pane.preserveSessionOnMove = true;
+      }
+    }
+    await tick();
+    mutate();
+    await tick();
+    // Panes may have been copied into other tabs by the mutation, so clear
+    // the transient flag across the whole store instead of tracked refs.
+    for (const tab of tabs) {
+      for (const pane of tab.panes) {
+        if (pane.preserveSessionOnMove) {
+          pane.preserveSessionOnMove = false;
+        }
+      }
+    }
     tabs = [...tabs];
     commit();
   }
@@ -634,12 +675,6 @@ function createTabsStore() {
       commit();
     },
 
-    updateTab(id: string, updates: Partial<Tab>) {
-      mutateTab(id, (tab) => {
-        Object.assign(tab, updates);
-      });
-    },
-
     setConnected(
       id: string,
       sessionId: string,
@@ -694,20 +729,12 @@ function createTabsStore() {
       });
     },
 
-    setPreserveSessionOnMove(tabId: string, paneId: string, value: boolean) {
-      mutateTab(tabId, (tab) => {
-        const pane = tab.panes.find((candidate) => candidate.id === paneId);
-        if (!pane) return;
-        pane.preserveSessionOnMove = value;
-      });
-    },
-
     /** Split a pane in the given direction, cloning its connection target. */
-    splitPane(
+    async splitPane(
       tabId: string,
       paneId: string,
       dir: "row" | "col"
-    ): string | null {
+    ): Promise<string | null> {
       const tab = tabs.find((candidate) => candidate.id === tabId);
       if (!tab) return null;
       const source = tab.panes.find((candidate) => candidate.id === paneId);
@@ -718,19 +745,24 @@ function createTabsStore() {
         auth: { ...source.connection.auth },
       };
       const pane = makePane(tabId, connection);
+      let newPaneId: string | null = null;
 
-      mutateTab(tabId, (candidate) => {
-        candidate.panes = [...candidate.panes, pane];
-        candidate.layout = replaceLeaf(candidate.layout, paneId, (leafNode) =>
+      await withPreservedLayout([tabId], () => {
+        const target = tabs.find((candidate) => candidate.id === tabId);
+        if (!target) return;
+        target.panes = [...target.panes, pane];
+        target.layout = replaceLeaf(target.layout, paneId, (leafNode) =>
           makeSplit(dir, 0.5, [leafNode, leaf(pane.id)])
         );
-        candidate.activePaneId = pane.id;
+        target.activePaneId = pane.id;
+        syncTabFromPanes(target);
+        newPaneId = pane.id;
       });
-      return pane.id;
+      return newPaneId;
     },
 
     /** Close a pane; closes the tab when it holds the last pane. */
-    closePane(tabId: string, paneId: string) {
+    async closePane(tabId: string, paneId: string) {
       const tab = tabs.find((candidate) => candidate.id === tabId);
       if (!tab) return;
       if (!tab.panes.some((pane) => pane.id === paneId)) return;
@@ -741,14 +773,22 @@ function createTabsStore() {
         return;
       }
 
-      mutateTab(tabId, (candidate) => {
-        candidate.panes = remaining;
-        const pruned = pruneLayout(candidate.layout, new Set(remaining.map((pane) => pane.id)));
-        candidate.layout = pruned ?? leaf(remaining[0]!.id);
+      await withPreservedLayout([tabId], () => {
+        const candidate = tabs.find((entry) => entry.id === tabId);
+        if (!candidate) return;
+        candidate.panes = candidate.panes.filter(
+          (pane) => pane.id !== paneId
+        );
+        const pruned = pruneLayout(
+          candidate.layout,
+          new Set(candidate.panes.map((pane) => pane.id))
+        );
+        candidate.layout = pruned ?? leaf(candidate.panes[0]!.id);
         const stillAlive = collectPaneIds(candidate.layout);
         if (!stillAlive.includes(candidate.activePaneId ?? "")) {
           candidate.activePaneId = stillAlive[0] ?? null;
         }
+        syncTabFromPanes(candidate);
       });
     },
 
@@ -757,7 +797,7 @@ function createTabsStore() {
      * Panes keep their own connection targets, so different servers can sit
      * side by side. The source tab is removed.
      */
-    mergeTab(
+    async mergeTab(
       sourceTabId: string,
       targetTabId: string,
       dir: "row" | "col",
@@ -778,16 +818,21 @@ function createTabsStore() {
         side === "before" ? target.layout : source.layout,
       ]);
 
-      mutateTab(targetTabId, (candidate) => {
-        candidate.panes = [...candidate.panes, ...movedPanes];
-        candidate.layout = mergedLayout;
-        candidate.activePaneId = movedPanes[0]?.id ?? candidate.activePaneId;
-      });
+      await withPreservedLayout([sourceTabId, targetTabId], () => {
+        const destination = tabs.find(
+          (candidate) => candidate.id === targetTabId
+        );
+        if (!destination) return;
+        destination.panes = [...destination.panes, ...movedPanes];
+        destination.layout = mergedLayout;
+        destination.activePaneId = movedPanes[0]?.id ?? destination.activePaneId;
+        syncTabFromPanes(destination);
 
-      tabs = tabs.filter((candidate) => candidate.id !== sourceTabId);
-      if (activeTabId === sourceTabId) {
-        activeTabId = targetTabId;
-      }
+        tabs = tabs.filter((candidate) => candidate.id !== sourceTabId);
+        if (activeTabId === sourceTabId) {
+          activeTabId = targetTabId;
+        }
+      });
       commit();
     },
 
@@ -798,7 +843,7 @@ function createTabsStore() {
     },
 
     /** Move a pane next to another pane of the same tab (drag rearrange). */
-    movePaneWithinTab(
+    async movePaneWithinTab(
       tabId: string,
       paneId: string,
       targetPaneId: string,
@@ -815,7 +860,9 @@ function createTabsStore() {
         return;
       }
 
-      mutateTab(tabId, (candidate) => {
+      await withPreservedLayout([tabId], () => {
+        const candidate = tabs.find((entry) => entry.id === tabId);
+        if (!candidate) return;
         const withoutMoved = pruneLayout(
           candidate.layout,
           new Set(

@@ -41,7 +41,10 @@
   });
 
   function startResize(event: PointerEvent) {
-    if (node.type !== "split" || !splitEl || event.button !== 0) return;
+    const divider = event.currentTarget as HTMLElement | null;
+    if (node.type !== "split" || !splitEl || event.button !== 0 || !divider) {
+      return;
+    }
     event.preventDefault();
     const rect = splitEl.getBoundingClientRect();
     liveRatio = node.ratio;
@@ -53,16 +56,27 @@
           : (moveEvent.clientY - rect.top) / rect.height;
       liveRatio = Math.min(0.9, Math.max(0.1, raw));
     };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
+    const finish = () => {
+      divider.removeEventListener("pointermove", onMove);
+      divider.removeEventListener("pointerup", finish);
+      divider.removeEventListener("pointercancel", cancel);
       tabsStore.updateSplitRatio(tabId, node.id, liveRatio);
     };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp, { once: true });
+    const cancel = () => {
+      liveRatio = node.ratio;
+      divider.removeEventListener("pointermove", onMove);
+      divider.removeEventListener("pointerup", finish);
+      divider.removeEventListener("pointercancel", cancel);
+    };
+    divider.addEventListener("pointermove", onMove);
+    divider.addEventListener("pointerup", finish, { once: true });
+    divider.addEventListener("pointercancel", cancel, { once: true });
+    divider.setPointerCapture(event.pointerId);
   }
 
   function startPaneDrag(event: PointerEvent, paneId: string, title: string) {
-    if (event.button !== 0) return;
+    const header = event.currentTarget as HTMLElement | null;
+    if (event.button !== 0 || !header) return;
     event.preventDefault();
     const startX = event.clientX;
     const startY = event.clientY;
@@ -88,15 +102,21 @@
         ? zoneFromPoint(rect, moveEvent.clientX, moveEvent.clientY)
         : null;
     };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
-      if (armed) {
+    const finish = (drop: boolean) => {
+      header.removeEventListener("pointermove", onMove);
+      header.removeEventListener("pointerup", finishUp);
+      header.removeEventListener("pointercancel", cancel);
+      if (armed && drop) {
         workspace.paneDragDropped(tabId, paneId);
       }
       resetTabDrag();
     };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp, { once: true });
+    const finishUp = () => finish(true);
+    const cancel = () => finish(false);
+    header.addEventListener("pointermove", onMove);
+    header.addEventListener("pointerup", finishUp, { once: true });
+    header.addEventListener("pointercancel", cancel, { once: true });
+    header.setPointerCapture(event.pointerId);
   }
 </script>
 
@@ -126,12 +146,13 @@
   {@const pane = tabsStore.getPane(tabId, node.paneId)}
   {@const focused = interactive && activePaneId === node.paneId}
   {#if pane}
-    <section
-      class="pane"
-      class:focused
-      data-pane-id={node.paneId}
-      onpointerdowncapture={() => workspace.activatePane(tabId, node.paneId)}
-    >
+    {#key node.paneId}
+      <section
+        class="pane"
+        class:focused
+        data-pane-id={node.paneId}
+        onpointerdowncapture={() => workspace.activatePane(tabId, node.paneId)}
+      >
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <header
         class="pane-header"
@@ -195,7 +216,8 @@
           bind:this={term}
         />
       </div>
-    </section>
+      </section>
+    {/key}
   {/if}
 {/if}
 

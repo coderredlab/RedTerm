@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { onMount } from "svelte";
   import ConnectionDialog from "$lib/components/ConnectionDialog.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import type { SavedConnection } from "$lib/tauri/commands";
@@ -18,6 +18,7 @@
   import {
     dragTargets,
     tabDrag,
+    zoneFromPoint,
     type DropZone,
   } from "./workspace/drag-state.svelte";
   import { setWorkspaceApi, type WorkspaceApi } from "./workspace/workspace-context";
@@ -222,27 +223,15 @@
   ) {
     const targetTabId = tabsStore.activeTabId;
     if (!targetTabId || targetTabId === sourceTabId) return;
-    const source = tabsStore.getTab(sourceTabId);
-    if (!source) return;
+    if (!tabsStore.getTab(sourceTabId)) return;
 
     const dir = zone === "left" || zone === "right" ? "row" : "col";
     const side = zone === "left" || zone === "top" ? "before" : "after";
-
-    const movedPaneIds = source.panes.map((pane) => pane.id);
-    for (const paneId of movedPaneIds) {
-      tabsStore.setPreserveSessionOnMove(sourceTabId, paneId, true);
-    }
-    await tick();
-    tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
-    await tick();
-    for (const paneId of movedPaneIds) {
-      tabsStore.setPreserveSessionOnMove(targetTabId, paneId, false);
-    }
+    await tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
   }
 
   async function handlePaneDrop(tabId: string, paneId: string) {
-    const zone = tabDrag.dropZone;
-    if (!zone || !workspaceEl) return;
+    if (!workspaceEl) return;
     const hit = document.elementFromPoint(
       tabDrag.pointerX,
       tabDrag.pointerY
@@ -250,14 +239,16 @@
     const targetPaneId = hit?.dataset.paneId;
     if (!targetPaneId || targetPaneId === paneId) return;
 
+    // Direction comes from the hovered pane's own rect so the split happens
+    // where the pointer actually is, not relative to the whole workspace.
+    const zone =
+      zoneFromPoint(hit!.getBoundingClientRect(), tabDrag.pointerX, tabDrag.pointerY) ??
+      tabDrag.dropZone;
+    if (!zone) return;
+
     const dir = zone === "left" || zone === "right" ? "row" : "col";
     const side = zone === "left" || zone === "top" ? "before" : "after";
-
-    tabsStore.setPreserveSessionOnMove(tabId, paneId, true);
-    await tick();
-    tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side);
-    await tick();
-    tabsStore.setPreserveSessionOnMove(tabId, paneId, false);
+    await tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side);
   }
 
   const workspaceApi: WorkspaceApi = {
@@ -292,6 +283,9 @@
   setWorkspaceApi(workspaceApi);
 
   function onKeydownCapture(event: KeyboardEvent) {
+    const terminalTarget =
+      event.target instanceof Element &&
+      event.target.closest(".pane-terminal") !== null;
     const consumed = handleDesktopShortcuts(
       event,
       {
@@ -308,7 +302,8 @@
           settingsOpen = true;
         },
       },
-      () => !showDialog && !settingsOpen && sessionsReconciled
+      () => !showDialog && !settingsOpen && !previewEntry && sessionsReconciled,
+      terminalTarget
     );
     if (consumed) {
       event.preventDefault();
@@ -384,7 +379,7 @@
           </div>
         {/each}
 
-        {#if tabDrag.active && tabDrag.dropZone}
+        {#if tabDrag.active && tabDrag.dropZone && tabDrag.kind === "tab" && tabDrag.tabId !== tabsStore.activeTabId}
           <div class="drop-overlay" aria-hidden="true">
             <div class="drop-zone" class:lit={tabDrag.dropZone === "left"}></div>
             <div class="drop-zone" class:lit={tabDrag.dropZone === "right"}></div>

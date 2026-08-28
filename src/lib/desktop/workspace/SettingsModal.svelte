@@ -116,6 +116,10 @@
               </div>
             {/each}
           </div>
+          <p class="shortcut-note">
+            On Linux and Windows, Ctrl+T / Ctrl+W / Ctrl+\\ keep their shell
+            meaning while a terminal has focus.
+          </p>
         </section>
       </div>
     </div>
@@ -126,7 +130,7 @@
   .settings-overlay {
     position: fixed;
     inset: 0;
-    z-index: 60;
+    z-index: 80;
     display: grid;
     place-items: center;
   }
@@ -315,5 +319,11 @@
     color: var(--text-secondary);
     font-size: 11px;
     text-align: right;
+  }
+
+  .shortcut-note {
+    margin: 10px 0 0;
+    color: var(--text-muted);
+    font-size: 10px;
   }
 </style>

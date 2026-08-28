@@ -24,7 +24,14 @@
 
   $effect(() => {
     // Restart browsing whenever the active session changes.
-    sessionId;
+    if (!sessionId) {
+      loadToken += 1;
+      entries = null;
+      errorMessage = "";
+      loading = false;
+      path = "/";
+      return;
+    }
     path = "/";
     void navigate("/");
   });

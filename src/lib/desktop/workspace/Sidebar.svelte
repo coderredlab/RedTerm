@@ -35,7 +35,8 @@
   let panelEl: HTMLElement | null = $state(null);
 
   function startResize(event: PointerEvent) {
-    if (event.button !== 0 || !panelEl) return;
+    const handle = event.currentTarget as HTMLElement | null;
+    if (event.button !== 0 || !handle) return;
     event.preventDefault();
     const startX = event.clientX;
     const startWidth = width;
@@ -48,11 +49,20 @@
       );
       onWidthChange(next);
     };
-    const onUp = () => {
-      window.removeEventListener("pointermove", onMove);
+    const finish = () => {
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", finishUp);
+      handle.removeEventListener("pointercancel", cancel);
     };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp, { once: true });
+    const finishUp = () => finish();
+    const cancel = () => {
+      onWidthChange(startWidth);
+      finish();
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", finishUp, { once: true });
+    handle.addEventListener("pointercancel", cancel, { once: true });
+    handle.setPointerCapture(event.pointerId);
   }
 </script>
 

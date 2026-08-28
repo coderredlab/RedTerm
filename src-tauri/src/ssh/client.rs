@@ -17,6 +17,7 @@ use super::{AuthConfig, AuthMethod};
 const SSH_DATA_CHUNK_BYTES: usize = 64 * 1024;
 const SSH_COMMAND_CHANNEL_CAPACITY: usize = 256;
 const MAX_EXEC_CAPTURE_BYTES: usize = 64 * 1024;
+const MAX_SFTP_LIST_ENTRIES: usize = 10_000;
 const EXEC_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_COMMAND_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_CHANNEL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -351,10 +352,7 @@ impl SshConnection {
         Ok(remote_path)
     }
 
-    pub async fn list_dir_via_sftp(
-        &self,
-        path: &str,
-    ) -> Result<Vec<SftpDirEntry>, SshError> {
+    pub async fn list_dir_via_sftp(&self, path: &str) -> Result<Vec<SftpDirEntry>, SshError> {
         let sftp = self.open_sftp().await?;
         let mut entries = Vec::new();
         for entry in sftp
@@ -362,6 +360,9 @@ impl SshConnection {
             .await
             .map_err(|e| SshError::SessionError(e.to_string()))?
         {
+            if entries.len() >= MAX_SFTP_LIST_ENTRIES {
+                break;
+            }
             let name = entry.file_name();
             if name == "." || name == ".." {
                 continue;
@@ -401,9 +402,32 @@ impl SshConnection {
                 )));
             }
         }
-        sftp.read(path)
+
+        // Stream instead of read_to_end: the advertised size may be absent
+        // or stale (e.g. /dev/zero), so the cap is enforced while reading.
+        let mut remote_file = sftp
+            .open(path)
             .await
-            .map_err(|e| SshError::SessionError(e.to_string()))
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        let mut data = Vec::new();
+        let mut buffer = vec![0_u8; 256 * 1024];
+        loop {
+            let read = remote_file
+                .read(&mut buffer)
+                .await
+                .map_err(|e| SshError::SessionError(e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            if data.len() as u64 + read as u64 > max_bytes {
+                return Err(SshError::SessionError(format!(
+                    "File exceeded the {} byte preview limit while reading",
+                    max_bytes
+                )));
+            }
+            data.extend_from_slice(&buffer[..read]);
+        }
+        Ok(data)
     }
 
     pub async fn download_file_via_sftp(

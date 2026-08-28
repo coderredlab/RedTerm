@@ -1,5 +1,6 @@
 <script lang="ts">
   import { convertFileSrc } from "@tauri-apps/api/core";
+  import { untrack } from "svelte";
   import DOMPurify from "dompurify";
   import hljs from "highlight.js/lib/common";
   import { marked } from "marked";
@@ -37,6 +38,10 @@
   let renderedMarkdown = $state("");
   let mediaUrl = $state("");
   let codeEl: HTMLElement | null = $state(null);
+  let loadToken = 0;
+  // Frozen at open so switching the active tab does not re-target the
+  // preview at another server's path.
+  let boundSessionId = $state<string | null>(null);
 
   const kind = $derived(entry ? previewKindOf(entry.name) : "unknown" as FilePreviewKind);
   const language = $derived(entry ? highlightLanguageOf(entry.name) : null);
@@ -52,7 +57,10 @@
 
   $effect(() => {
     if (!entry) return;
-    void openEntry(entry);
+    const current = entry;
+    // Only entry re-opens the preview; the session is captured (frozen)
+    // inside openEntry so switching tabs does not re-target the path.
+    untrack(() => void openEntry(current));
   });
 
   $effect(() => {
@@ -71,7 +79,14 @@
   }
 
   async function openEntry(target: PreviewEntry) {
+    const token = ++loadToken;
+    boundSessionId = sessionId;
     reset();
+    if (kind === "unknown") {
+      // Nothing sensible to render inline; skip the fetch entirely.
+      loadState = "ready";
+      return;
+    }
     if (needsExplicitDownload) {
       loadState = "idle";
       return;
@@ -82,18 +97,21 @@
       return;
     }
     loadState = "loading";
-    await loadInline(target);
+    await loadInline(target, token);
   }
 
-  async function loadInline(target: PreviewEntry) {
+  async function loadInline(target: PreviewEntry, token: number) {
     try {
-      const content = await sftpReadFile(sessionId!, target.path);
+      const content = await sftpReadFile(boundSessionId!, target.path);
+      if (token !== loadToken) return;
       const dataUrl = `data:text/plain;charset=utf-8;base64,${content.content_base64}`;
       const response = await fetch(dataUrl);
       const decoded = await response.text();
+      if (token !== loadToken) return;
 
       if (kind === "markdown") {
         const parsed = await marked.parse(decoded);
+        if (token !== loadToken) return;
         renderedMarkdown = DOMPurify.sanitize(parsed);
       } else if (kind === "image") {
         mediaUrl = `data:${mimeOf(target.name)};base64,${content.content_base64}`;
@@ -102,6 +120,7 @@
       }
       loadState = "ready";
     } catch (error) {
+      if (token !== loadToken) return;
       loadState = "error";
       errorMessage = error instanceof Error ? error.message : String(error);
     }
@@ -109,17 +128,20 @@
 
   async function loadViaDownload() {
     if (!entry) return;
-    if (!sessionId) {
+    const token = ++loadToken;
+    if (!boundSessionId) {
       loadState = "error";
       errorMessage = "No active SSH session.";
       return;
     }
     loadState = "loading";
     try {
-      const downloaded = await sftpDownloadFile(sessionId, entry.path);
+      const downloaded = await sftpDownloadFile(boundSessionId, entry.path);
+      if (token !== loadToken) return;
       mediaUrl = convertFileSrc(downloaded.local_path);
       loadState = "ready";
     } catch (error) {
+      if (token !== loadToken) return;
       loadState = "error";
       errorMessage = error instanceof Error ? error.message : String(error);
     }

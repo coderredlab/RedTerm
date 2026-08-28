@@ -39,6 +39,18 @@ function persistPrefs(prefs: DesktopPrefs) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
 }
 
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Debounced persist: sidebar resize updates this on every pointermove. */
+function schedulePersist(prefs: DesktopPrefs) {
+  if (!canUseStorage()) return;
+  if (persistTimer !== null) clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+  }, 250);
+}
+
 function createDesktopPrefs() {
   let prefs = $state<DesktopPrefs>(loadPrefs());
 
@@ -54,7 +66,7 @@ function createDesktopPrefs() {
       const clamped = clampWidth(width);
       if (clamped === prefs.sidebarWidth) return;
       prefs = { ...prefs, sidebarWidth: clamped };
-      persistPrefs(prefs);
+      schedulePersist(prefs);
     },
   };
 }

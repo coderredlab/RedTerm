@@ -11,22 +11,38 @@ export interface DesktopShortcutHandlers {
   openSettings(): void;
 }
 
+const IS_MAC =
+  typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
+
 /**
  * Match desktop shortcuts on a capture-phase keydown. Returns true when the
  * event was consumed and the caller must preventDefault + stopPropagation so
  * terminal key handling never sees it.
+ *
+ * `terminalTarget` reports that the key was pressed while a terminal had
+ * focus. Combos that shells consume (Ctrl+T/W/\\ on Linux and Windows) are
+ * then left for the terminal instead of being stolen by the app shell.
  */
 export function handleDesktopShortcuts(
   event: KeyboardEvent,
   handlers: DesktopShortcutHandlers,
-  isEnabled: () => boolean
+  isEnabled: () => boolean,
+  terminalTarget = false
 ): boolean {
   if (!isEnabled()) return false;
 
-  const mod = event.ctrlKey || event.metaKey;
+  const mod = IS_MAC ? event.metaKey : event.ctrlKey;
   const alt = event.altKey;
   const shift = event.shiftKey;
   const key = event.key;
+  // Shells consume Ctrl+T/W/\ on Linux and Windows; leave those for the
+  // terminal when the key was pressed inside one.
+  const shellReserved =
+    !IS_MAC &&
+    terminalTarget &&
+    (key === "t" || key === "T" || key === "w" || key === "W" || key === "\\");
+
+  if (shellReserved) return false;
 
   if (mod && !alt && (key === "t" || key === "T")) {
     handlers.newConnection();

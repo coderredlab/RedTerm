@@ -2373,7 +2373,12 @@
       unlistenExit = null;
     }
 
-    if (activeSessionId && !disconnectRequested && !isBackgroundTeardown) {
+    if (
+      activeSessionId &&
+      !disconnectRequested &&
+      !isBackgroundTeardown &&
+      disconnectOnDestroy
+    ) {
       terminalModesStore.clearSession(activeSessionId);
       clearSessionSnapshot(activeSessionId);
       void sshDisconnect(activeSessionId).catch((e) => {
