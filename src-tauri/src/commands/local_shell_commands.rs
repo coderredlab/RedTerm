@@ -8,8 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 
 use super::ssh_commands::{
-    ensure_local_sftp_preview_dir, make_download_progress_emitter, sanitize_file_name,
-    unique_download_path, SftpDownloadedFile, SftpFileContent,
+    claim_download_destination, ensure_local_sftp_preview_dir, make_download_progress_emitter,
+    sanitize_file_name, SftpDownloadedFile, SftpFileContent,
 };
 use crate::ssh::SftpDirEntry;
 
@@ -142,7 +142,7 @@ pub async fn local_shell_resize(
     let shell = shells
         .get(&session_id)
         .ok_or_else(|| "Local shell not found".to_string())?;
-    let mut master = shell
+    let master = shell
         .master
         .lock()
         .map_err(|_| "Local shell is unavailable".to_string())?;
@@ -455,7 +455,7 @@ pub async fn local_download_to_dir(
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| "download".to_string());
-    let destination = unique_download_path(&downloads_dir, &sanitize_file_name(&file_name));
+    let destination = claim_download_destination(&downloads_dir, &sanitize_file_name(&file_name))?;
     let scoped_label = scoped.to_string_lossy().to_string();
 
     local_download(&app, scoped, destination, scoped_label, u64::MAX).await

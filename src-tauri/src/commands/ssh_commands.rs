@@ -1169,11 +1169,13 @@ pub(crate) fn sanitize_file_name(file_name: &str) -> String {
     }
 }
 
-pub(crate) fn unique_download_path(dir: &Path, file_name: &str) -> PathBuf {
-    let candidate = dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
-    }
+/// Collision-safe destination candidates: the plain name first, then
+/// "name (1)", "name (2)", … and finally a uuid fallback that always wins.
+pub(crate) fn unique_download_candidates(
+    dir: &Path,
+    file_name: &str,
+) -> impl Iterator<Item = PathBuf> {
+    let dir = dir.to_path_buf();
     let stem = Path::new(file_name)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -1182,13 +1184,27 @@ pub(crate) fn unique_download_path(dir: &Path, file_name: &str) -> PathBuf {
         .extension()
         .map(|s| format!(".{}", s.to_string_lossy()))
         .unwrap_or_default();
-    for index in 1..1000u32 {
-        let candidate = dir.join(format!("{} ({}){}", stem, index, extension));
-        if !candidate.exists() {
-            return candidate;
+    let base = dir.join(file_name);
+    std::iter::once(base).chain(
+        (1..1000u32).map(move |index| dir.join(format!("{} ({}){}", stem, index, extension))),
+    )
+}
+
+/// Claim a destination atomically (create_new) so concurrent downloads and
+/// symlink swaps cannot clobber or redirect an existing file.
+pub(crate) fn claim_download_destination(dir: &Path, file_name: &str) -> Result<PathBuf, String> {
+    for candidate in unique_download_candidates(dir, file_name) {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Failed to prepare download destination: {}", error)),
         }
     }
-    dir.join(format!("{} ({}){}", stem, Uuid::new_v4(), extension))
+    Err("No available download file name".to_string())
 }
 
 /// Explicit user download: stream the remote file into a user-chosen
@@ -1221,7 +1237,7 @@ pub async fn sftp_download_to_dir(
         .unwrap_or("download");
     let safe_name = sanitize_file_name(file_name);
 
-    let destination = unique_download_path(&downloads_dir, &safe_name);
+    let destination = claim_download_destination(&downloads_dir, &safe_name)?;
     if !destination.starts_with(&downloads_dir) {
         return Err("Invalid download destination path".to_string());
     }
