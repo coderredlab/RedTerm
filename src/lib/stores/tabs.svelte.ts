@@ -76,9 +76,18 @@ function loadPersistedState(): PersistedTabsState {
         (tab): tab is Tab =>
           Boolean(tab?.id && tab?.host && tab?.port && tab?.auth) &&
           (
-            tab.auth.method.type === "key" ||
-            tab.auth.method.type === "stored_password" ||
-            Boolean(tab.sessionId || tab.canRestorePassword)
+            (tab.auth.method.type === "key" && Boolean(tab.auth.method.key_id)) ||
+            (
+              tab.auth.method.type === "stored_password" &&
+              Boolean(
+                tab.connectionId &&
+                tab.auth.method.connection_id === tab.connectionId
+              )
+            ) ||
+            Boolean(
+              tab.sessionId ||
+              (tab.connectionId && tab.canRestorePassword)
+            )
           )
       )
       .map((tab) => {

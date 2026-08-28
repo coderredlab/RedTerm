@@ -81,6 +81,21 @@ describe("tabs store persistence", () => {
             sessionId: null,
             connected: true,
           },
+          {
+            id: "tab-legacy-key-path",
+            title: "legacy.example.com",
+            host: "legacy.example.com",
+            port: 22,
+            auth: {
+              username: "deploy",
+              method: {
+                type: "key",
+                key_path: "/legacy/id_ed25519",
+              },
+            },
+            sessionId: null,
+            connected: false,
+          },
         ],
         activeTabId: "tab-stale-passphrase",
       })
