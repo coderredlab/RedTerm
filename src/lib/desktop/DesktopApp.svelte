@@ -1,35 +1,89 @@
-
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import ConnectionDialog from "$lib/components/ConnectionDialog.svelte";
   import ConnectionList from "$lib/components/ConnectionList.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
-  import { terminalModesStore } from "$lib/stores/terminal-modes.svelte";
   import type { SavedConnection } from "$lib/tauri/commands";
   import {
     getRuntimeInstanceId,
-    sshDisconnect,
     sshSessionExists,
   } from "$lib/tauri/commands";
   import Terminal from "$lib/terminal/Terminal.svelte";
+  import { handleDesktopShortcuts } from "./shortcuts";
+  import PaneView from "./workspace/PaneView.svelte";
+  import TabStrip from "./workspace/TabStrip.svelte";
+  import {
+    dragTargets,
+    tabDrag,
+    type DropZone,
+  } from "./workspace/drag-state.svelte";
+  import { setWorkspaceApi, type WorkspaceApi } from "./workspace/workspace-context";
 
   let showDialog = $state(false);
+  let settingsOpen = $state(false);
   let editingConnection = $state<SavedConnection | undefined>(undefined);
-  let terminalRefs = $state<Record<string, Terminal | undefined>>({});
   let runtimeInstanceId = $state<string | null>(null);
   let sessionsReconciled = $state(false);
+  let workspaceEl: HTMLElement | null = $state(null);
+
+  const terminals = new Map<string, Terminal>();
+
+  $effect(() => {
+    dragTargets.workspace = workspaceEl;
+    return () => {
+      if (dragTargets.workspace === workspaceEl) {
+        dragTargets.workspace = null;
+      }
+    };
+  });
 
   onMount(() => {
-    window.addEventListener("resize", resizeActiveTerminal);
     void reconcilePersistedSessions();
   });
 
-  onDestroy(() => {
-    window.removeEventListener("resize", resizeActiveTerminal);
-  });
+  async function disconnectTerminal(paneId: string) {
+    const terminal = terminals.get(paneId);
+    if (!terminal?.disconnect) return;
+    try {
+      await terminal.disconnect();
+    } catch (error) {
+      console.error("Pane disconnect error:", error);
+    }
+  }
 
-  function resizeActiveTerminal() {
-    terminalRefs[tabsStore.activeTabId ?? ""]?.resize();
+  async function reconcilePersistedSessions() {
+    try {
+      runtimeInstanceId = await getRuntimeInstanceId();
+    } catch (error) {
+      console.error("Failed to load runtime instance id:", error);
+      sessionsReconciled = true;
+      return;
+    }
+
+    for (const tab of [...tabsStore.tabs]) {
+      for (const pane of [...tab.panes]) {
+        if (!pane.sessionId) continue;
+
+        const sameRuntime = pane.runtimeInstanceId === runtimeInstanceId;
+        const sessionAlive = sameRuntime
+          ? await sshSessionExists(pane.sessionId).catch(() => false)
+          : false;
+
+        if (sessionAlive) continue;
+
+        if (
+          pane.connection.auth.method.type === "password" &&
+          !pane.connection.canRestorePassword
+        ) {
+          tabsStore.closePane(tab.id, pane.id);
+          continue;
+        }
+
+        tabsStore.setPaneDisconnected(tab.id, pane.id);
+      }
+    }
+
+    sessionsReconciled = true;
   }
 
   function handleNewConnection() {
@@ -47,68 +101,211 @@
     editingConnection = undefined;
   }
 
-  function handleConnected(tabId: string, sessionId: string) {
-    tabsStore.setConnected(tabId, sessionId, runtimeInstanceId);
-  }
-
-  function handleDisconnected(tabId: string) {
-    tabsStore.setDisconnected(tabId);
-  }
-
-  async function reconcilePersistedSessions() {
-    try {
-      runtimeInstanceId = await getRuntimeInstanceId();
-    } catch (error) {
-      console.error("Failed to load runtime instance id:", error);
-      sessionsReconciled = true;
-      return;
-    }
-
-    for (const tab of [...tabsStore.tabs]) {
-      if (!tab.sessionId) continue;
-
-      const sameRuntime = tab.runtimeInstanceId === runtimeInstanceId;
-      const sessionAlive = sameRuntime
-        ? await sshSessionExists(tab.sessionId).catch(() => false)
-        : false;
-
-      if (sessionAlive) continue;
-
-      if (tab.auth.method.type === "password" && !tab.canRestorePassword) {
-        tabsStore.removeTab(tab.id);
-        continue;
-      }
-
-      tabsStore.setDisconnected(tab.id);
-    }
-
-    sessionsReconciled = true;
-  }
-
-  async function handleCloseTab(event: MouseEvent, tabId: string) {
-    event.stopPropagation();
-
-    const terminal = terminalRefs[tabId];
+  async function closeTabById(tabId: string) {
     const tab = tabsStore.getTab(tabId);
-    if (terminal?.disconnect) {
-      try {
-        await terminal.disconnect();
-      } catch (error) {
-        console.error("Tab disconnect error:", error);
-      }
-    } else if (tab?.sessionId) {
-      terminalModesStore.clearSession(tab.sessionId);
-      try {
-        await sshDisconnect(tab.sessionId);
-      } catch (error) {
-        console.error("Fallback tab disconnect error:", error);
-      }
+    if (!tab) return;
+    for (const pane of tab.panes) {
+      await disconnectTerminal(pane.id);
     }
-
     tabsStore.removeTab(tabId);
-    delete terminalRefs[tabId];
+  }
+
+  function closeActivePane() {
+    const tab = tabsStore.activeTab;
+    if (!tab) return;
+    const paneId = tab.activePaneId ?? tab.panes[0]?.id;
+    if (paneId) void workspaceApi.closePane(tab.id, paneId);
+  }
+
+  function closeActiveTab() {
+    const tabId = tabsStore.activeTabId;
+    if (tabId) void closeTabById(tabId);
+  }
+
+  function cycleTab(delta: number) {
+    const count = tabsStore.tabs.length;
+    if (count < 2) return;
+    const index = tabsStore.tabs.findIndex(
+      (tab) => tab.id === tabsStore.activeTabId
+    );
+    const next = tabsStore.tabs[(index + delta + count) % count]!;
+    tabsStore.setActiveTab(next.id);
+  }
+
+  function selectTabByIndex(index: number) {
+    const tab = tabsStore.tabs[index];
+    if (tab) {
+      tabsStore.setActiveTab(tab.id);
+    }
+  }
+
+  function splitActivePane(dir: "row" | "col") {
+    const tab = tabsStore.activeTab;
+    const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
+    if (tab && paneId) {
+      tabsStore.splitPane(tab.id, paneId, dir);
+    }
+  }
+
+  function moveFocus(direction: "left" | "right" | "up" | "down") {
+    const tab = tabsStore.activeTab;
+    const activePaneId = tab?.activePaneId;
+    if (!tab || !activePaneId || !workspaceEl) return;
+    const container = workspaceEl.querySelector(".tab-container.active");
+    if (!container) return;
+
+    const current = container.querySelector<HTMLElement>(
+      `[data-pane-id="${activePaneId}"]`
+    );
+    if (!current) return;
+    const cur = current.getBoundingClientRect();
+    const curCX = cur.left + cur.width / 2;
+    const curCY = cur.top + cur.height / 2;
+
+    let bestId: string | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+    container.querySelectorAll<HTMLElement>("[data-pane-id]").forEach((el) => {
+      const id = el.dataset.paneId;
+      if (!id || id === activePaneId) return;
+      const rect = el.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      if (direction === "left" && cx >= curCX) return;
+      if (direction === "right" && cx <= curCX) return;
+      if (direction === "up" && cy >= curCY) return;
+      if (direction === "down" && cy <= curCY) return;
+
+      const gapX =
+        direction === "left"
+          ? cur.left - rect.right
+          : direction === "right"
+            ? rect.left - cur.right
+            : 0;
+      const gapY =
+        direction === "up"
+          ? cur.top - rect.bottom
+          : direction === "down"
+            ? rect.top - cur.bottom
+            : 0;
+      const primary = Math.max(gapX, gapY);
+      const cross =
+        direction === "left" || direction === "right"
+          ? Math.abs(cy - curCY)
+          : Math.abs(cx - curCX);
+      const score = primary + cross * 0.01;
+      if (score < bestScore) {
+        bestScore = score;
+        bestId = id;
+      }
+    });
+
+    if (bestId) {
+      tabsStore.setActivePane(tab.id, bestId);
+    }
+  }
+
+  async function handleTabDropIntoWorkspace(
+    sourceTabId: string,
+    zone: DropZone
+  ) {
+    const targetTabId = tabsStore.activeTabId;
+    if (!targetTabId || targetTabId === sourceTabId) return;
+    const source = tabsStore.getTab(sourceTabId);
+    if (!source) return;
+
+    const dir = zone === "left" || zone === "right" ? "row" : "col";
+    const side = zone === "left" || zone === "top" ? "before" : "after";
+
+    const movedPaneIds = source.panes.map((pane) => pane.id);
+    for (const paneId of movedPaneIds) {
+      tabsStore.setPreserveSessionOnMove(sourceTabId, paneId, true);
+    }
+    await tick();
+    tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
+    await tick();
+    for (const paneId of movedPaneIds) {
+      tabsStore.setPreserveSessionOnMove(targetTabId, paneId, false);
+    }
+  }
+
+  async function handlePaneDrop(tabId: string, paneId: string) {
+    const zone = tabDrag.dropZone;
+    if (!zone || !workspaceEl) return;
+    const hit = document.elementFromPoint(
+      tabDrag.pointerX,
+      tabDrag.pointerY
+    )?.closest<HTMLElement>("[data-pane-id]");
+    const targetPaneId = hit?.dataset.paneId;
+    if (!targetPaneId || targetPaneId === paneId) return;
+
+    const dir = zone === "left" || zone === "right" ? "row" : "col";
+    const side = zone === "left" || zone === "top" ? "before" : "after";
+
+    tabsStore.setPreserveSessionOnMove(tabId, paneId, true);
+    await tick();
+    tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side);
+    await tick();
+    tabsStore.setPreserveSessionOnMove(tabId, paneId, false);
+  }
+
+  const workspaceApi: WorkspaceApi = {
+    registerTerminal(paneId, terminal) {
+      terminals.set(paneId, terminal as Terminal);
+    },
+    unregisterTerminal(paneId) {
+      terminals.delete(paneId);
+    },
+    paneConnected(tabId, paneId, sessionId) {
+      tabsStore.setPaneConnected(tabId, paneId, sessionId, runtimeInstanceId);
+    },
+    paneDisconnected(tabId, paneId) {
+      tabsStore.setPaneDisconnected(tabId, paneId);
+    },
+    closePane(tabId, paneId) {
+      void (async () => {
+        await disconnectTerminal(paneId);
+        tabsStore.closePane(tabId, paneId);
+      })();
+    },
+    splitPane(tabId, paneId, dir) {
+      tabsStore.splitPane(tabId, paneId, dir);
+    },
+    activatePane(tabId, paneId) {
+      tabsStore.setActivePane(tabId, paneId);
+    },
+    paneDragDropped(tabId, paneId) {
+      void handlePaneDrop(tabId, paneId);
+    },
+  };
+  setWorkspaceApi(workspaceApi);
+
+  function onKeydownCapture(event: KeyboardEvent) {
+    const consumed = handleDesktopShortcuts(
+      event,
+      {
+        newConnection: handleNewConnection,
+        closePane: closeActivePane,
+        closeTab: closeActiveTab,
+        nextTab: () => cycleTab(1),
+        previousTab: () => cycleTab(-1),
+        selectTab: selectTabByIndex,
+        splitRight: () => splitActivePane("row"),
+        splitDown: () => splitActivePane("col"),
+        moveFocus,
+        openSettings: () => {
+          settingsOpen = true;
+        },
+      },
+      () => !showDialog && !settingsOpen && sessionsReconciled
+    );
+    if (consumed) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
   }
 </script>
+
+<svelte:window onkeydowncapture={onKeydownCapture} />
 
 <svelte:head>
   <title>RedTerm Desktop</title>
@@ -128,42 +325,17 @@
   </aside>
 
   <section class="workspace">
-    <header class="workspace-bar">
-      <div class="tabs" role="tablist" aria-label="Terminal sessions">
-        {#each tabsStore.tabs as tab (tab.id)}
-          <button
-            class="session-tab"
-            class:active={tab.id === tabsStore.activeTabId}
-            role="tab"
-            aria-selected={tab.id === tabsStore.activeTabId}
-            onclick={() => tabsStore.setActiveTab(tab.id)}
-          >
-            <span class="connection-state" class:connected={tab.connected}></span>
-            <span class="session-title">{tab.title}</span>
-            <span
-              class="close-tab"
-              role="button"
-              tabindex="0"
-              aria-label={`Close ${tab.title}`}
-              onclick={(event) => void handleCloseTab(event, tab.id)}
-              onkeydown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  void handleCloseTab(event as unknown as MouseEvent, tab.id);
-                }
-              }}
-            >×</span>
-          </button>
-        {/each}
-      </div>
+    <TabStrip
+      onNewConnection={handleNewConnection}
+      onCloseTab={(tabId) => void closeTabById(tabId)}
+      onOpenSettings={() => {
+        settingsOpen = true;
+      }}
+      onDropToWorkspace={(sourceTabId, zone) =>
+        void handleTabDropIntoWorkspace(sourceTabId, zone)}
+    />
 
-      <button class="new-session" onclick={handleNewConnection}>
-        <span aria-hidden="true">+</span>
-        New connection
-      </button>
-    </header>
-
-    <main class="terminal-workspace">
+    <main class="terminal-workspace" bind:this={workspaceEl}>
       {#if tabsStore.tabs.length === 0}
         <div class="empty-workspace">
           <div class="empty-rule"></div>
@@ -171,32 +343,39 @@
           <h1>Start with a server.</h1>
           <p class="empty-copy">
             Choose a saved connection from the left, or add a new SSH connection.
+            Drag tabs onto the workspace to split the view across servers.
           </p>
-          <button class="empty-action" onclick={handleNewConnection}>New connection</button>
+          <button class="empty-action" onclick={handleNewConnection}>
+            New connection
+          </button>
         </div>
       {:else if !sessionsReconciled}
         <div class="session-restore-loader">Checking session state…</div>
       {:else}
         {#each tabsStore.tabs as tab (tab.id)}
           <div
-            class="terminal-container"
+            class="tab-container"
             class:active={tab.id === tabsStore.activeTabId}
           >
-            <Terminal
-              host={tab.host}
-              port={tab.port}
-              auth={tab.auth}
-              existingSessionId={tab.sessionId}
-              connectionId={tab.connectionId}
-              startupScript={tab.startupScript}
-              startupScriptReadyText={tab.startupScriptReadyText}
-              interactive={!showDialog && tab.id === tabsStore.activeTabId}
-              onConnected={(sessionId) => handleConnected(tab.id, sessionId)}
-              onDisconnected={() => handleDisconnected(tab.id)}
-              bind:this={terminalRefs[tab.id]}
+            <PaneView
+              tabId={tab.id}
+              node={tab.layout}
+              interactive={!showDialog &&
+                !settingsOpen &&
+                tab.id === tabsStore.activeTabId}
+              activePaneId={tab.activePaneId}
             />
           </div>
         {/each}
+
+        {#if tabDrag.active && tabDrag.dropZone}
+          <div class="drop-overlay" aria-hidden="true">
+            <div class="drop-zone" class:lit={tabDrag.dropZone === "left"}></div>
+            <div class="drop-zone" class:lit={tabDrag.dropZone === "right"}></div>
+            <div class="drop-zone" class:lit={tabDrag.dropZone === "top"}></div>
+            <div class="drop-zone" class:lit={tabDrag.dropZone === "bottom"}></div>
+          </div>
+        {/if}
       {/if}
     </main>
   </section>
@@ -206,6 +385,16 @@
     editConnection={editingConnection}
     onClose={handleCloseDialog}
   />
+
+  {#if tabDrag.active}
+    <div
+      class="drag-ghost"
+      style:left="{tabDrag.pointerX + 14}px"
+      style:top="{tabDrag.pointerY + 12}px"
+    >
+      {tabDrag.title}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -295,119 +484,6 @@
     background: var(--terminal-bg);
   }
 
-  .workspace-bar {
-    height: 45px;
-    flex: 0 0 auto;
-    display: flex;
-    align-items: stretch;
-    border-bottom: 1px solid var(--border-primary);
-    background: var(--bg-primary);
-  }
-
-  .tabs {
-    min-width: 0;
-    flex: 1;
-    display: flex;
-    align-items: stretch;
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  .tabs::-webkit-scrollbar {
-    display: none;
-  }
-
-  .session-tab {
-    min-width: 150px;
-    max-width: 230px;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 0 10px 0 14px;
-    border: 0;
-    border-right: 1px solid var(--border-primary);
-    border-bottom: 2px solid transparent;
-    background: transparent;
-    color: var(--text-muted);
-    font: inherit;
-    font-size: 11px;
-    cursor: pointer;
-  }
-
-  .session-tab:hover {
-    background: var(--bg-secondary);
-    color: var(--text-secondary);
-  }
-
-  .session-tab.active {
-    border-bottom-color: var(--accent-primary);
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-  }
-
-  .connection-state {
-    width: 7px;
-    height: 7px;
-    flex: 0 0 auto;
-    border-radius: 50%;
-    background: var(--text-muted);
-  }
-
-  .connection-state.connected {
-    background: var(--status-success);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--status-success) 13%, transparent);
-  }
-
-  .session-title {
-    min-width: 0;
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    text-align: left;
-  }
-
-  .close-tab {
-    width: 20px;
-    height: 20px;
-    display: grid;
-    place-items: center;
-    border-radius: 3px;
-    color: var(--text-muted);
-    font-size: 16px;
-    line-height: 1;
-  }
-
-  .close-tab:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-  }
-
-  .new-session {
-    flex: 0 0 auto;
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    padding: 0 16px;
-    border: 0;
-    border-left: 1px solid var(--border-primary);
-    background: transparent;
-    color: var(--text-secondary);
-    font: inherit;
-    font-size: 11px;
-    cursor: pointer;
-  }
-
-  .new-session span {
-    color: var(--accent-primary);
-    font-size: 17px;
-  }
-
-  .new-session:hover {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-  }
-
   .terminal-workspace {
     position: relative;
     flex: 1;
@@ -415,14 +491,78 @@
     overflow: hidden;
   }
 
-  .terminal-container {
+  .tab-container {
     position: absolute;
     inset: 0;
     display: none;
   }
 
-  .terminal-container.active {
+  .tab-container.active {
     display: block;
+  }
+
+  .drop-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    pointer-events: none;
+  }
+
+  .drop-zone {
+    position: absolute;
+    background: color-mix(in srgb, var(--accent-primary) 6%, transparent);
+    opacity: 0;
+    transition: opacity 80ms ease;
+  }
+
+  .drop-zone:nth-child(1) {
+    left: 0;
+    top: 0;
+    width: 50%;
+    height: 100%;
+  }
+
+  .drop-zone:nth-child(2) {
+    right: 0;
+    top: 0;
+    width: 50%;
+    height: 100%;
+  }
+
+  .drop-zone:nth-child(3) {
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 50%;
+  }
+
+  .drop-zone:nth-child(4) {
+    left: 0;
+    bottom: 0;
+    width: 100%;
+    height: 50%;
+  }
+
+  .drop-zone.lit {
+    opacity: 1;
+    border: 2px solid var(--accent-primary);
+  }
+
+  .drag-ghost {
+    position: fixed;
+    z-index: 100;
+    max-width: 220px;
+    padding: 5px 12px;
+    border: 1px solid var(--accent-primary);
+    border-radius: 3px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
   }
 
   .empty-workspace,

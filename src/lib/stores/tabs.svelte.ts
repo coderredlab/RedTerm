@@ -1,8 +1,44 @@
 import type { AuthConfig } from "$lib/tauri/commands";
 
+/** Connection target owned by a single terminal pane. */
+export interface PaneConnection {
+  host: string;
+  port: number;
+  auth: AuthConfig;
+  connectionId?: string;
+  canRestorePassword?: boolean;
+  startupScript?: string;
+  startupScriptReadyText?: string;
+}
+
+/** One terminal instance slot. Each pane owns its connection target and session. */
+export interface Pane {
+  id: string;
+  tabId: string;
+  title: string;
+  connection: PaneConnection;
+  sessionId: string | null;
+  runtimeInstanceId?: string | null;
+  connected: boolean;
+  /** When true, Terminal teardown must keep the remote session alive (desktop pane move). */
+  preserveSessionOnMove?: boolean;
+}
+
+export type PaneNode =
+  | { type: "leaf"; paneId: string }
+  | {
+      type: "split";
+      id: string;
+      dir: "row" | "col";
+      ratio: number;
+      children: [PaneNode, PaneNode];
+    };
+
 export interface Tab {
   id: string;
   title: string;
+  // Legacy single-connection surface, mirrored from the primary pane.
+  // MobileApp and shared components rely on these fields.
   host: string;
   port: number;
   auth: AuthConfig;
@@ -13,14 +49,26 @@ export interface Tab {
   sessionId: string | null;
   runtimeInstanceId?: string | null;
   connected: boolean;
+  // Pane model. Every tab has at least one pane; legacy single-pane tabs
+  // simply hold exactly one.
+  panes: Pane[];
+  layout: PaneNode;
+  activePaneId: string | null;
 }
 
-interface PersistedTabsState {
+interface PersistedTabsStateV1 {
   tabs: Tab[];
   activeTabId: string | null;
 }
 
-const STORAGE_KEY = "redterm.tabs.v1";
+interface PersistedTabsStateV2 {
+  version: 2;
+  tabs: Tab[];
+  activeTabId: string | null;
+}
+
+const STORAGE_KEY = "redterm.tabs.v2";
+const LEGACY_STORAGE_KEY = "redterm.tabs.v1";
 
 function canUseStorage(): boolean {
   return typeof window !== "undefined" && typeof localStorage !== "undefined";
@@ -52,85 +100,402 @@ function makePersistableAuth(
   };
 }
 
-function canPersistTab(tab: Tab): boolean {
-  if (tab.auth.method.type === "key") {
-    return true;
+function canPersistPane(pane: Pane): boolean {
+  const auth = pane.connection.auth;
+  if (auth.method.type === "key") {
+    return Boolean(auth.method.key_id);
   }
-  if (tab.auth.method.type === "stored_password") {
-    return Boolean(tab.connectionId);
+  if (auth.method.type === "stored_password") {
+    return Boolean(pane.connection.connectionId);
   }
-  return Boolean(tab.sessionId || (tab.connectionId && tab.canRestorePassword));
+  return Boolean(
+    pane.sessionId ||
+      (pane.connection.connectionId && pane.connection.canRestorePassword)
+  );
 }
 
-function loadPersistedState(): PersistedTabsState {
-  if (!canUseStorage()) return { tabs: [], activeTabId: null };
+function paneTitle(connection: PaneConnection): string {
+  return `${connection.auth.username}@${connection.host}`;
+}
+
+function makePane(
+  tabId: string,
+  connection: PaneConnection,
+  paneId?: string
+): Pane {
+  return {
+    id: paneId ?? crypto.randomUUID(),
+    tabId,
+    title: paneTitle(connection),
+    connection,
+    sessionId: null,
+    runtimeInstanceId: null,
+    connected: false,
+  };
+}
+
+function leaf(paneId: string): PaneNode {
+  return { type: "leaf", paneId };
+}
+
+function makeSplit(
+  dir: "row" | "col",
+  ratio: number,
+  children: [PaneNode, PaneNode]
+): PaneNode {
+  return { type: "split", id: crypto.randomUUID(), dir, ratio, children };
+}
+
+function collectPaneIds(node: PaneNode, into: string[] = []): string[] {
+  if (node.type === "leaf") {
+    into.push(node.paneId);
+  } else {
+    collectPaneIds(node.children[0], into);
+    collectPaneIds(node.children[1], into);
+  }
+  return into;
+}
+
+function pruneLayout(node: PaneNode, alive: Set<string>): PaneNode | null {
+  if (node.type === "leaf") {
+    return alive.has(node.paneId) ? node : null;
+  }
+  const first = pruneLayout(node.children[0], alive);
+  const second = pruneLayout(node.children[1], alive);
+  if (first && second) {
+    return { ...node, children: [first, second] as [PaneNode, PaneNode] };
+  }
+  return first ?? second;
+}
+
+function replaceLeaf(
+  node: PaneNode,
+  paneId: string,
+  transform: (leafNode: PaneNode) => PaneNode
+): PaneNode {
+  if (node.type === "leaf") {
+    return node.paneId === paneId ? transform(node) : node;
+  }
+  return {
+    ...node,
+    children: [
+      replaceLeaf(node.children[0], paneId, transform),
+      replaceLeaf(node.children[1], paneId, transform),
+    ] as [PaneNode, PaneNode],
+  };
+}
+
+function updateRatio(
+  node: PaneNode,
+  splitId: string,
+  ratio: number
+): PaneNode {
+  if (node.type === "leaf") return node;
+  if (node.id === splitId) return { ...node, ratio };
+  return {
+    ...node,
+    children: [
+      updateRatio(node.children[0], splitId, ratio),
+      updateRatio(node.children[1], splitId, ratio),
+    ] as [PaneNode, PaneNode],
+  };
+}
+
+function validateLayout(node: unknown, validPaneIds: Set<string>): PaneNode | null {
+  if (!node || typeof node !== "object") return null;
+  const candidate = node as Partial<PaneNode>;
+  if (candidate.type === "leaf") {
+    const leafNode = candidate as { type: "leaf"; paneId?: unknown };
+    return typeof leafNode.paneId === "string" && validPaneIds.has(leafNode.paneId)
+      ? leaf(leafNode.paneId)
+      : null;
+  }
+  if (candidate.type === "split") {
+    const splitNode = candidate as {
+      type: "split";
+      dir?: unknown;
+      ratio?: unknown;
+      children?: unknown;
+    };
+    if (
+      (splitNode.dir !== "row" && splitNode.dir !== "col") ||
+      typeof splitNode.ratio !== "number" ||
+      !Array.isArray(splitNode.children) ||
+      splitNode.children.length !== 2
+    ) {
+      return null;
+    }
+    const first = validateLayout(splitNode.children[0], validPaneIds);
+    const second = validateLayout(splitNode.children[1], validPaneIds);
+    if (!first || !second) return null;
+    return makeSplitWithId(
+      { dir: splitNode.dir as "row" | "col", ratio: splitNode.ratio as number },
+      first,
+      second
+    );
+  }
+  return null;
+}
+
+function makeSplitWithId(
+  source: { dir: "row" | "col"; ratio: number },
+  first: PaneNode,
+  second: PaneNode
+): PaneNode {
+  const ratio = Number.isFinite(source.ratio)
+    ? Math.min(0.9, Math.max(0.1, source.ratio))
+    : 0.5;
+  return {
+    type: "split",
+    id: crypto.randomUUID(),
+    dir: source.dir,
+    ratio,
+    children: [first, second],
+  };
+}
+
+function validatePane(candidate: unknown, tabId: string): Pane | null {
+  if (!candidate || typeof candidate !== "object") return null;
+  const raw = candidate as Partial<Pane> & {
+    connection?: Partial<PaneConnection>;
+  };
+  const connection = raw.connection;
+  if (
+    typeof raw.id !== "string" ||
+    !connection ||
+    typeof connection.host !== "string" ||
+    typeof connection.port !== "number" ||
+    !connection.auth ||
+    typeof connection.auth.username !== "string" ||
+    !connection.auth.method
+  ) {
+    return null;
+  }
+  const persistedConnection: PaneConnection = {
+    host: connection.host,
+    port: connection.port,
+    auth: makePersistableAuth(
+      connection.auth as AuthConfig,
+      connection.connectionId,
+      Boolean(connection.canRestorePassword)
+    ),
+    connectionId: connection.connectionId,
+    canRestorePassword: connection.canRestorePassword,
+    startupScript: connection.startupScript,
+    startupScriptReadyText: connection.startupScriptReadyText,
+  };
+  const pane: Pane = {
+    id: raw.id,
+    tabId,
+    title: paneTitle(persistedConnection),
+    connection: persistedConnection,
+    sessionId: typeof raw.sessionId === "string" ? raw.sessionId : null,
+    runtimeInstanceId:
+      typeof raw.runtimeInstanceId === "string" ? raw.runtimeInstanceId : null,
+    connected: false,
+  };
+  return canPersistPane(pane) ? pane : null;
+}
+
+/** Recompute legacy tab-level fields from the pane model. */
+function syncTabFromPanes(tab: Tab) {
+  const primary = tab.panes[0];
+  const active =
+    tab.panes.find((pane) => pane.id === tab.activePaneId) ?? primary;
+  if (primary) {
+    tab.host = primary.connection.host;
+    tab.port = primary.connection.port;
+    tab.auth = primary.connection.auth;
+    tab.connectionId = primary.connection.connectionId;
+    tab.canRestorePassword = primary.connection.canRestorePassword;
+    tab.startupScript = primary.connection.startupScript;
+    tab.startupScriptReadyText = primary.connection.startupScriptReadyText;
+  }
+  tab.sessionId = active?.sessionId ?? null;
+  tab.runtimeInstanceId = active?.runtimeInstanceId ?? null;
+  tab.connected = tab.panes.some((pane) => pane.connected);
+  tab.title = active?.title ?? tab.title;
+}
+
+function buildTab(
+  id: string,
+  panes: Pane[],
+  layout: PaneNode,
+  activePaneId: string | null,
+  title?: string
+): Tab {
+  const tab: Tab = {
+    id,
+    title: title ?? panes[0]?.title ?? "Session",
+    host: "",
+    port: 22,
+    auth: { username: "", method: { type: "password", password: "" } },
+    sessionId: null,
+    connected: false,
+    panes,
+    layout,
+    activePaneId: activePaneId ?? panes[0]?.id ?? null,
+  };
+  syncTabFromPanes(tab);
+  return tab;
+}
+
+function loadV2State(parsed: Partial<PersistedTabsStateV2>): PersistedTabsStateV2 | null {
+  const rawTabs = Array.isArray(parsed.tabs) ? parsed.tabs : [];
+  const tabs: Tab[] = [];
+  for (const rawTab of rawTabs) {
+    if (!rawTab || typeof rawTab.id !== "string") continue;
+    const rawPanes = Array.isArray(rawTab.panes) ? rawTab.panes : [];
+    const panes: Pane[] = [];
+    for (const rawPane of rawPanes) {
+      const pane = validatePane(rawPane, rawTab.id as string);
+      if (pane) panes.push(pane);
+    }
+    if (panes.length === 0) continue;
+    const validIds = new Set(panes.map((pane) => pane.id));
+    const layout =
+      validateLayout(rawTab.layout, validIds) ?? leaf(panes[0]!.id);
+    const aliveIds = new Set(collectPaneIds(layout));
+    const activePaneId =
+      typeof rawTab.activePaneId === "string" &&
+      aliveIds.has(rawTab.activePaneId)
+        ? rawTab.activePaneId
+        : collectPaneIds(layout)[0]!;
+    tabs.push(buildTab(rawTab.id as string, panes, layout, activePaneId));
+  }
+  if (tabs.length === 0) return null;
+  const activeTabId =
+    typeof parsed.activeTabId === "string" &&
+    tabs.some((tab) => tab.id === parsed.activeTabId)
+      ? parsed.activeTabId
+      : tabs[0]!.id;
+  return { version: 2, tabs, activeTabId };
+}
+
+function loadLegacyState(raw: string): PersistedTabsStateV2 | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<PersistedTabsStateV1>;
+    const rawTabs = Array.isArray(parsed.tabs) ? parsed.tabs : [];
+    const tabs: Tab[] = [];
+    for (const legacy of rawTabs) {
+      if (
+        !legacy?.id ||
+        !legacy.host ||
+        !legacy.port ||
+        !legacy.auth
+      ) {
+        continue;
+      }
+      const method = legacy.auth.method;
+      if (method.type === "key" && !method.key_id) {
+        // Legacy tabs holding key paths instead of uploaded key ids cannot
+        // connect; keep discarding them (see "discard legacy key-path tabs").
+        continue;
+      }
+      if (
+        method.type === "stored_password" &&
+        (!legacy.connectionId ||
+          method.connection_id !== legacy.connectionId)
+      ) {
+        continue;
+      }
+      const connection: PaneConnection = {
+        host: legacy.host,
+        port: legacy.port,
+        auth: makePersistableAuth(
+          legacy.auth,
+          legacy.connectionId,
+          Boolean(legacy.canRestorePassword)
+        ),
+        connectionId: legacy.connectionId,
+        canRestorePassword: legacy.canRestorePassword,
+        startupScript: legacy.startupScript,
+        startupScriptReadyText: legacy.startupScriptReadyText,
+      };
+      const tabId = legacy.id as string;
+      const pane = makePane(tabId, connection, tabId);
+      pane.sessionId =
+        typeof legacy.sessionId === "string" ? legacy.sessionId : null;
+      pane.runtimeInstanceId =
+        typeof legacy.runtimeInstanceId === "string"
+          ? legacy.runtimeInstanceId
+          : null;
+      if (!canPersistPane(pane)) continue;
+      tabs.push(buildTab(tabId, [pane], leaf(pane.id), pane.id));
+    }
+    if (tabs.length === 0) return null;
+    const activeTabId =
+      typeof parsed.activeTabId === "string" &&
+      tabs.some((tab) => tab.id === parsed.activeTabId)
+        ? parsed.activeTabId
+        : tabs[0]!.id;
+    return { version: 2, tabs, activeTabId };
+  } catch {
+    return null;
+  }
+}
+
+function loadPersistedState(): PersistedTabsStateV2 {
+  const empty: PersistedTabsStateV2 = {
+    version: 2,
+    tabs: [],
+    activeTabId: null,
+  };
+  if (!canUseStorage()) return empty;
 
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { tabs: [], activeTabId: null };
-    const parsed = JSON.parse(raw) as Partial<PersistedTabsState>;
-    const rawTabs = Array.isArray(parsed.tabs) ? parsed.tabs : [];
-
-    const tabs: Tab[] = rawTabs
-      .filter(
-        (tab): tab is Tab =>
-          Boolean(tab?.id && tab?.host && tab?.port && tab?.auth) &&
-          (
-            (tab.auth.method.type === "key" && Boolean(tab.auth.method.key_id)) ||
-            (
-              tab.auth.method.type === "stored_password" &&
-              Boolean(
-                tab.connectionId &&
-                tab.auth.method.connection_id === tab.connectionId
-              )
-            ) ||
-            Boolean(
-              tab.sessionId ||
-              (tab.connectionId && tab.canRestorePassword)
-            )
-          )
-      )
-      .map((tab) => {
-        const { keyPassphraseExplicitEmpty: _keyPassphraseExplicitEmpty, ...persistedTab } =
-          tab as Tab & { keyPassphraseExplicitEmpty?: boolean };
-        return {
-          ...persistedTab,
-          auth: makePersistableAuth(
-            tab.auth,
-            tab.connectionId,
-            tab.canRestorePassword
-          ),
-          sessionId: typeof tab.sessionId === "string" ? tab.sessionId : null,
-          connected: false,
-        };
-      });
-
-    const activeTabId =
-      typeof parsed.activeTabId === "string" && tabs.some((t) => t.id === parsed.activeTabId)
-        ? parsed.activeTabId
-        : tabs[0]?.id ?? null;
-
-    return { tabs, activeTabId };
+    const rawV2 = localStorage.getItem(STORAGE_KEY);
+    if (rawV2) {
+      const state = loadV2State(JSON.parse(rawV2));
+      if (state) return state;
+    }
+    const rawV1 = localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (rawV1) {
+      const state = loadLegacyState(rawV1);
+      if (state) return state;
+    }
+    return empty;
   } catch {
-    return { tabs: [], activeTabId: null };
+    return empty;
   }
 }
 
 function persistState(tabs: Tab[], activeTabId: string | null) {
   if (!canUseStorage()) return;
 
-  const persistableTabs = tabs
-    .filter((tab) => canPersistTab(tab))
-    .map((tab) => ({
-      ...tab,
-      auth: makePersistableAuth(
-        tab.auth,
-        tab.connectionId,
-        tab.canRestorePassword
-      ),
-      sessionId: tab.sessionId,
+  const persistableTabs: Tab[] = [];
+  for (const tab of tabs) {
+    const alivePanes = tab.panes.filter(canPersistPane).map((pane) => ({
+      ...pane,
+      connection: {
+        ...pane.connection,
+        auth: makePersistableAuth(
+          pane.connection.auth,
+          pane.connection.connectionId,
+          Boolean(pane.connection.canRestorePassword)
+        ),
+      },
       connected: false,
     }));
+    if (alivePanes.length === 0) continue;
+    const aliveIds = new Set(alivePanes.map((pane) => pane.id));
+    const layout = pruneLayout(tab.layout, aliveIds);
+    if (!layout) continue;
+    const layoutIds = collectPaneIds(layout);
+    const activePaneId = aliveIds.has(tab.activePaneId ?? "")
+      ? tab.activePaneId
+      : layoutIds[0]!;
+    const synced = buildTab(
+      tab.id,
+      tab.panes,
+      layout,
+      activePaneId,
+      tab.title
+    );
+    synced.panes = alivePanes;
+    syncTabFromPanes(synced);
+    persistableTabs.push(synced);
+  }
 
   const persistableActiveTabId =
     activeTabId && persistableTabs.some((tab) => tab.id === activeTabId)
@@ -140,9 +505,10 @@ function persistState(tabs: Tab[], activeTabId: string | null) {
   localStorage.setItem(
     STORAGE_KEY,
     JSON.stringify({
+      version: 2,
       tabs: persistableTabs,
       activeTabId: persistableActiveTabId,
-    })
+    } satisfies PersistedTabsStateV2)
   );
 }
 
@@ -151,8 +517,23 @@ function createTabsStore() {
   let tabs = $state<Tab[]>(initialState.tabs);
   let activeTabId = $state<string | null>(initialState.activeTabId);
 
-  function generateId(): string {
-    return crypto.randomUUID();
+  function commit() {
+    persistState(tabs, activeTabId);
+  }
+
+  function getPaneOrNull(tabId: string, paneId: string): Pane | undefined {
+    return tabs
+      .find((tab) => tab.id === tabId)
+      ?.panes.find((pane) => pane.id === paneId);
+  }
+
+  function mutateTab(tabId: string, mutate: (tab: Tab) => void) {
+    const tab = tabs.find((candidate) => candidate.id === tabId);
+    if (!tab) return;
+    mutate(tab);
+    syncTabFromPanes(tab);
+    tabs = [...tabs];
+    commit();
   }
 
   return {
@@ -165,11 +546,26 @@ function createTabsStore() {
     },
 
     get activeTab(): Tab | undefined {
-      return tabs.find((t) => t.id === activeTabId);
+      return tabs.find((tab) => tab.id === activeTabId);
     },
 
     getTab(id: string): Tab | undefined {
-      return tabs.find((t) => t.id === id);
+      return tabs.find((tab) => tab.id === id);
+    },
+
+    getPane(tabId: string, paneId: string): Pane | undefined {
+      return getPaneOrNull(tabId, paneId);
+    },
+
+    getActivePane(tabId?: string): Pane | undefined {
+      const tab = tabId
+        ? tabs.find((candidate) => candidate.id === tabId)
+        : this.activeTab;
+      if (!tab) return undefined;
+      return (
+        tab.panes.find((pane) => pane.id === tab.activePaneId) ??
+        tab.panes[0]
+      );
     },
 
     addTab(
@@ -181,12 +577,8 @@ function createTabsStore() {
       startupScript?: string,
       startupScriptReadyText?: string
     ): string {
-      const id = generateId();
-      const title = `${auth.username}@${host}`;
-
-      const newTab: Tab = {
-        id,
-        title,
+      const id = crypto.randomUUID();
+      const connection: PaneConnection = {
         host,
         port,
         auth,
@@ -194,24 +586,23 @@ function createTabsStore() {
         canRestorePassword,
         startupScript,
         startupScriptReadyText,
-        sessionId: null,
-        connected: false,
       };
+      const pane = makePane(id, connection);
+      const tab = buildTab(id, [pane], leaf(pane.id), pane.id);
 
-      tabs = [...tabs, newTab];
+      tabs = [...tabs, tab];
       activeTabId = id;
-      persistState(tabs, activeTabId);
+      commit();
 
       return id;
     },
 
     removeTab(id: string) {
-      const index = tabs.findIndex((t) => t.id === id);
+      const index = tabs.findIndex((tab) => tab.id === id);
       if (index === -1) return;
 
-      tabs = tabs.filter((t) => t.id !== id);
+      tabs = tabs.filter((tab) => tab.id !== id);
 
-      // Switch to another tab if needed
       if (activeTabId === id) {
         if (tabs.length > 0) {
           const newIndex = Math.min(index, tabs.length - 1);
@@ -221,33 +612,231 @@ function createTabsStore() {
         }
       }
 
-      persistState(tabs, activeTabId);
+      commit();
     },
 
     setActiveTab(id: string) {
-      if (tabs.some((t) => t.id === id)) {
+      if (tabs.some((tab) => tab.id === id)) {
         activeTabId = id;
-        persistState(tabs, activeTabId);
+        commit();
       }
     },
 
-    updateTab(id: string, updates: Partial<Tab>) {
-      tabs = tabs.map((t) => (t.id === id ? { ...t, ...updates } : t));
-      persistState(tabs, activeTabId);
+    moveTab(id: string, toIndex: number) {
+      const index = tabs.findIndex((tab) => tab.id === id);
+      if (index === -1) return;
+      const clamped = Math.min(Math.max(toIndex, 0), tabs.length - 1);
+      if (clamped === index) return;
+      const reordered = [...tabs];
+      const [moved] = reordered.splice(index, 1);
+      reordered.splice(clamped, 0, moved!);
+      tabs = reordered;
+      commit();
     },
 
-    setConnected(id: string, sessionId: string, runtimeInstanceId?: string | null) {
-      tabs = tabs.map((t) =>
-        t.id === id ? { ...t, sessionId, runtimeInstanceId: runtimeInstanceId ?? null, connected: true } : t
-      );
-      persistState(tabs, activeTabId);
+    updateTab(id: string, updates: Partial<Tab>) {
+      mutateTab(id, (tab) => {
+        Object.assign(tab, updates);
+      });
+    },
+
+    setConnected(
+      id: string,
+      sessionId: string,
+      runtimeInstanceId?: string | null
+    ) {
+      const tab = tabs.find((candidate) => candidate.id === id);
+      if (!tab) return;
+      const paneId = tab.activePaneId ?? tab.panes[0]?.id;
+      if (!paneId) return;
+      this.setPaneConnected(id, paneId, sessionId, runtimeInstanceId);
     },
 
     setDisconnected(id: string) {
-      tabs = tabs.map((t) =>
-        t.id === id ? { ...t, sessionId: null, runtimeInstanceId: null, connected: false } : t
-      );
-      persistState(tabs, activeTabId);
+      const tab = tabs.find((candidate) => candidate.id === id);
+      if (!tab) return;
+      for (const pane of [...tab.panes]) {
+        this.setPaneDisconnected(id, pane.id);
+      }
+    },
+
+    setActivePane(tabId: string, paneId: string) {
+      const tab = tabs.find((candidate) => candidate.id === tabId);
+      if (!tab) return;
+      if (!tab.panes.some((pane) => pane.id === paneId)) return;
+      mutateTab(tabId, (candidate) => {
+        candidate.activePaneId = paneId;
+      });
+    },
+
+    setPaneConnected(
+      tabId: string,
+      paneId: string,
+      sessionId: string,
+      runtimeInstanceId?: string | null
+    ) {
+      mutateTab(tabId, (tab) => {
+        const pane = tab.panes.find((candidate) => candidate.id === paneId);
+        if (!pane) return;
+        pane.sessionId = sessionId;
+        pane.runtimeInstanceId = runtimeInstanceId ?? null;
+        pane.connected = true;
+      });
+    },
+
+    setPaneDisconnected(tabId: string, paneId: string) {
+      mutateTab(tabId, (tab) => {
+        const pane = tab.panes.find((candidate) => candidate.id === paneId);
+        if (!pane) return;
+        pane.sessionId = null;
+        pane.runtimeInstanceId = null;
+        pane.connected = false;
+      });
+    },
+
+    setPreserveSessionOnMove(tabId: string, paneId: string, value: boolean) {
+      mutateTab(tabId, (tab) => {
+        const pane = tab.panes.find((candidate) => candidate.id === paneId);
+        if (!pane) return;
+        pane.preserveSessionOnMove = value;
+      });
+    },
+
+    /** Split a pane in the given direction, cloning its connection target. */
+    splitPane(
+      tabId: string,
+      paneId: string,
+      dir: "row" | "col"
+    ): string | null {
+      const tab = tabs.find((candidate) => candidate.id === tabId);
+      if (!tab) return null;
+      const source = tab.panes.find((candidate) => candidate.id === paneId);
+      if (!source) return null;
+
+      const connection: PaneConnection = {
+        ...source.connection,
+        auth: { ...source.connection.auth },
+      };
+      const pane = makePane(tabId, connection);
+
+      mutateTab(tabId, (candidate) => {
+        candidate.panes = [...candidate.panes, pane];
+        candidate.layout = replaceLeaf(candidate.layout, paneId, (leafNode) =>
+          makeSplit(dir, 0.5, [leafNode, leaf(pane.id)])
+        );
+        candidate.activePaneId = pane.id;
+      });
+      return pane.id;
+    },
+
+    /** Close a pane; closes the tab when it holds the last pane. */
+    closePane(tabId: string, paneId: string) {
+      const tab = tabs.find((candidate) => candidate.id === tabId);
+      if (!tab) return;
+      if (!tab.panes.some((pane) => pane.id === paneId)) return;
+
+      const remaining = tab.panes.filter((pane) => pane.id !== paneId);
+      if (remaining.length === 0) {
+        this.removeTab(tabId);
+        return;
+      }
+
+      mutateTab(tabId, (candidate) => {
+        candidate.panes = remaining;
+        const pruned = pruneLayout(candidate.layout, new Set(remaining.map((pane) => pane.id)));
+        candidate.layout = pruned ?? leaf(remaining[0]!.id);
+        const stillAlive = collectPaneIds(candidate.layout);
+        if (!stillAlive.includes(candidate.activePaneId ?? "")) {
+          candidate.activePaneId = stillAlive[0] ?? null;
+        }
+      });
+    },
+
+    /**
+     * Merge the source tab's whole pane tree into the target tab as a split.
+     * Panes keep their own connection targets, so different servers can sit
+     * side by side. The source tab is removed.
+     */
+    mergeTab(
+      sourceTabId: string,
+      targetTabId: string,
+      dir: "row" | "col",
+      side: "before" | "after"
+    ) {
+      if (sourceTabId === targetTabId) return;
+      const source = tabs.find((candidate) => candidate.id === sourceTabId);
+      const target = tabs.find((candidate) => candidate.id === targetTabId);
+      if (!source || !target) return;
+
+      const movedPanes = source.panes.map((pane) => ({
+        ...pane,
+        tabId: targetTabId,
+      }));
+
+      const mergedLayout = makeSplit(dir, 0.5, [
+        side === "before" ? source.layout : target.layout,
+        side === "before" ? target.layout : source.layout,
+      ]);
+
+      mutateTab(targetTabId, (candidate) => {
+        candidate.panes = [...candidate.panes, ...movedPanes];
+        candidate.layout = mergedLayout;
+        candidate.activePaneId = movedPanes[0]?.id ?? candidate.activePaneId;
+      });
+
+      tabs = tabs.filter((candidate) => candidate.id !== sourceTabId);
+      if (activeTabId === sourceTabId) {
+        activeTabId = targetTabId;
+      }
+      commit();
+    },
+
+    updateSplitRatio(tabId: string, splitId: string, ratio: number) {
+      mutateTab(tabId, (tab) => {
+        tab.layout = updateRatio(tab.layout, splitId, ratio);
+      });
+    },
+
+    /** Move a pane next to another pane of the same tab (drag rearrange). */
+    movePaneWithinTab(
+      tabId: string,
+      paneId: string,
+      targetPaneId: string,
+      dir: "row" | "col",
+      side: "before" | "after"
+    ) {
+      if (paneId === targetPaneId) return;
+      const tab = tabs.find((candidate) => candidate.id === tabId);
+      if (!tab) return;
+      if (
+        !tab.panes.some((pane) => pane.id === paneId) ||
+        !tab.panes.some((pane) => pane.id === targetPaneId)
+      ) {
+        return;
+      }
+
+      mutateTab(tabId, (candidate) => {
+        const withoutMoved = pruneLayout(
+          candidate.layout,
+          new Set(
+            collectPaneIds(candidate.layout).filter((id) => id !== paneId)
+          )
+        );
+        if (!withoutMoved) return;
+        candidate.layout = replaceLeaf(
+          withoutMoved,
+          targetPaneId,
+          (leafNode) =>
+            makeSplit(
+              dir,
+              0.5,
+              side === "before"
+                ? [leaf(paneId), leafNode]
+                : [leafNode, leaf(paneId)]
+            )
+        );
+        candidate.activePaneId = paneId;
+      });
     },
   };
 }

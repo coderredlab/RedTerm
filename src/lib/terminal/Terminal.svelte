@@ -59,6 +59,8 @@
     existingSessionId?: string | null;
     connectionId?: string;
     interactive?: boolean;
+    refocusOnBlur?: boolean;
+    disconnectOnDestroy?: boolean;
     startupScript?: string;
     startupScriptReadyText?: string;
     onConnected?: (sessionId: string) => void;
@@ -75,6 +77,8 @@
     startupScript = "",
     startupScriptReadyText = "",
     interactive = true,
+    refocusOnBlur = true,
+    disconnectOnDestroy = true,
     onConnected,
     onDisconnected,
     onError
@@ -755,7 +759,7 @@
           return;
         }
 
-        if (interactive && connected && hiddenInput && !selectionMode) {
+        if (interactive && refocusOnBlur && connected && hiddenInput && !selectionMode) {
           hiddenInput.focus();
         }
       };
@@ -2307,8 +2311,10 @@
       }
     }
 
-    // Disconnect SSH session when tab is closed
-    if (activeSessionId && !isBackgroundTeardown) {
+    // Disconnect SSH session when tab is closed. Callers moving a live
+    // terminal between containers opt out via disconnectOnDestroy and
+    // re-attach with existingSessionId.
+    if (activeSessionId && !isBackgroundTeardown && disconnectOnDestroy) {
       disconnectRequested = true;
       void sshDisconnect(activeSessionId).catch((e) => {
         console.error("Disconnect on destroy error:", e);

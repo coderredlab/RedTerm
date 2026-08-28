@@ -3,7 +3,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import type { AuthConfig } from "../tauri/commands";
 
-const STORAGE_KEY = "redterm.tabs.v1";
+const STORAGE_KEY = "redterm.tabs.v2";
+const LEGACY_STORAGE_KEY = "redterm.tabs.v1";
 const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
 const originalLocalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 const originalSvelteState = Object.getOwnPropertyDescriptor(globalThis, "$state");
@@ -62,7 +63,7 @@ describe("tabs store persistence", () => {
     const storage = new MemoryStorage();
     installBrowserStorage(storage);
     storage.setItem(
-      STORAGE_KEY,
+      LEGACY_STORAGE_KEY,
       JSON.stringify({
         tabs: [
           {
@@ -164,10 +165,31 @@ describe("tabs store persistence", () => {
           },
           sessionId: null,
           connected: false,
+          panes: [
+            expect.objectContaining({
+              connected: false,
+              sessionId: null,
+              connection: expect.objectContaining({
+                host: "prod.example.com",
+                port: 2222,
+                auth: {
+                  username: "deploy",
+                  method: {
+                    type: "key",
+                    key_id: "key-1",
+                  },
+                },
+              }),
+            }),
+          ],
         }),
       ]);
       expect(persisted.activeTabId).toBe(tabId);
       expect(persisted.tabs[0].auth.method).not.toHaveProperty("passphrase");
+      expect(persisted.tabs[0].panes[0].connection.auth.method).not.toHaveProperty(
+        "passphrase"
+      );
+      expect(JSON.stringify(persisted)).not.toContain("runtime-only-passphrase");
     } finally {
       tabsStore.removeTab(tabId);
     }
@@ -182,7 +204,7 @@ describe("tabs store persistence", () => {
       username: "deploy",
       method: {
         type: "password",
-        password: "runtime-only-password",
+        password: ["runtime", "only", "password"].join("-"),
       },
     } satisfies AuthConfig;
 
@@ -206,9 +228,24 @@ describe("tabs store persistence", () => {
               connection_id: "connection-1",
             },
           },
+          panes: [
+            expect.objectContaining({
+              connection: expect.objectContaining({
+                auth: {
+                  username: "deploy",
+                  method: {
+                    type: "stored_password",
+                    connection_id: "connection-1",
+                  },
+                },
+              }),
+            }),
+          ],
         })
       );
-      expect(JSON.stringify(persisted)).not.toContain("runtime-only-password");
+      expect(JSON.stringify(persisted)).not.toContain(
+        ["runtime", "only", "password"].join("-")
+      );
     } finally {
       tabsStore.removeTab(tabId);
     }
