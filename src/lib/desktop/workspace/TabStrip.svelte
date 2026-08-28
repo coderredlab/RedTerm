@@ -61,6 +61,8 @@
     startX = event.clientX;
     startY = event.clientY;
 
+    let settled = false;
+
     const onMove = (moveEvent: PointerEvent) => {
       if (
         !dragArmed ||
@@ -100,9 +102,14 @@
     };
 
     const finish = (drop: boolean) => {
+      if (settled) return;
+      settled = true;
       tabEl.removeEventListener("pointermove", onMove);
       tabEl.removeEventListener("pointerup", finishUp);
       tabEl.removeEventListener("pointercancel", cancel);
+      // Window-level backstop in case the tab element unmounts mid-gesture.
+      window.removeEventListener("pointerup", finishUp, true);
+      window.removeEventListener("pointercancel", cancel, true);
       if (tabDrag.active && dragTabId) {
         suppressClick = true;
         setTimeout(() => {
@@ -127,8 +134,10 @@
     const cancel = () => finish(false);
 
     tabEl.addEventListener("pointermove", onMove);
-    tabEl.addEventListener("pointerup", finishUp, { once: true });
-    tabEl.addEventListener("pointercancel", cancel, { once: true });
+    tabEl.addEventListener("pointerup", finishUp);
+    tabEl.addEventListener("pointercancel", cancel);
+    window.addEventListener("pointerup", finishUp, true);
+    window.addEventListener("pointercancel", cancel, true);
     tabEl.setPointerCapture(event.pointerId);
   }
 

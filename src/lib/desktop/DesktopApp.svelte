@@ -312,7 +312,10 @@
   }
 </script>
 
-<svelte:window onkeydowncapture={onKeydownCapture} />
+<svelte:window
+  onkeydowncapture={onKeydownCapture}
+  onpagehide={() => desktopPrefsStore.flushPendingPersist()}
+/>
 
 <svelte:head>
   <title>RedTerm Desktop</title>
@@ -373,6 +376,7 @@
               node={tab.layout}
               interactive={!showDialog &&
                 !settingsOpen &&
+                !previewEntry &&
                 tab.id === tabsStore.activeTabId}
               activePaneId={tab.activePaneId}
             />

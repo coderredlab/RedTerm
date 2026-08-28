@@ -32,14 +32,19 @@ export function handleDesktopShortcuts(
   if (!isEnabled()) return false;
 
   const mod = IS_MAC ? event.metaKey : event.ctrlKey;
+  // Non-shell-reserved combos also accept the other modifier on macOS so
+  // Ctrl+Tab / Ctrl+1..9 keep working alongside the Cmd variants.
+  const modLike = event.ctrlKey || event.metaKey;
   const alt = event.altKey;
   const shift = event.shiftKey;
   const key = event.key;
-  // Shells consume Ctrl+T/W/\ on Linux and Windows; leave those for the
-  // terminal when the key was pressed inside one.
+  // Shells consume Ctrl+T/W/\ on Linux and Windows; leave those (and their
+  // shifted variants, which the app also uses) for the terminal when the key
+  // was pressed inside one.
   const shellReserved =
     !IS_MAC &&
     terminalTarget &&
+    !shift &&
     (key === "t" || key === "T" || key === "w" || key === "W" || key === "\\");
 
   if (shellReserved) return false;
@@ -58,7 +63,7 @@ export function handleDesktopShortcuts(
     return true;
   }
 
-  if (mod && key === "Tab") {
+  if (modLike && !alt && key === "Tab") {
     if (shift) {
       handlers.previousTab();
     } else {
@@ -67,17 +72,17 @@ export function handleDesktopShortcuts(
     return true;
   }
 
-  if (event.ctrlKey && !event.metaKey && key === "PageUp" && !alt && !shift) {
+  if (modLike && key === "PageUp" && !alt && !shift) {
     handlers.previousTab();
     return true;
   }
 
-  if (event.ctrlKey && !event.metaKey && key === "PageDown" && !alt && !shift) {
+  if (modLike && key === "PageDown" && !alt && !shift) {
     handlers.nextTab();
     return true;
   }
 
-  if (mod && !alt && !shift && /^[1-9]$/.test(key)) {
+  if (modLike && !alt && !shift && /^[1-9]$/.test(key)) {
     handlers.selectTab(Number(key) - 1);
     return true;
   }
@@ -110,7 +115,7 @@ export function handleDesktopShortcuts(
     }
   }
 
-  if (mod && !alt && !shift && key === ",") {
+  if (modLike && !alt && !shift && key === ",") {
     handlers.openSettings();
     return true;
   }

@@ -56,7 +56,11 @@
   );
 
   $effect(() => {
-    if (!entry) return;
+    if (!entry) {
+      // Invalidate any in-flight load so a closed preview cannot land state.
+      loadToken += 1;
+      return;
+    }
     const current = entry;
     // Only entry re-opens the preview; the session is captured (frozen)
     // inside openEntry so switching tabs does not re-target the path.

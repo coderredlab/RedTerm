@@ -548,33 +548,47 @@ function createTabsStore() {
    * Apply a layout mutation while keeping live SSH sessions alive. Any pane
    * of the involved tabs may unmount and remount as the tree reshapes, so
    * every Terminal gets the disconnectOnDestroy opt-out for the duration and
-   * re-attaches through its persisted sessionId afterwards.
+   * re-attaches through its persisted sessionId afterwards. Actions are
+   * serialized so concurrent mutations cannot clear each other's flags.
    */
+  let layoutQueue: Promise<unknown> = Promise.resolve();
+
   async function withPreservedLayout(
     involvedTabIds: string[],
     mutate: () => void
   ) {
-    const involved = new Set(involvedTabIds);
-    for (const tab of tabs) {
-      if (!involved.has(tab.id)) continue;
-      for (const pane of tab.panes) {
-        pane.preserveSessionOnMove = true;
-      }
-    }
-    await tick();
-    mutate();
-    await tick();
-    // Panes may have been copied into other tabs by the mutation, so clear
-    // the transient flag across the whole store instead of tracked refs.
-    for (const tab of tabs) {
-      for (const pane of tab.panes) {
-        if (pane.preserveSessionOnMove) {
-          pane.preserveSessionOnMove = false;
+    const run = layoutQueue.then(async () => {
+      const involved = new Set(involvedTabIds);
+      for (const tab of tabs) {
+        if (!involved.has(tab.id)) continue;
+        for (const pane of tab.panes) {
+          pane.preserveSessionOnMove = true;
         }
       }
-    }
-    tabs = [...tabs];
-    commit();
+      await tick();
+      try {
+        mutate();
+      } finally {
+        await tick();
+        // Panes may have been copied into other tabs by the mutation, so
+        // clear the transient flag across the whole store instead of
+        // tracked refs.
+        for (const tab of tabs) {
+          for (const pane of tab.panes) {
+            if (pane.preserveSessionOnMove) {
+              pane.preserveSessionOnMove = false;
+            }
+          }
+        }
+        tabs = [...tabs];
+        commit();
+      }
+    });
+    layoutQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    await run;
   }
 
   return {
@@ -883,6 +897,7 @@ function createTabsStore() {
             )
         );
         candidate.activePaneId = paneId;
+        syncTabFromPanes(candidate);
       });
     },
   };

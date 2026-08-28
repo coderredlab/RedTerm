@@ -68,6 +68,13 @@ function createDesktopPrefs() {
       prefs = { ...prefs, sidebarWidth: clamped };
       schedulePersist(prefs);
     },
+    /** Write any debounced change immediately (pagehide teardown). */
+    flushPendingPersist() {
+      if (persistTimer === null) return;
+      clearTimeout(persistTimer);
+      persistTimer = null;
+      persistPrefs(prefs);
+    },
   };
 }
 

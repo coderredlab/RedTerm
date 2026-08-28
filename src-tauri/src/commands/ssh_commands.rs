@@ -991,7 +991,7 @@ fn prune_stale_sftp_previews(dir: &Path) {
         let stale_part = entry.file_name().to_string_lossy().ends_with(".part")
             && age
                 .map(|secs| secs > SFTP_PREVIEW_PART_MAX_AGE_SECS)
-                .unwrap_or(true);
+                .unwrap_or(false);
         let stale = age
             .map(|secs| secs > SFTP_PREVIEW_MAX_AGE_SECS)
             .unwrap_or(false);
@@ -1051,7 +1051,13 @@ pub async fn sftp_download_file(
         .unwrap_or("download");
     let safe_name: String = file_name
         .chars()
-        .filter(|c| !c.is_control() && !std::path::is_separator(*c))
+        .filter(|c| {
+            !c.is_control()
+                && !std::path::is_separator(*c)
+                // Windows-reserved characters (':' would form an NTFS
+                // alternate data stream); harmless to drop everywhere.
+                && !matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*')
+        })
         .collect();
     let safe_name = if safe_name.is_empty() {
         "download".to_string()
