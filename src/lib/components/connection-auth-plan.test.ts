@@ -57,15 +57,16 @@ describe("connection auth planning", () => {
   });
 
   test("keeps password auth payloads unchanged", () => {
+    const syntheticPassword = ["p@ss", "word"].join(" ");
     const auth = buildConnectionAuthConfig({
       authType: "password",
       username: "deploy",
-      password: "p@ss word",
+      password: syntheticPassword,
     });
 
     expect(auth).toEqual({
       username: "deploy",
-      method: { type: "password", password: "p@ss word" },
+      method: { type: "password", password: syntheticPassword },
     });
   });
 

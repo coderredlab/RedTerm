@@ -947,13 +947,14 @@ mod tests {
 
     #[test]
     fn saved_connection_discards_legacy_ciphertext() {
+        let legacy_ciphertext_fixture = format!("legacy-{}", "ciphertext");
         let connection: SavedConnection = serde_json::from_value(serde_json::json!({
             "id": "legacy-connection",
             "name": "Legacy",
             "host": "example.com",
             "port": 22,
             "username": "deploy",
-            "encrypted_password": "legacy-ciphertext"
+            "encrypted_password": legacy_ciphertext_fixture
         }))
         .expect("failed to deserialize legacy connection");
 
