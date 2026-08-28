@@ -44,7 +44,13 @@
     size: number;
   } | null>(null);
 
-  const activeSessionId = $derived(tabsStore.getActivePane()?.sessionId ?? null);
+  const activePane = $derived(tabsStore.getActivePane());
+  const explorerKind = $derived<"ssh" | "local" | null>(
+    activePane ? (activePane.kind ?? "ssh") : null
+  );
+  const activeSessionId = $derived(
+    explorerKind === "local" ? null : (activePane?.sessionId ?? null)
+  );
 
   $effect(() => {
     dragTargets.workspace = workspaceEl;
@@ -349,6 +355,7 @@
     collapsed={desktopPrefsStore.prefs.sidebarCollapsed}
     width={desktopPrefsStore.prefs.sidebarWidth}
     activeSessionId={activeSessionId}
+    explorerKind={explorerKind}
     onToggleCollapsed={() => desktopPrefsStore.toggleSidebar()}
     onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
     onEdit={handleEdit}
@@ -430,6 +437,7 @@
   <FileViewer
     entry={previewEntry}
     sessionId={activeSessionId}
+    kind={explorerKind ?? "ssh"}
     onClose={() => (previewEntry = null)}
   />
 

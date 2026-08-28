@@ -931,6 +931,40 @@ pub async fn set_keyboard_visible(app: AppHandle, visible: bool) -> Result<(), S
 const MAX_SFTP_PREVIEW_READ_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SFTP_PREVIEW_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
 
+/// Throttled progress emitter: reports at most ~1 MiB granularity plus the
+/// final chunk so progress bars always complete.
+pub(crate) fn make_download_progress_emitter(
+    app: AppHandle,
+    path: String,
+    total: Option<u64>,
+) -> impl Fn(u64) + Send + Sync {
+    let last_emitted = std::sync::Mutex::new(0_u64);
+    move |transferred: u64| {
+        let should_emit = {
+            let mut last = last_emitted.lock().unwrap();
+            if transferred >= *last + (1 << 20) {
+                *last = transferred;
+                true
+            } else if total.is_some_and(|size| transferred >= size) {
+                *last = transferred;
+                true
+            } else {
+                false
+            }
+        };
+        if should_emit {
+            let _ = app.emit(
+                "sftp-download-progress",
+                serde_json::json!({
+                    "path": path,
+                    "transferred": transferred,
+                    "total": total,
+                }),
+            );
+        }
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 pub struct SftpFileContent {
     pub path: String,
@@ -956,7 +990,7 @@ async fn sftp_connection_for_session(
         .ok_or_else(|| "Session not found".to_string())
 }
 
-fn ensure_local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn ensure_local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base_dir = app
         .path()
         .app_cache_dir()
@@ -1072,8 +1106,18 @@ pub async fn sftp_download_file(
         return Err("Invalid preview destination path".to_string());
     }
 
+    let total = connection
+        .file_size_via_sftp(&remote_path)
+        .await
+        .unwrap_or(None);
+    let on_progress = make_download_progress_emitter(app.clone(), remote_path.clone(), total);
     let size = match connection
-        .download_file_via_sftp(&remote_path, &part_path, MAX_SFTP_PREVIEW_DOWNLOAD_BYTES)
+        .download_file_via_sftp(
+            &remote_path,
+            &part_path,
+            MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
+            Some(&on_progress),
+        )
         .await
     {
         Ok(size) => size,
@@ -1101,10 +1145,13 @@ pub async fn sftp_home_dir(
     session_id: String,
 ) -> Result<String, String> {
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
-    connection.home_dir_via_sftp().await.map_err(|e| e.to_string())
+    connection
+        .home_dir_via_sftp()
+        .await
+        .map_err(|e| e.to_string())
 }
 
-fn unique_download_path(dir: &Path, file_name: &str) -> PathBuf {
+pub(crate) fn unique_download_path(dir: &Path, file_name: &str) -> PathBuf {
     let candidate = dir.join(file_name);
     if !candidate.exists() {
         return candidate;
@@ -1123,12 +1170,7 @@ fn unique_download_path(dir: &Path, file_name: &str) -> PathBuf {
             return candidate;
         }
     }
-    dir.join(format!(
-        "{} ({}){}",
-        stem,
-        Uuid::new_v4(),
-        extension
-    ))
+    dir.join(format!("{} ({}){}", stem, Uuid::new_v4(), extension))
 }
 
 /// Explicit user download: stream the remote file into the user's Downloads
@@ -1173,13 +1215,21 @@ pub async fn sftp_download_to_downloads(
         return Err("Invalid download destination path".to_string());
     }
 
-    let size = connection
-        .download_file_via_sftp(&remote_path, &destination, u64::MAX)
+    let total = connection
+        .file_size_via_sftp(&remote_path)
         .await
-        .map_err(|error| {
+        .unwrap_or(None);
+    let on_progress = make_download_progress_emitter(app.clone(), remote_path.clone(), total);
+    let size = match connection
+        .download_file_via_sftp(&remote_path, &destination, u64::MAX, Some(&on_progress))
+        .await
+    {
+        Ok(size) => size,
+        Err(error) => {
             let _ = std::fs::remove_file(&destination);
-            error.to_string()
-        })?;
+            return Err(error.to_string());
+        }
+    };
 
     Ok(SftpDownloadedFile {
         remote_path,

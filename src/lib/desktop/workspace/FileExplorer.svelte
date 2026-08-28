@@ -1,5 +1,9 @@
 <script lang="ts">
   import {
+    listenDownloadProgress,
+    localDownloadToDownloads,
+    localHomeDir,
+    localListDir,
     sftpDownloadToDownloads,
     sftpHomeDir,
     sftpListDir,
@@ -12,11 +16,12 @@
   } from "./file-kinds";
 
   interface Props {
+    kind: "ssh" | "local" | null;
     sessionId: string | null;
     onPreview: (entry: { name: string; path: string; size: number }) => void;
   }
 
-  let { sessionId, onPreview }: Props = $props();
+  let { kind, sessionId, onPreview }: Props = $props();
 
   let path = $state("/");
   let entries = $state<SftpDirEntry[] | null>(null);
@@ -27,6 +32,36 @@
   let statusMessage = $state("");
   let downloadingPaths = $state<string[]>([]);
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
+  let downloads = $state<Record<string, { transferred: number; total: number | null }>>({});
+
+  const canBrowse = $derived(kind === "local" || Boolean(sessionId));
+
+  $effect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listenDownloadProgress((event) => {
+      downloads[event.path] = {
+        transferred: event.transferred,
+        total: event.total,
+      };
+      if (event.total !== null && event.transferred >= event.total) {
+        const target = event.path;
+        setTimeout(() => {
+          delete downloads[target];
+        }, 1500);
+      }
+    }).then((fn) => {
+      if (cancelled) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  });
 
   function showStatus(message: string) {
     statusMessage = message;
@@ -36,9 +71,14 @@
     }, 6000);
   }
 
+  function baseName(target: string): string {
+    const parts = target.split("/").filter(Boolean);
+    return parts[parts.length - 1] ?? target;
+  }
+
   $effect(() => {
     // Restart browsing whenever the active session changes; start at home.
-    if (!sessionId) {
+    if (!canBrowse) {
       loadToken += 1;
       entries = null;
       errorMessage = "";
@@ -52,12 +92,16 @@
   });
 
   async function openHome() {
-    if (!sessionId) return;
     const token = ++loadToken;
     loading = true;
     errorMessage = "";
     try {
-      const home = await sftpHomeDir(sessionId);
+      const home =
+        kind === "local"
+          ? await localHomeDir()
+          : sessionId
+            ? await sftpHomeDir(sessionId)
+            : "/";
       if (token !== loadToken) return;
       homePath = home || "/";
       await navigate(homePath);
@@ -69,12 +113,15 @@
   }
 
   async function navigate(target: string) {
-    if (!sessionId) return;
+    if (!canBrowse) return;
     const token = ++loadToken;
     loading = true;
     errorMessage = "";
     try {
-      const result = await sftpListDir(sessionId, target);
+      const result =
+        kind === "local"
+          ? await localListDir(target)
+          : await sftpListDir(sessionId!, target);
       if (token !== loadToken) return;
       entries = result;
       path = target;
@@ -91,10 +138,14 @@
 
   async function downloadEntry(entry: SftpDirEntry) {
     const target = joinPath(path, entry.name);
-    if (!sessionId || downloadingPaths.includes(target)) return;
+    if (!canBrowse || downloadingPaths.includes(target)) return;
     downloadingPaths = [...downloadingPaths, target];
+    downloads[target] = { transferred: 0, total: entry.size || null };
     try {
-      const saved = await sftpDownloadToDownloads(sessionId, target);
+      const saved =
+        kind === "local"
+          ? await localDownloadToDownloads(target)
+          : await sftpDownloadToDownloads(sessionId!, target);
       showStatus(`Saved to ${saved.local_path}`);
     } catch (error) {
       showStatus(
@@ -102,6 +153,9 @@
       );
     } finally {
       downloadingPaths = downloadingPaths.filter((candidate) => candidate !== target);
+      setTimeout(() => {
+        delete downloads[target];
+      }, 1500);
     }
   }
 
@@ -174,8 +228,30 @@
     <div class="explorer-toast" role="status">{statusMessage}</div>
   {/if}
 
+  {#each Object.entries(downloads) as [target, progress] (target)}
+    <div class="download-progress">
+      <div class="download-progress-info">
+        <span class="download-progress-name">{baseName(target)}</span>
+        <span class="download-progress-bytes">
+          {formatBytes(progress.transferred)}{progress.total !== null
+            ? ` / ${formatBytes(progress.total)}`
+            : ""}
+        </span>
+      </div>
+      <div class="download-track">
+        <div
+          class="download-fill"
+          class:indeterminate={progress.total === null}
+          style:width={progress.total !== null && progress.total > 0
+            ? `${Math.min(100, (progress.transferred / progress.total) * 100)}%`
+            : "100%"}
+        ></div>
+      </div>
+    </div>
+  {/each}
+
   <div class="entry-list">
-    {#if !sessionId}
+    {#if !canBrowse}
       <div class="explorer-status">Connect to a server to browse files.</div>
     {:else if loading}
       <div class="explorer-status">Loading…</div>
@@ -307,6 +383,65 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .download-progress {
+    flex: 0 0 auto;
+    margin: 4px 8px 0;
+    padding: 6px 10px;
+    border: 1px solid var(--border-secondary);
+    border-radius: 3px;
+    background: var(--bg-tertiary);
+  }
+
+  .download-progress-info {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 4px;
+  }
+
+  .download-progress-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+    font-size: 10px;
+  }
+
+  .download-progress-bytes {
+    flex: 0 0 auto;
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+
+  .download-track {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--bg-primary);
+    overflow: hidden;
+  }
+
+  .download-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: var(--accent-primary);
+    transition: width 150ms ease;
+  }
+
+  .download-fill.indeterminate {
+    animation: indeterminate 1.2s ease-in-out infinite;
+  }
+
+  @keyframes indeterminate {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(100%);
+    }
   }
 
   .path-breadcrumbs {

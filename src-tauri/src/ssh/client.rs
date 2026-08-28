@@ -359,6 +359,15 @@ impl SshConnection {
             .map_err(|e| SshError::SessionError(e.to_string()))
     }
 
+    pub async fn file_size_via_sftp(&self, path: &str) -> Result<Option<u64>, SshError> {
+        let sftp = self.open_sftp().await?;
+        Ok(sftp
+            .metadata(path)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?
+            .size)
+    }
+
     pub async fn list_dir_via_sftp(&self, path: &str) -> Result<Vec<SftpDirEntry>, SshError> {
         let sftp = self.open_sftp().await?;
         let mut entries = Vec::new();
@@ -442,14 +451,17 @@ impl SshConnection {
         remote_path: &str,
         destination: &Path,
         max_bytes: u64,
+        on_progress: Option<&(dyn Fn(u64) + Send + Sync)>,
     ) -> Result<u64, SshError> {
         let sftp = self.open_sftp().await?;
+        let mut total_size: Option<u64> = None;
         if let Some(size) = sftp
             .metadata(remote_path)
             .await
             .map_err(|e| SshError::SessionError(e.to_string()))?
             .size
         {
+            total_size = Some(size);
             if size > max_bytes {
                 return Err(SshError::SessionError(format!(
                     "File is too large to preview ({} bytes exceeds the {} byte limit)",
@@ -487,6 +499,9 @@ impl SshConnection {
                 .write_all(&buffer[..read])
                 .await
                 .map_err(|e| SshError::SessionError(e.to_string()))?;
+            if let Some(on_progress) = on_progress {
+                on_progress(total.min(total_size.unwrap_or(total)));
+            }
         }
         local_file
             .flush()

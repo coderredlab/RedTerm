@@ -12,6 +12,7 @@
     collapsed: boolean;
     width: number;
     activeSessionId: string | null;
+    explorerKind: "ssh" | "local" | null;
     onToggleCollapsed: () => void;
     onWidthChange: (width: number) => void;
     onEdit: (connection: SavedConnection) => void;
@@ -23,6 +24,7 @@
     collapsed,
     width,
     activeSessionId,
+    explorerKind,
     onToggleCollapsed,
     onWidthChange,
     onEdit,
@@ -124,8 +126,8 @@
       <button
         class="view-tab"
         class:active={view === "files"}
-        disabled={!activeSessionId}
-        title={activeSessionId ? "" : "Requires a connected session"}
+        disabled={explorerKind === null}
+        title={explorerKind === null ? "Requires a connected session" : ""}
         onclick={() => (view = "files")}
       >
         Files
@@ -135,7 +137,7 @@
     {#if view === "connections"}
       <ConnectionList onEdit={onEdit} onNewConnection={onNewConnection} />
     {:else}
-      <FileExplorer sessionId={activeSessionId} {onPreview} />
+      <FileExplorer kind={explorerKind} sessionId={activeSessionId} {onPreview} />
     {/if}
   {/if}
 

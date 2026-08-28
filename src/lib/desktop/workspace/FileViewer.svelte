@@ -7,6 +7,10 @@
   import {
     MAX_SFTP_DOWNLOAD_BYTES,
     MAX_SFTP_READ_BYTES,
+    listenDownloadProgress,
+    localDownloadFile,
+    localDownloadToDownloads,
+    localReadFile,
     sftpDownloadFile,
     sftpDownloadToDownloads,
     sftpReadFile,
@@ -28,10 +32,11 @@
   interface Props {
     entry: PreviewEntry | null;
     sessionId: string | null;
+    kind?: "ssh" | "local";
     onClose: () => void;
   }
 
-  let { entry, sessionId, onClose }: Props = $props();
+  let { entry, sessionId, kind = "ssh", onClose }: Props = $props();
 
   let loadState = $state<"idle" | "loading" | "ready" | "error">("idle");
   let errorMessage = $state("");
@@ -43,14 +48,16 @@
   // Frozen at open so switching the active tab does not re-target the
   // preview at another server's path.
   let boundSessionId = $state<string | null>(null);
+  let boundKind = $state<"ssh" | "local">("ssh");
+  let downloadProgress = $state<{ transferred: number; total: number | null } | null>(null);
 
-  const kind = $derived(entry ? previewKindOf(entry.name) : "unknown" as FilePreviewKind);
+  const fileKind = $derived(entry ? previewKindOf(entry.name) : "unknown" as FilePreviewKind);
   const language = $derived(entry ? highlightLanguageOf(entry.name) : null);
   const needsExplicitDownload = $derived(
     entry !== null &&
-      (kind === "audio" ||
-        kind === "video" ||
-        (kind === "image" && entry.size > MAX_SFTP_READ_BYTES))
+      (fileKind === "audio" ||
+        fileKind === "video" ||
+        (fileKind === "image" && entry.size > MAX_SFTP_READ_BYTES))
   );
   const lineCount = $derived(
     textContent === null ? 0 : textContent.split("\n").length
@@ -69,9 +76,33 @@
   });
 
   $effect(() => {
-    if (codeEl && textContent !== null && (kind === "code" || kind === "text")) {
+    if (codeEl && textContent !== null && (fileKind === "code" || fileKind === "text")) {
       hljs.highlightElement(codeEl);
     }
+  });
+
+  $effect(() => {
+    if (loadState !== "loading" || !entry) return;
+    const path = entry.path;
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listenDownloadProgress((event) => {
+      if (event.path !== path) return;
+      downloadProgress = {
+        transferred: event.transferred,
+        total: event.total,
+      };
+    }).then((fn) => {
+      if (cancelled) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   });
 
   function reset() {
@@ -81,13 +112,15 @@
     renderedMarkdown = "";
     mediaUrl = "";
     codeEl = null;
+    downloadProgress = null;
   }
 
   async function openEntry(target: PreviewEntry) {
     const token = ++loadToken;
     boundSessionId = sessionId;
+    boundKind = kind;
     reset();
-    if (kind === "unknown") {
+    if (fileKind === "unknown") {
       // Nothing sensible to render inline; skip the fetch entirely.
       loadState = "ready";
       return;
@@ -96,7 +129,7 @@
       loadState = "idle";
       return;
     }
-    if (!sessionId) {
+    if (kind === "ssh" && !sessionId) {
       loadState = "error";
       errorMessage = "No active SSH session.";
       return;
@@ -107,18 +140,21 @@
 
   async function loadInline(target: PreviewEntry, token: number) {
     try {
-      const content = await sftpReadFile(boundSessionId!, target.path);
+      const content =
+        boundKind === "local"
+          ? await localReadFile(target.path)
+          : await sftpReadFile(boundSessionId!, target.path);
       if (token !== loadToken) return;
       const dataUrl = `data:text/plain;charset=utf-8;base64,${content.content_base64}`;
       const response = await fetch(dataUrl);
       const decoded = await response.text();
       if (token !== loadToken) return;
 
-      if (kind === "markdown") {
+      if (fileKind === "markdown") {
         const parsed = await marked.parse(decoded);
         if (token !== loadToken) return;
         renderedMarkdown = DOMPurify.sanitize(parsed);
-      } else if (kind === "image") {
+      } else if (fileKind === "image") {
         mediaUrl = `data:${mimeOf(target.name)};base64,${content.content_base64}`;
       } else {
         textContent = decoded;
@@ -134,20 +170,26 @@
   async function loadViaDownload() {
     if (!entry) return;
     const token = ++loadToken;
-    if (!boundSessionId) {
+    if (boundKind === "ssh" && !boundSessionId) {
       loadState = "error";
       errorMessage = "No active SSH session.";
       return;
     }
     loadState = "loading";
+    downloadProgress = { transferred: 0, total: entry.size || null };
     try {
-      const downloaded = await sftpDownloadFile(boundSessionId, entry.path);
+      const downloaded =
+        boundKind === "local"
+          ? await localDownloadFile(entry.path)
+          : await sftpDownloadFile(boundSessionId!, entry.path);
       if (token !== loadToken) return;
       mediaUrl = convertFileSrc(downloaded.local_path);
       loadState = "ready";
+      downloadProgress = null;
     } catch (error) {
       if (token !== loadToken) return;
       loadState = "error";
+      downloadProgress = null;
       errorMessage = error instanceof Error ? error.message : String(error);
     }
   }
@@ -162,11 +204,14 @@
   let savedHint = $state(false);
 
   async function downloadToDownloads() {
-    if (!entry || !boundSessionId || downloading) return;
+    if (!entry || (boundKind === "ssh" && !boundSessionId) || downloading) return;
     downloading = true;
     savedHint = false;
     try {
-      await sftpDownloadToDownloads(boundSessionId, entry.path);
+      const saved =
+        boundKind === "local"
+          ? await localDownloadToDownloads(entry.path)
+          : await sftpDownloadToDownloads(boundSessionId!, entry.path);
       savedHint = true;
       setTimeout(() => {
         savedHint = false;
@@ -210,37 +255,59 @@
 
       <div class="viewer-body">
         {#if loadState === "loading"}
-          <div class="viewer-status">Loading preview…</div>
+          {#if downloadProgress}
+            <div class="viewer-progress">
+              <div class="download-progress-info">
+                <span class="download-progress-name">Downloading…</span>
+                <span class="download-progress-bytes">
+                  {formatBytes(downloadProgress.transferred)}{downloadProgress.total !== null
+                    ? ` / ${formatBytes(downloadProgress.total)}`
+                    : ""}
+                </span>
+              </div>
+              <div class="download-track">
+                <div
+                  class="download-fill"
+                  class:indeterminate={downloadProgress.total === null}
+                  style:width={downloadProgress.total !== null && downloadProgress.total > 0
+                    ? `${Math.min(100, (downloadProgress.transferred / downloadProgress.total) * 100)}%`
+                    : "100%"}
+                ></div>
+              </div>
+            </div>
+          {:else}
+            <div class="viewer-status">Loading preview…</div>
+          {/if}
         {:else if loadState === "idle"}
           <div class="viewer-download-prompt">
             <p class="download-title">
-              {kind === "audio" ? "Audio file" : kind === "video" ? "Video file" : "Large image"}
+              {fileKind === "audio" ? "Audio file" : fileKind === "video" ? "Video file" : "Large image"}
             </p>
             <p class="download-copy">
               {formatBytes(entry.size)} — download starts when you press play.
             </p>
             <button class="download-button" onclick={() => void loadViaDownload()}>
-              {kind === "audio" || kind === "video" ? "Load & play" : "Load image"}
+              {fileKind === "audio" || fileKind === "video" ? "Load & play" : "Load image"}
             </button>
           </div>
         {:else if loadState === "error"}
           <div class="viewer-status viewer-error">{errorMessage}</div>
         {:else if loadState === "ready"}
-          {#if kind === "markdown" && renderedMarkdown}
+          {#if fileKind === "markdown" && renderedMarkdown}
             <!-- eslint-disable-next-line svelte/no-at-html-tags -- content is sanitized with DOMPurify -->
             <div class="markdown-body">{@html renderedMarkdown}</div>
-          {:else if kind === "image" && mediaUrl}
+          {:else if fileKind === "image" && mediaUrl}
             <img class="image-preview" src={mediaUrl} alt={entry.name} />
-          {:else if kind === "audio" && mediaUrl}
+          {:else if fileKind === "audio" && mediaUrl}
             <div class="media-wrap">
               <audio controls src={mediaUrl}></audio>
             </div>
-          {:else if kind === "video" && mediaUrl}
+          {:else if fileKind === "video" && mediaUrl}
             <div class="media-wrap">
               <!-- svelte-ignore a11y_media_has_caption -- remote arbitrary media has no caption track -->
               <video controls src={mediaUrl}></video>
             </div>
-          {:else if (kind === "code" || kind === "text") && textContent !== null}
+          {:else if (fileKind === "code" || fileKind === "text") && textContent !== null}
             <div class="code-wrap">
               {#if lineCount > 0}
                 <div class="line-gutter" aria-hidden="true">
@@ -396,6 +463,60 @@
     color: var(--text-muted);
     font-size: 12px;
     padding: 24px;
+  }
+
+  .viewer-progress {
+    margin: auto;
+    width: min(420px, 80%);
+    padding: 14px 16px;
+    border: 1px solid var(--border-secondary);
+    border-radius: 4px;
+    background: var(--bg-secondary);
+  }
+
+  .download-progress-info {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+
+  .download-progress-name {
+    color: var(--text-primary);
+    font-size: 11px;
+  }
+
+  .download-progress-bytes {
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+
+  .download-track {
+    height: 5px;
+    border-radius: 3px;
+    background: var(--bg-tertiary);
+    overflow: hidden;
+  }
+
+  .download-fill {
+    height: 100%;
+    border-radius: 3px;
+    background: var(--accent-primary);
+    transition: width 150ms ease;
+  }
+
+  .download-fill.indeterminate {
+    animation: indeterminate 1.2s ease-in-out infinite;
+  }
+
+  @keyframes indeterminate {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(100%);
+    }
   }
 
   .viewer-error {

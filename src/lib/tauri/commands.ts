@@ -311,6 +311,40 @@ export async function sftpDownloadToDownloads(
   });
 }
 
+export async function localHomeDir(): Promise<string> {
+  return invoke<string>("local_home_dir");
+}
+
+export async function localListDir(path: string): Promise<SftpDirEntry[]> {
+  return invoke<SftpDirEntry[]>("local_list_dir", { path });
+}
+
+export async function localReadFile(path: string): Promise<SftpFileContent> {
+  return invoke<SftpFileContent>("local_read_file", { path });
+}
+
+export async function localDownloadFile(path: string): Promise<SftpDownloadedFile> {
+  return invoke<SftpDownloadedFile>("local_download_file", { path });
+}
+
+export async function localDownloadToDownloads(path: string): Promise<SftpDownloadedFile> {
+  return invoke<SftpDownloadedFile>("local_download_to_downloads", { path });
+}
+
+export interface DownloadProgressEvent {
+  path: string;
+  transferred: number;
+  total: number | null;
+}
+
+export async function listenDownloadProgress(
+  callback: (event: DownloadProgressEvent) => void
+): Promise<UnlistenFn> {
+  return listen<DownloadProgressEvent>("sftp-download-progress", (event) => {
+    callback(event.payload);
+  });
+}
+
 export async function localShellStart(cols: number, rows: number): Promise<string> {
   return invoke<string>("local_shell_start", { cols, rows });
 }

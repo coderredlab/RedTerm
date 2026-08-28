@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-local-home-dir"
+description = "Enables the local_home_dir command without any pre-configured scope."
+commands.allow = ["local_home_dir"]
+
+[[permission]]
+identifier = "deny-local-home-dir"
+description = "Denies the local_home_dir command without any pre-configured scope."
+commands.deny = ["local_home_dir"]
