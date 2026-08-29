@@ -335,6 +335,11 @@ export class HangulComposer {
     this.reset();
   }
 
+  /** True while a Hangul word is being accumulated (raw jamo present). */
+  hasActiveWord(): boolean {
+    return this.raw.length > 0;
+  }
+
   /**
    * Drop the current word and report erasing whatever was already sent
    * (the IME canceled or reverted the composition).
@@ -376,7 +381,24 @@ export class HangulComposer {
           const isShrink =
             lastParts.length > runParts.length &&
             runParts.every((p, i) => lastParts[i] === p);
-          if (isGrowth || isShrink) {
+          // Equal-length resend: the IME re-committed the unit as a whole.
+          // Either a composed 2+jamo run with a shared prefix (말 → 막 jong
+          // swap), or a single jamo derived from the previous one (ㄱ → ㄲ
+          // tense). A plain different jamo (ㅎ → ㅏ) is a delta keystroke,
+          // never a resend.
+          const isDerivedJamo =
+            lastParts.length === 1 &&
+            runParts.length === 1 &&
+            (CHO_MERGE.get(lastParts[0]) === runParts[0] ||
+              JONG_MERGE.get(lastParts[0]) === runParts[0]);
+          const isResend =
+            isDerivedJamo ||
+            (runParts.length > 1 &&
+              runParts.length === lastParts.length &&
+              lastParts
+                .slice(0, -1)
+                .every((p, i) => runParts[i] === p));
+          if (isGrowth || isShrink || isResend) {
             // The IME resent the in-progress syllable in grown or shrunk
             // form: replace the trailing unit instead of appending.
             candidateRaw =

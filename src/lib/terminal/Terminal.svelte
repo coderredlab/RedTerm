@@ -967,6 +967,7 @@
   let compositionTimeout: number | null = null;
   const hangulComposer = new HangulComposer();
   let pendingCommitKey: string | null = null;
+  let suppressPlainSpace = false;
   let pendingWrite = "";
   let writeFlushScheduled = false;
   const MAX_AUTOMATIC_RESPONSES_PER_SECOND = 32;
@@ -1734,6 +1735,9 @@
     lastProcessedSeq = 0;
     resetParser();
     clearAutomaticResponses();
+    hangulComposer.reset();
+    pendingCommitKey = null;
+    suppressPlainSpace = false;
 
     try {
       const reconnected = await connectNewSession(false);
@@ -1884,7 +1888,7 @@
       connected = true;
       statusMessage = "";
       await bindLocalSessionListener(existingSessionId);
-      localShellResize(existingSessionId, cols, rows);
+      localShellResize(existingSessionId, cols, rows).catch(console.error);
       onConnected?.(existingSessionId);
       attached = true;
     } else if (existingSessionId) {
@@ -2146,6 +2150,16 @@
         isComposing = false;
         compositionTimeout = null;
       }, 3000);
+    } else {
+      // Safety net for WKWebView compositionend quirks. Long enough that
+      // no real composition outlives it, and it only re-enables keydown
+      // flow — the composer keeps its accumulated word so a late
+      // compositionend still corrects cleanly.
+      if (compositionTimeout) clearTimeout(compositionTimeout);
+      compositionTimeout = window.setTimeout(() => {
+        isComposing = false;
+        compositionTimeout = null;
+      }, 30000);
     }
   }
 
@@ -2158,13 +2172,35 @@
     if (sessionId) {
       const data = e.data ?? "";
       if (isDesktopTarget) {
-        // Empty data means the IME canceled the composition: erase whatever
-        // was already shown. Otherwise feed the final text; the composer
-        // keeps accumulating if the IME commits in jamo deltas.
-        writeComposed(data ? hangulComposer.feed(data) : hangulComposer.flushReset());
+        // Diff against the ASCII the IME already sent as early deltas
+        // (pinyin-style IMEs emit insertCompositionText for the marked
+        // string). Hangul keeps immediateCompositionText empty, so the
+        // full data feeds the composer and jamo commits accumulate
+        // across compositionends.
+        if (data.startsWith(immediateCompositionText)) {
+          const remaining = data.slice(immediateCompositionText.length);
+          if (remaining) {
+            writeComposed(hangulComposer.feed(remaining));
+          } else if (!data) {
+            // Empty data means the IME canceled the composition: erase
+            // whatever was already shown.
+            writeComposed(hangulComposer.flushReset());
+          }
+        } else if (immediateCompositionText.startsWith(data)) {
+          // Composition shrank below the ASCII already sent.
+          queueWrite("\x7f".repeat(immediateCompositionText.length - data.length));
+          hangulComposer.breakWord();
+        } else {
+          // Composition replaced (e.g. candidate pick): erase, then send anew.
+          queueWrite("\x7f".repeat(immediateCompositionText.length));
+          writeComposed(hangulComposer.feed(data));
+        }
         const pending = pendingCommitKey;
         pendingCommitKey = null;
         if (pending) queueWrite(pending);
+        // WebKit may also deliver the committing space as a plain input
+        // event after compositionend; drop that duplicate.
+        suppressPlainSpace = pending === " ";
       } else if (data.startsWith(immediateCompositionText)) {
         const remainingText = data.slice(immediateCompositionText.length);
         if (remainingText) sendText(remainingText);
@@ -2274,7 +2310,12 @@
 
     // Normal text (non-composing)
     if (value) {
-      sendText(value);
+      if (suppressPlainSpace) {
+        suppressPlainSpace = false;
+        if (value !== " ") sendText(value);
+      } else {
+        sendText(value);
+      }
       target.value = "";
     }
   }
@@ -2286,11 +2327,16 @@
     if (isDesktopTarget && e.isComposing) {
       // The IME owns this keystroke. Backspace and Escape edit or cancel
       // the marked syllable (the following compositionend reports the
-      // shrink/cancel), and the Hangul IME has no candidate window — but
-      // Enter/Space commit it: defer them so the committed text lands
-      // before the newline/space.
-      if (e.key === "Enter" || e.key === " ") {
-        pendingCommitKey = e.key === "Enter" ? "\r" : " ";
+      // shrink/cancel). Enter commits it; Space commits a Korean syllable
+      // but only picks a candidate for pinyin/kana, so defer a literal
+      // space only while a Hangul word is active. Windows IMEs report
+      // "Process" instead of the real key name.
+      const isEnter =
+        e.key === "Enter" ||
+        (e.key === "Process" && (e.code === "Enter" || e.code === "NumpadEnter"));
+      const isSpace = e.key === " " || (e.key === "Process" && e.code === "Space");
+      if (isEnter || (isSpace && hangulComposer.hasActiveWord())) {
+        pendingCommitKey = isEnter ? "\r" : " ";
       }
       return;
     }
@@ -2311,6 +2357,7 @@
     ) {
       hangulComposer.breakWord();
       pendingCommitKey = null;
+      suppressPlainSpace = false;
     }
 
     // Enter key
@@ -2659,13 +2706,18 @@
   }
 
   /// Persist the current screen so a caller moving this terminal between
-  /// containers can restore it exactly after the remount.
-  export function storeSnapshot() {
+  /// containers can restore it exactly after the remount. Resolves once
+  /// the backend snapshot is stored (or resolves immediately when there
+  /// is nothing to store).
+  export function storeSnapshot(): Promise<void> {
     if (sessionId && parser) {
-      void sshStoreSessionSnapshot(sessionId, parser.createSnapshot(), lastProcessedSeq).catch(
-        () => {}
-      );
+      return sshStoreSessionSnapshot(
+        sessionId,
+        parser.createSnapshot(),
+        lastProcessedSeq
+      ).catch(() => {});
     }
+    return Promise.resolve();
   }
 
   /// Re-measure the container and push the current geometry to the PTY.

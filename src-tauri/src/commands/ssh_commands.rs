@@ -1128,6 +1128,9 @@ pub async fn sftp_download_file(
 }
 
 /// Read plain text from the system clipboard (terminal paste shortcut).
+// arboard has no Android/iOS implementation; the paste shortcut only
+// exists in the desktop shell, so mobile returns unavailable.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
 pub async fn read_clipboard_text() -> Result<Option<String>, String> {
     use arboard::Clipboard;
@@ -1138,6 +1141,12 @@ pub async fn read_clipboard_text() -> Result<Option<String>, String> {
         .get_text()
         .map(Some)
         .map_err(|e| format!("Failed to read clipboard: {}", e))
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[tauri::command]
+pub async fn read_clipboard_text() -> Result<Option<String>, String> {
+    Err("Clipboard text is unavailable on this platform".to_string())
 }
 
 #[tauri::command]

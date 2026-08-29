@@ -257,12 +257,13 @@
     const side = zone === "left" || zone === "top" ? "before" : "after";
 
     // Persist each live screen so the remount after the move restores it
-    // exactly instead of replaying the full session output.
-    for (const pane of source.panes) {
-      if (pane.kind !== "local") {
-        terminals.get(pane.id)?.storeSnapshot();
-      }
-    }
+    // exactly instead of replaying the full session output. The writes
+    // must complete before the remount reads the snapshot back.
+    await Promise.all(
+      source.panes
+        .filter((pane) => pane.kind !== "local")
+        .map((pane) => terminals.get(pane.id)?.storeSnapshot() ?? Promise.resolve())
+    );
     await tick();
     await tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
     // The moved panes remounted at the target geometry — resync PTY sizes.
@@ -290,7 +291,7 @@
     const dir = zone === "left" || zone === "right" ? "row" : "col";
     const side = zone === "left" || zone === "top" ? "before" : "after";
 
-    terminals.get(paneId)?.storeSnapshot();
+    await terminals.get(paneId)?.storeSnapshot();
     await tick();
     await tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side);
     terminals.get(paneId)?.syncSize();

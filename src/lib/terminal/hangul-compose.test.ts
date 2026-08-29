@@ -60,6 +60,18 @@ describe("HangulComposer", () => {
     expect(netText(["ㅎ", "ㅏ", "ㄴ", "하"])).toBe("하");
   });
 
+  test("tense resend: ㄱ → ㄲ → 까", () => {
+    expect(netText(["ㄱ", "ㄲ", "까"])).toBe("까");
+  });
+
+  test("equal-length jong resend: 말 → 막", () => {
+    expect(netText(["ㅁ", "마", "말", "막"])).toBe("막");
+  });
+
+  test("equal-length vowel resend: 마 → 머", () => {
+    expect(netText(["ㅁ", "마", "머"])).toBe("머");
+  });
+
   test("latin between words breaks and sends directly", () => {
     expect(netText(["ㅎㅏㄴ", "cd", "ㄱㅡㄹ"])).toBe("한cd글");
   });

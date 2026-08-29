@@ -1056,3 +1056,25 @@ describe("AnsiParser image resource limits", () => {
   });
 
 });
+
+describe("AnsiParser reflow wide-char boundaries", () => {
+  test("narrowing keeps wide-char pairs together at chunk boundaries", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write("가가가가x가AB");
+    parser.resize(10, 3);
+
+    const rows = parser.getBuffer();
+    for (const row of rows) {
+      for (let x = 0; x < row.length; x++) {
+        const cell = row[x];
+        if (cell.char === "") {
+          // A placeholder must always sit right after its wide main cell,
+          // never at the start of a reflowed row.
+          expect(x).toBeGreaterThan(0);
+        }
+      }
+    }
+    const flattened = rows.map((r) => r.map((c) => c.char).join("")).join("\n");
+    expect(flattened.replace(/\n+$/g, "")).toContain("가가가가x");
+  });
+});

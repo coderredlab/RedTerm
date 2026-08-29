@@ -368,12 +368,34 @@ export class AnsiParser {
       for (let y = 0; y < nextBufferRows.length; y++) {
         const row = nextBufferRows[y];
         const contentLength = this.rowContentLength(row);
-        const chunkCount = Math.max(1, Math.ceil(contentLength / cols));
-        for (let start = 0; start < contentLength; start += cols) {
-          allRows.push(row.slice(start, start + cols));
+        let pushed = 0;
+        let start = 0;
+        while (start < contentLength) {
+          let end = Math.min(start + cols, contentLength);
+          // Keep wide-char pairs together: if the chunk would end on a
+          // wide main cell whose placeholder lands in the next chunk,
+          // move the pair down. With a 1-column grid the split is
+          // unavoidable and the renderer clips the glyph.
+          if (
+            cols > 1 &&
+            end - start === cols &&
+            end < contentLength &&
+            row[end].char === "" &&
+            row[end - 1].char !== "" &&
+            this.isWideChar(row[end - 1].char)
+          ) {
+            end -= 1;
+          }
+          allRows.push(row.slice(start, end));
+          start = end;
+          pushed++;
+        }
+        if (pushed === 0) {
+          allRows.push([]);
+          pushed = 1;
         }
         if (y < nextCursorY) {
-          cursorRowOffset += chunkCount;
+          cursorRowOffset += pushed;
         }
       }
 
