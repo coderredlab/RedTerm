@@ -1068,7 +1068,7 @@
       offset = end;
     }
     pendingDataCharacters += text.length;
-    if (pendingDataCharacters >= MAX_PENDING_OUTPUT_CHARACTERS) {
+    if (kind !== "local" && pendingDataCharacters >= MAX_PENDING_OUTPUT_CHARACTERS) {
       pauseSshDataSource();
     }
   }
@@ -1663,7 +1663,18 @@
       const text = sshOutputDecoder.decode(data);
       if (parser) {
         enqueuePendingOutput(++localSeq, text);
-        updateBuffer();
+        // WebKit suspends animation frames in the background. Local-shell
+        // output has no replay API, so parse it without painting instead of
+        // dropping the listener when the pending queue reaches its limit.
+        if (
+          document.visibilityState === "hidden" ||
+          pendingDataCharacters >= MAX_PENDING_OUTPUT_CHARACTERS
+        ) {
+          processPendingOutputSlice(true);
+        }
+        if (document.visibilityState !== "hidden") {
+          updateBuffer();
+        }
       }
     });
 

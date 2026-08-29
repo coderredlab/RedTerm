@@ -89,6 +89,11 @@ describe("HangulComposer", () => {
     expect(netText(["ㅁ", "ㅏ", "ㄹ", "ㄱ", "ㅏ"])).toBe("말가");
   });
 
+  test("detaches ㄵ and ㄶ clusters when the next vowel arrives", () => {
+    expect(netText(["세", "션", "ㅈ", "ㅗ", "ㅇ", "료"])).toBe("세션종료");
+    expect(netText(["안", "ㅎ", "ㅏ"])).toBe("안하");
+  });
+
   test("backspace shrink via composition data", () => {
     // 한 then the IME deletes the jong: 하
     expect(netText(["ㅎ", "ㅏ", "ㄴ", "하"])).toBe("하");
