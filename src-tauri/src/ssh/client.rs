@@ -384,8 +384,16 @@ impl SshConnection {
                 continue;
             }
             let metadata = entry.metadata();
+            let mut is_dir = metadata.file_type().is_dir();
+            // SFTP readdir reports the link's own type; resolve symlinks (and
+            // any Other-typed entry) so symlinked directories stay navigable.
+            if !is_dir && !metadata.file_type().is_file() {
+                if let Ok(target) = sftp.metadata(entry.path()).await {
+                    is_dir = target.file_type().is_dir();
+                }
+            }
             entries.push(SftpDirEntry {
-                is_dir: entry.file_type().is_dir(),
+                is_dir,
                 name,
                 size: metadata.size.unwrap_or(0),
                 mtime: metadata.mtime.map(|value| value as i64).unwrap_or(0),
