@@ -9,6 +9,7 @@ export interface DesktopShortcutHandlers {
   splitDown(): void;
   moveFocus(direction: "left" | "right" | "up" | "down"): void;
   openSettings(): void;
+  copySelection(): void;
 }
 
 const IS_MAC =
@@ -48,6 +49,12 @@ export function handleDesktopShortcuts(
     (key === "t" || key === "T" || key === "w" || key === "W" || key === "\\");
 
   if (shellReserved) return false;
+
+  // Copy selection: the Shift variant keeps plain Ctrl/Cmd+C for the shell.
+  if (mod && shift && (key === "c" || key === "C")) {
+    handlers.copySelection();
+    return true;
+  }
 
   if (mod && !alt && (key === "t" || key === "T")) {
     handlers.newConnection();

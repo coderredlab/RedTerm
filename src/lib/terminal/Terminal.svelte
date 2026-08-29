@@ -539,6 +539,17 @@
     }
   }
 
+  /// Keyboard entry point (Ctrl/Cmd+Shift+C): copy without closing the
+  /// selection, so repeated copies are possible.
+  export function copySelection() {
+    const text = extractSelectedText();
+    if (text.trim() && navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(text).catch((e) => {
+        console.error("[Terminal] copy failed:", e);
+      });
+    }
+  }
+
   function cancelSelection() {
     clearSelectionFeedbackTimer();
     selectionFeedback = "";

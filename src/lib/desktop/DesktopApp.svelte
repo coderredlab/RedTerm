@@ -326,6 +326,14 @@
   };
   setWorkspaceApi(workspaceApi);
 
+  function copyActiveSelection() {
+    const tab = tabsStore.activeTab;
+    const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
+    if (paneId) {
+      terminals.get(paneId)?.copySelection();
+    }
+  }
+
   function onKeydownCapture(event: KeyboardEvent) {
     const terminalTarget =
       event.target instanceof Element &&
@@ -342,6 +350,7 @@
         splitRight: () => splitActivePane("row"),
         splitDown: () => splitActivePane("col"),
         moveFocus,
+        copySelection: copyActiveSelection,
         openSettings: () => {
           settingsOpen = true;
         },
