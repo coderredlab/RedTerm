@@ -2133,12 +2133,16 @@
   function handleCompositionStart() {
     isComposing = true;
     immediateCompositionText = "";
-    // 3초 후 자동으로 isComposing 해제 (stuck 방지)
-    if (compositionTimeout) clearTimeout(compositionTimeout);
-    compositionTimeout = window.setTimeout(() => {
-      isComposing = false;
-      compositionTimeout = null;
-    }, 3000);
+    // 3초 stuck 타이머는 모바일(안드로이드 WebView)용 — compositionend가
+    // 없을 때 플래그를 풀어 입력 막힘을 방지한다. 데스크탑 IME는
+    // compositionend를 확실히 주므로 플래그를 임의로 끄지 않는다.
+    if (!isDesktopTarget) {
+      if (compositionTimeout) clearTimeout(compositionTimeout);
+      compositionTimeout = window.setTimeout(() => {
+        isComposing = false;
+        compositionTimeout = null;
+      }, 3000);
+    }
   }
 
   function handleCompositionEnd(e: CompositionEvent) {
@@ -2296,8 +2300,7 @@
     }
 
     // Arrow keys
-    const appCursorMode = parser?.isApplicationCursorKeys() ?? false;
-    if (e.key === "ArrowUp") {
+    const appCursorMode = parser?.isApplicationCursorKeys() ?? false;    if (e.key === "ArrowUp") {
       e.preventDefault();
       queueWrite(getArrowKeyCode("up", appCursorMode));
       return;
@@ -2322,7 +2325,9 @@
     // Ctrl+D = EOF, Ctrl+U, Ctrl+W ...). The shell cannot work without them.
     if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
       const lower = e.key.toLowerCase();
-      if (lower >= "a" && lower <= "z") {
+      // Single letters only — modifier key names ("control", "meta", ...)
+      // would otherwise pass this range check on their bare keydown.
+      if (lower.length === 1 && lower >= "a" && lower <= "z") {
         e.preventDefault();
         queueWrite(String.fromCharCode(lower.charCodeAt(0) - 96));
         return;
@@ -2425,7 +2430,9 @@
   function sendText(text: string) {
     if (!sessionId) return;
 
-    let data = text;
+    // macOS IMEs can deliver decomposed Hangul (NFD); normalize so the
+    // shell sees composed syllables.
+    let data = text.normalize("NFC");
 
     // Apply modifiers for single character
     if (data.length === 1) {
