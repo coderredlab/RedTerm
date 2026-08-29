@@ -53,7 +53,7 @@
   </div>
 
   {#if connectionsStore.loading}
-    <div class="loading">Loading...</div>
+    <div class="loading">Loading…</div>
   {:else if connectionsStore.connections.length === 0}
     <div class="empty">
       <p>No saved connections</p>

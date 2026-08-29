@@ -284,6 +284,10 @@
     cursor: pointer;
     position: relative;
     user-select: none;
+    transition:
+      background-color 120ms ease,
+      color 120ms ease,
+      border-bottom-color 120ms ease;
   }
 
   .session-tab:hover {
@@ -380,6 +384,9 @@
     font: inherit;
     font-size: 11px;
     cursor: pointer;
+    transition:
+      background-color 120ms ease,
+      color 120ms ease;
   }
 
   .new-session span {

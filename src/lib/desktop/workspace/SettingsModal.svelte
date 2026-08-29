@@ -139,6 +139,7 @@
     position: absolute;
     inset: 0;
     background: rgba(0, 0, 0, 0.45);
+    backdrop-filter: blur(4px);
   }
 
   .settings-modal {
@@ -152,6 +153,14 @@
     background: var(--bg-primary);
     box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
     overflow: hidden;
+    animation: settings-in 140ms ease;
+  }
+
+  @keyframes settings-in {
+    from {
+      opacity: 0;
+      transform: scale(0.98) translateY(6px);
+    }
   }
 
   .settings-header {

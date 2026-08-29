@@ -423,7 +423,7 @@
                 id="keyPassphrase"
                 bind:value={keyPassphrase}
                 autocomplete="current-password"
-                placeholder="Leave blank for unencrypted keys"
+                placeholder="Leave blank for unencrypted keys…"
               />
             </div>
           {/if}

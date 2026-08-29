@@ -273,44 +273,29 @@
         </button>
       {/if}
       {#each entries as entry (entry.name)}
-        <div
-          class="entry"
-          class:dir={entry.is_dir}
-          role="button"
-          tabindex="0"
-          onclick={() =>
-            entry.is_dir
-              ? void navigate(joinPath(path, entry.name))
-              : onPreview({
-                  name: entry.name,
-                  path: joinPath(path, entry.name),
-                  size: entry.size,
-                })}
-          onkeydown={(event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              if (entry.is_dir) {
-                void navigate(joinPath(path, entry.name));
-              } else {
-                onPreview({
-                  name: entry.name,
-                  path: joinPath(path, entry.name),
-                  size: entry.size,
-                });
-              }
-            }
-          }}
-        >
-          <span class="entry-icon" aria-hidden="true">
-            {fileIconOf(entry.name, entry.is_dir)}
-          </span>
-          <span class="entry-name" title={entry.name}>{entry.name}</span>
-          <span class="entry-size">
-            {entry.is_dir ? "" : formatBytes(entry.size)}
-          </span>
-          <span class="entry-mtime">
-            {entry.is_dir ? "" : formatTimestamp(entry.mtime)}
-          </span>
+        <div class="entry" class:dir={entry.is_dir}>
+          <button
+            class="entry-main"
+            onclick={() =>
+              entry.is_dir
+                ? void navigate(joinPath(path, entry.name))
+                : onPreview({
+                    name: entry.name,
+                    path: joinPath(path, entry.name),
+                    size: entry.size,
+                  })}
+          >
+            <span class="entry-icon" aria-hidden="true">
+              {fileIconOf(entry.name, entry.is_dir)}
+            </span>
+            <span class="entry-name" title={entry.name}>{entry.name}</span>
+            <span class="entry-size">
+              {entry.is_dir ? "" : formatBytes(entry.size)}
+            </span>
+            <span class="entry-mtime">
+              {entry.is_dir ? "" : formatTimestamp(entry.mtime)}
+            </span>
+          </button>
           {#if !entry.is_dir}
             <button
               class="entry-download"
@@ -489,10 +474,9 @@
 
   .entry {
     width: 100%;
-    display: grid;
-    grid-template-columns: 18px minmax(0, 1fr) auto auto auto;
+    display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 4px;
     padding: 4px 8px;
     border: 0;
     border-radius: 3px;
@@ -502,6 +486,26 @@
     font-size: 11px;
     text-align: left;
     cursor: pointer;
+    transition: background-color 120ms ease;
+    content-visibility: auto;
+    contain-intrinsic-size: auto 26px;
+  }
+
+  .entry-main {
+    flex: 1;
+    min-width: 0;
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 8px;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-size: 11px;
+    text-align: left;
+    cursor: pointer;
+    padding: 0;
   }
 
   .entry:hover {
@@ -509,8 +513,10 @@
     color: var(--text-primary);
   }
 
-  .entry:focus-visible {
+  .entry-main:focus-visible {
     outline: 1px solid var(--accent-primary);
+    outline-offset: -1px;
+    border-radius: 3px;
   }
 
   .entry.dir .entry-name {
@@ -535,6 +541,7 @@
     color: var(--text-muted);
     font-size: 10px;
     white-space: nowrap;
+    font-variant-numeric: tabular-nums;
   }
 
   .entry-mtime {

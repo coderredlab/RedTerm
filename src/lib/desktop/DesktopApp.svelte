@@ -388,12 +388,14 @@
             Choose a saved connection from the left, or add a new SSH connection.
             Drag tabs onto the workspace to split the view across servers.
           </p>
-          <button class="empty-action" onclick={handleNewConnection}>
-            New connection
-          </button>
-          <button class="empty-action secondary" onclick={() => void tabsStore.addLocalTab()}>
-            Open local shell
-          </button>
+          <div class="empty-actions">
+            <button class="empty-action" onclick={handleNewConnection}>
+              New connection
+            </button>
+            <button class="empty-action secondary" onclick={() => void tabsStore.addLocalTab()}>
+              Open local shell
+            </button>
+          </div>
         </div>
       {:else if !sessionsReconciled}
         <div class="session-restore-loader">Checking session state…</div>
@@ -625,6 +627,7 @@
     font-size: clamp(32px, 4vw, 58px);
     font-weight: 500;
     letter-spacing: -0.055em;
+    text-wrap: balance;
   }
 
   .empty-copy {
@@ -634,6 +637,13 @@
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     font-size: 14px;
     line-height: 1.65;
+    text-wrap: pretty;
+  }
+
+  .empty-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
   }
 
   .empty-action {
@@ -646,6 +656,10 @@
     font-size: 11px;
     font-weight: 700;
     cursor: pointer;
+    transition:
+      background-color 120ms ease,
+      border-color 120ms ease,
+      color 120ms ease;
   }
 
   .empty-action:hover {
@@ -656,6 +670,11 @@
   .empty-action.secondary {
     background: transparent;
     color: var(--accent-primary);
+  }
+
+  .empty-action.secondary:hover {
+    background: color-mix(in srgb, var(--accent-primary) 12%, transparent);
+    color: var(--accent-hover);
   }
 
   .session-restore-loader {

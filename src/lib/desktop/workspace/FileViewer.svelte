@@ -378,6 +378,7 @@
     position: absolute;
     inset: 0;
     background: rgba(0, 0, 0, 0.55);
+    backdrop-filter: blur(4px);
   }
 
   .viewer-modal {
@@ -391,6 +392,14 @@
     background: var(--bg-primary);
     box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
     overflow: hidden;
+    animation: viewer-in 140ms ease;
+  }
+
+  @keyframes viewer-in {
+    from {
+      opacity: 0;
+      transform: scale(0.98) translateY(6px);
+    }
   }
 
   .viewer-header {
