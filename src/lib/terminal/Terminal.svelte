@@ -37,7 +37,7 @@
   import { findUrlAtCell, validateTerminalUrl, type SafeTerminalUrl } from "./terminal-links";
   import { extractTerminalSelection } from "./terminal-selection";
   import { formatTerminalPaste } from "./terminal-paste";
-  import { encodeTerminalMouseEvent } from "./terminal-mouse";
+  import { encodeTerminalMouseEvent, terminalMouseCellFromPoint } from "./terminal-mouse";
   import { SshOutputDecoder } from "./ssh-output-decoder";
   import { cleanupFailedSessionAttach } from "./session-attach-cleanup";
   import { composeJamoSequence, HangulComposer } from "./hangul-compose";
@@ -78,6 +78,10 @@
     onDisconnected?: () => void;
     onError?: (error: string) => void;
   }
+  type TerminalMouseModifiers = Pick<
+    MouseEvent,
+    "shiftKey" | "altKey" | "ctrlKey" | "metaKey"
+  >;
 
   let {
     host,
@@ -202,6 +206,7 @@
   let touchPointerMoved = false;
   let longPressTriggered = false;
   let terminalMousePointerId: number | null = null;
+  let terminalMouseButton: number | null = null;
   let lastTerminalMouseCell: { row: number; col: number } | null = null;
   let desktopWheelRows = 0;
   let pendingMouseClick: {
@@ -314,14 +319,23 @@
     return { row, col };
   }
 
-  function touchToCell(touch: Touch): { row: number; col: number } {
+  function pointerToViewportCell(point: { clientX: number; clientY: number }): {
+    row: number;
+    col: number;
+  } {
     if (!scrollContainer) return { row: 0, col: 0 };
     const rect = scrollContainer.getBoundingClientRect();
-    const x = touch.clientX - rect.left - TERMINAL_HORIZONTAL_PADDING_PX;
-    const y = touch.clientY - rect.top + scrollContainer.scrollTop;
-    const col = Math.max(0, Math.min(cols - 1, Math.floor(x / charWidth)));
-    const row = Math.max(0, Math.floor(y / charHeight));
-    return { row, col };
+    return terminalMouseCellFromPoint({
+      clientX: point.clientX,
+      clientY: point.clientY,
+      viewportLeft: rect.left,
+      viewportTop: rect.top,
+      horizontalPadding: TERMINAL_HORIZONTAL_PADDING_PX,
+      charWidth,
+      charHeight,
+      cols: parser?.getCols() ?? cols,
+      rows: parser?.getRows() ?? rows,
+    });
   }
 
   function compareCells(a: { row: number; col: number }, b: { row: number; col: number }) {
@@ -455,8 +469,13 @@
     return !!parser && parser.isMouseEnabled() && !selectionMode;
   }
 
-  function sendMouseButton(button: number, point: { row: number; col: number }, pressed: boolean) {
-    if (!sessionId || !parser) return;
+  function sendMouseButton(
+    button: number,
+    point: { row: number; col: number },
+    pressed: boolean,
+    modifiers?: TerminalMouseModifiers,
+  ) {
+    if (!sessionId || !parser || (!pressed && !parser.shouldReportMouseRelease())) return;
     sendSessionData(
       encodeTerminalMouseEvent({
         action: pressed ? "press" : "release",
@@ -464,12 +483,20 @@
         col: point.col,
         row: point.row,
         sgr: parser.isSgrMouseEncoding(),
+        shiftKey: modifiers?.shiftKey,
+        altKey: modifiers?.altKey,
+        ctrlKey: modifiers?.ctrlKey,
+        metaKey: modifiers?.metaKey,
       }),
       true,
     );
   }
 
-  function sendMouseMotion(button: number, point: { row: number; col: number }) {
+  function sendMouseMotion(
+    button: number,
+    point: { row: number; col: number },
+    modifiers: TerminalMouseModifiers,
+  ) {
     if (!sessionId || !parser) return;
     sendSessionData(
       encodeTerminalMouseEvent({
@@ -478,6 +505,10 @@
         col: point.col,
         row: point.row,
         sgr: parser.isSgrMouseEncoding(),
+        shiftKey: modifiers.shiftKey,
+        altKey: modifiers.altKey,
+        ctrlKey: modifiers.ctrlKey,
+        metaKey: modifiers.metaKey,
       }),
       true,
     );
@@ -993,9 +1024,11 @@
   let automaticResponseCount = 0;
   let protocolFloodDetected = false;
   let deferredUpdateTimer: number | null = null;
+  let synchronizedOutputTimer: number | null = null;
   let lastNonBottomRenderAt = 0;
   let prevScrollbackLength = 0;
   const NON_BOTTOM_RENDER_INTERVAL_MS = 90;
+  const SYNCHRONIZED_OUTPUT_TIMEOUT_MS = 150;
   type PendingOutputChunk = { seq: number; text: string; completesSeq: boolean };
   let pendingDataChunks: PendingOutputChunk[] = [];
   let pendingDataHead = 0;
@@ -1083,6 +1116,20 @@
     return distanceFromBottom() <= STICKY_BOTTOM_THRESHOLD_PX;
   }
 
+  function clearSynchronizedOutputTimer() {
+    if (synchronizedOutputTimer === null) return;
+    clearTimeout(synchronizedOutputTimer);
+    synchronizedOutputTimer = null;
+  }
+
+  function scheduleSynchronizedOutputRender() {
+    if (synchronizedOutputTimer !== null) return;
+    synchronizedOutputTimer = window.setTimeout(() => {
+      synchronizedOutputTimer = null;
+      updateBuffer(true);
+    }, SYNCHRONIZED_OUTPUT_TIMEOUT_MS);
+  }
+
   function updateBuffer(force = false) {
     // force=true: 앱 복귀 시 selection/throttle 무시하고 강제 렌더링
     if (!force && selectionMode) {
@@ -1137,7 +1184,12 @@
         }
       }
 
-      if (!force && parser.isSynchronizedOutput()) {
+      const synchronizedOutput = parser.isSynchronizedOutput();
+      if (!synchronizedOutput || force) {
+        clearSynchronizedOutputTimer();
+      }
+      if (!force && synchronizedOutput) {
+        scheduleSynchronizedOutputRender();
         if (pendingDataHead < pendingDataChunks.length) {
           updateBuffer();
         }
@@ -1239,13 +1291,20 @@
   const TOUCH_SCROLL_LINE_THRESHOLD = 0.6; // charHeight의 60%만큼 이동하면 1줄 스크롤
 
   function shouldInterceptScroll(): boolean {
-    // alternate screen 기반 TUI는 mouse mode를 명시적으로 켜지 않아도
-    // 터치 드래그를 네이티브 스크롤 대신 내부 휠 입력으로 기대하는 경우가 있다.
-    // 상위 레이아웃이 전역 스크롤을 막고 있으니, alt-screen에서는 우선 wheel 변환을 허용한다.
-    return !!parser && parser.isAlternateScreen() && !selectionMode;
+    return (
+      !!parser &&
+      parser.isAlternateScreen() &&
+      parser.isMouseEnabled() &&
+      !selectionMode
+    );
   }
 
-  function sendMouseWheel(up: boolean, lines: number, point: { row: number; col: number }) {
+  function sendMouseWheel(
+    up: boolean,
+    lines: number,
+    point: { row: number; col: number },
+    modifiers?: TerminalMouseModifiers,
+  ) {
     if (!sessionId || !parser || lines <= 0) return;
     sendSessionData(
       encodeTerminalMouseEvent({
@@ -1254,6 +1313,10 @@
         col: point.col,
         row: point.row,
         sgr: parser.isSgrMouseEncoding(),
+        shiftKey: modifiers?.shiftKey,
+        altKey: modifiers?.altKey,
+        ctrlKey: modifiers?.ctrlKey,
+        metaKey: modifiers?.metaKey,
         repeat: lines,
       }),
       true,
@@ -1277,7 +1340,7 @@
 
     const signedLines = Math.trunc(desktopWheelRows);
     if (signedLines === 0) return;
-    sendMouseWheel(signedLines < 0, Math.abs(signedLines), pointerToCell(e));
+    sendMouseWheel(signedLines < 0, Math.abs(signedLines), pointerToViewportCell(e), e);
     desktopWheelRows -= signedLines;
   }
 
@@ -1302,7 +1365,7 @@
     const lines = Math.floor(Math.abs(touchScrollAccum) / lineThreshold);
     if (lines > 0) {
       const up = touchScrollAccum < 0;
-      sendMouseWheel(up, lines, touchToCell(e.touches[0]));
+      sendMouseWheel(up, lines, pointerToViewportCell(e.touches[0]));
       // accum을 0 방향으로 줄여야 소비됨
       touchScrollAccum -= Math.sign(touchScrollAccum) * lines * lineThreshold;
       e.preventDefault(); // 네이티브 스크롤 방지
@@ -1729,6 +1792,7 @@
   }
 
   function resetParser() {
+    clearSynchronizedOutputTimer();
     parser = new AnsiParser(cols, rows);
     parser.setResponseHandler((data: string) => {
       enqueueAutomaticResponse(data);
@@ -1993,19 +2057,21 @@
     if (statusMessage) return;
 
     if (e.pointerType === "mouse") {
-      if (e.button !== 0) return;
       if (shouldForwardTerminalMouseEvents()) {
+        if (e.button < 0 || e.button > 2) return;
         e.preventDefault();
         suppressNextFocus = true;
         terminalMousePointerId = e.pointerId;
-        const point = pointerToCell(e);
+        terminalMouseButton = e.button;
+        const point = pointerToViewportCell(e);
         lastTerminalMouseCell = point;
         if (scrollContainer && !scrollContainer.hasPointerCapture(e.pointerId)) {
           scrollContainer.setPointerCapture(e.pointerId);
         }
-        sendMouseButton(0, point, true);
+        sendMouseButton(e.button, point, true, e);
         return;
       }
+      if (e.button !== 0) return;
 
       e.preventDefault();
       suppressNextFocus = true;
@@ -2050,17 +2116,21 @@
 
   function handleScreenPointerMove(e: PointerEvent) {
     if (e.pointerType === "mouse") {
-      const buttonPressed = terminalMousePointerId === e.pointerId;
+      const buttonPressed =
+        terminalMousePointerId === e.pointerId && terminalMouseButton !== null;
       const reportsHover = parser?.shouldReportMouseMotion(false) ?? false;
-      if ((buttonPressed || shouldForwardTerminalMouseEvents()) && parser?.shouldReportMouseMotion(buttonPressed)) {
-        const point = pointerToCell(e);
+      if (
+        (buttonPressed || shouldForwardTerminalMouseEvents()) &&
+        parser?.shouldReportMouseMotion(buttonPressed)
+      ) {
+        const point = pointerToViewportCell(e);
         if (
           !lastTerminalMouseCell ||
           point.row !== lastTerminalMouseCell.row ||
           point.col !== lastTerminalMouseCell.col
         ) {
           e.preventDefault();
-          sendMouseMotion(buttonPressed ? 0 : 3, point);
+          sendMouseMotion(buttonPressed ? terminalMouseButton! : 3, point, e);
           lastTerminalMouseCell = point;
         }
       }
@@ -2118,11 +2188,17 @@
   function handleScreenPointerEnd(e: PointerEvent) {
     if (terminalMousePointerId === e.pointerId) {
       e.preventDefault();
-      sendMouseButton(0, pointerToCell(e), false);
+      sendMouseButton(
+        terminalMouseButton ?? 0,
+        pointerToViewportCell(e),
+        false,
+        e,
+      );
       if (scrollContainer?.hasPointerCapture(e.pointerId)) {
         scrollContainer.releasePointerCapture(e.pointerId);
       }
       terminalMousePointerId = null;
+      terminalMouseButton = null;
       lastTerminalMouseCell = null;
     }
 
@@ -2170,9 +2246,9 @@
     if (touchPointerId === e.pointerId) {
       if (e.pointerType === "touch" && !touchPointerMoved && !longPressTriggered && touchPointerStart) {
         if (shouldForwardTerminalMouseEvents()) {
-          const point = pointerToCell(e);
-          sendMouseButton(0, point, true);
-          sendMouseButton(0, point, false);
+          const point = pointerToViewportCell(e);
+          sendMouseButton(0, point, true, e);
+          sendMouseButton(0, point, false, e);
         } else {
           const match = e.type === "pointerup" ? findUrlAtCell(buffer, pointerToCell(e)) : null;
           resetTouchLongPressState();
@@ -2657,6 +2733,7 @@
       clearTimeout(deferredUpdateTimer);
       deferredUpdateTimer = null;
     }
+    clearSynchronizedOutputTimer();
     if (cursorInterval) {
       clearInterval(cursorInterval);
     }

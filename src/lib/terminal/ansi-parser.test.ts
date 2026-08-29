@@ -810,6 +810,25 @@ describe("AnsiParser resize", () => {
     expect(parser.getScrollbackLength()).toBe(0);
     expect(parser.getFullBuffer()).toHaveLength(6);
   });
+
+  test("normalizes the saved main screen before leaving a resized alternate screen", () => {
+    const parser = new AnsiParser(20, 6);
+    parser.write("line0\r\nline1\r\nline2\r\nline3\r\nline4");
+    parser.write("\x1b[?1049h");
+
+    parser.resize(20, 3);
+    parser.write("\x1b[?1049l");
+
+    expect(parser.getBuffer()).toHaveLength(3);
+    expect(parser.getBuffer().map((_, row) => visibleRowText(parser, row))).toEqual([
+      "line2",
+      "line3",
+      "line4",
+    ]);
+    expect(parser.getScrollbackLength()).toBe(2);
+    expect(parser.getFullBuffer()).toHaveLength(5);
+    expect(parser.getCursor()).toEqual({ x: 5, y: 2 });
+  });
 });
 
 describe("AnsiParser erase in display", () => {
@@ -920,6 +939,7 @@ describe("AnsiParser CSI work limits", () => {
     expect(parser.isMouseEnabled()).toBe(true);
     expect(parser.shouldReportMouseMotion(false)).toBe(false);
     expect(parser.shouldReportMouseMotion(true)).toBe(true);
+    expect(parser.shouldReportMouseRelease()).toBe(true);
     expect(parser.isSgrMouseEncoding()).toBe(true);
 
     const restored = new AnsiParser(40, 2);
@@ -933,6 +953,24 @@ describe("AnsiParser CSI work limits", () => {
     restored.write("\x1b[?1003l\x1b[?1006l");
     expect(restored.isMouseEnabled()).toBe(false);
     expect(restored.isSgrMouseEncoding()).toBe(false);
+  });
+
+  test("tracks X10 press-only mouse mode across snapshots", () => {
+    const parser = new AnsiParser(40, 2);
+    parser.write("\x1b[?9h");
+
+    expect(parser.isMouseEnabled()).toBe(true);
+    expect(parser.shouldReportMouseMotion(false)).toBe(false);
+    expect(parser.shouldReportMouseMotion(true)).toBe(false);
+    expect(parser.shouldReportMouseRelease()).toBe(false);
+
+    const restored = new AnsiParser(40, 2);
+    restored.restoreSnapshot(parser.createSnapshot());
+    expect(restored.isMouseEnabled()).toBe(true);
+    expect(restored.shouldReportMouseRelease()).toBe(false);
+
+    restored.write("\x1b[?9l");
+    expect(restored.isMouseEnabled()).toBe(false);
   });
 
 });

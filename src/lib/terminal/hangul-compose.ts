@@ -39,8 +39,8 @@ const JONGSEONG_MAP = new Map<string, number>(
 const HANGUL_SYLLABLE_BASE = 0xac00;
 const JUNGSEONG_COUNT = 21;
 
-/** Consecutive consonant keystrokes that merge into a tense consonant. */
-const CHO_MERGE = new Map<string, string>([
+/** Direct tense Jamo that can replace an in-progress basic consonant resend. */
+const TENSE_CONSONANT = new Map<string, string>([
   ["ㄱ", "ㄲ"],
   ["ㄷ", "ㄸ"],
   ["ㅂ", "ㅃ"],
@@ -63,7 +63,6 @@ const JUNG_MERGE = new Map<string, string>([
 
 /** Final-consonant cluster keystrokes: prevJong + next jamo → merged jong. */
 const JONG_MERGE = new Map<string, string>([
-  ["ㄱㄱ", "ㄲ"],
   ["ㄱㅅ", "ㄳ"],
   ["ㄴㅈ", "ㄵ"],
   ["ㄴㅎ", "ㄶ"],
@@ -75,16 +74,15 @@ const JONG_MERGE = new Map<string, string>([
   ["ㄹㅍ", "ㄿ"],
   ["ㄹㅎ", "ㅀ"],
   ["ㅂㅅ", "ㅄ"],
-  ["ㅅㅅ", "ㅆ"],
 ]);
 
 /**
  * How a jongseong splits when a vowel follows: [kept jong, new choseong].
- * Plain consonants detach entirely; clusters keep their first component.
+ * Basic and direct tense consonants detach entirely; clusters keep their first component.
  */
 const JONG_SPLIT = new Map<string, [string, string]>([
   ["ㄱ", ["", "ㄱ"]],
-  ["ㄲ", ["ㄱ", "ㄱ"]],
+  ["ㄲ", ["", "ㄲ"]],
   ["ㄴ", ["", "ㄴ"]],
   ["ㄳ", ["ㄱ", "ㅅ"]],
   ["ㄷ", ["", "ㄷ"]],
@@ -100,7 +98,7 @@ const JONG_SPLIT = new Map<string, [string, string]>([
   ["ㅂ", ["", "ㅂ"]],
   ["ㅄ", ["ㅂ", "ㅅ"]],
   ["ㅅ", ["", "ㅅ"]],
-  ["ㅆ", ["ㅅ", "ㅅ"]],
+  ["ㅆ", ["", "ㅆ"]],
   ["ㅇ", ["", "ㅇ"]],
   ["ㅈ", ["", "ㅈ"]],
   ["ㅊ", ["", "ㅊ"]],
@@ -164,8 +162,8 @@ function isHangulChar(ch: string): boolean {
 
 /**
  * Recompose a raw stream of Jamo and/or composed syllables into syllables,
- * merging keystrokes that extend the previous unit (tense consonants,
- * compound vowels, jongseong attach, jongseong clusters).
+ * merging keystrokes that extend the previous unit (compound vowels,
+ * jongseong attach, jongseong clusters).
  */
 function buildParts(raw: string): Part[] {
   const parts: Part[] = [];
@@ -195,15 +193,7 @@ function buildParts(raw: string): Part[] {
     }
 
     if (CHOSEONG_MAP.has(ch)) {
-      if (last && last.kind === "lone" && last.ch === ch && CHO_MERGE.has(ch)) {
-        parts[parts.length - 1] = {
-          kind: "lone",
-          ch: CHO_MERGE.get(ch)!,
-          span: last.span + 1,
-        };
-      } else {
-        parts.push({ kind: "lone", ch, span: 1 });
-      }
+      parts.push({ kind: "lone", ch, span: 1 });
       continue;
     }
 
@@ -326,15 +316,14 @@ export class HangulComposer {
   private raw = "";
   private emitted = "";
   private tailFromJamo = false;
-  private pendingTenseOnset = false;
+  private pendingOnsetJamo: string | null = null;
 
   reset(): void {
     this.raw = "";
     this.emitted = "";
     this.tailFromJamo = false;
-    this.pendingTenseOnset = false;
+    this.pendingOnsetJamo = null;
   }
-
   breakWord(): void {
     this.reset();
   }
@@ -366,7 +355,8 @@ export class HangulComposer {
       }
 
       const previousTailFromJamo = this.tailFromJamo;
-      const includesJamoDelta = [...run.text].some(
+      const runChars = [...run.text];
+      const includesJamoDelta = runChars.some(
         (ch) => decomposeChar(ch)?.length === 1
       );
       const appendedRaw = this.raw + run.text;
@@ -374,24 +364,30 @@ export class HangulComposer {
       let replacedTail = false;
       const parts = buildParts(this.raw);
       const lastPart = parts.at(-1);
-      const continuesTenseOnset =
-        this.pendingTenseOnset &&
-        run.text.length === 1 &&
-        JUNGSEONG_MAP.has(run.text) &&
-        lastPart?.kind === "syllable" &&
-        (lastPart.jong === "ㄲ" || lastPart.jong === "ㅆ");
-      const startsTenseOnset =
-        !this.pendingTenseOnset &&
-        (run.text === "ㄲ" || run.text === "ㅆ") &&
-        lastPart?.kind === "syllable" &&
-        !lastPart.jong;
+      const firstRunParts = runChars[0] ? decomposeChar(runChars[0]) : null;
+      const pendingJongSplit =
+        lastPart?.kind === "syllable" && lastPart.jong
+          ? JONG_SPLIT.get(lastPart.jong)
+          : undefined;
+      const runStartsSyllable =
+        (firstRunParts?.length ?? 0) > 1 ||
+        (runChars.length > 1 &&
+          firstRunParts?.length === 1 &&
+          CHOSEONG_MAP.has(firstRunParts[0]) &&
+          JUNGSEONG_MAP.has(runChars[1]));
+      const continuesPendingOnset =
+        runStartsSyllable &&
+        this.pendingOnsetJamo !== null &&
+        firstRunParts?.[0] === this.pendingOnsetJamo &&
+        pendingJongSplit?.[1] === this.pendingOnsetJamo;
 
-      if (continuesTenseOnset && lastPart?.kind === "syllable") {
+      if (continuesPendingOnset && lastPart?.kind === "syllable" && pendingJongSplit) {
         candidateRaw =
           this.raw.slice(0, this.raw.length - lastPart.span) +
-          composeSmart(lastPart.cho + lastPart.jung) +
-          composeSmart(lastPart.jong + run.text);
-      } else if (!startsTenseOnset && lastPart && run.text.length === 1) {
+          composeSmart(lastPart.cho + lastPart.jung + pendingJongSplit[0]) +
+          run.text;
+        replacedTail = true;
+      } else if (lastPart && runChars.length === 1) {
         const lastParts =
           lastPart.kind === "syllable"
             ? [
@@ -404,23 +400,22 @@ export class HangulComposer {
         if (lastParts && runParts) {
           const isGrowth =
             runParts.length > lastParts.length &&
-            lastParts.every((p, i) => runParts[i] === p);
+            lastParts.every((part, index) => runParts[index] === part);
           const isShrink =
             runParts.length > 1 &&
             lastParts.length > runParts.length &&
-            runParts.every((p, i) => lastParts[i] === p);
+            runParts.every((part, index) => lastParts[index] === part);
           const isDerivedJamo =
             lastParts.length === 1 &&
             runParts.length === 1 &&
-            (CHO_MERGE.get(lastParts[0]) === runParts[0] ||
-              JONG_MERGE.get(lastParts[0]) === runParts[0]);
+            TENSE_CONSONANT.get(lastParts[0]) === runParts[0];
           const isEqualResend =
             previousTailFromJamo &&
             runParts.length > 1 &&
             runParts.length === lastParts.length &&
             lastParts
               .slice(0, -1)
-              .every((p, i) => runParts[i] === p);
+              .every((part, index) => runParts[index] === part);
           if (isGrowth || isShrink || isDerivedJamo || isEqualResend) {
             candidateRaw =
               this.raw.slice(0, this.raw.length - lastPart.span) + run.text;
@@ -429,9 +424,7 @@ export class HangulComposer {
         }
       }
 
-      let composed = continuesTenseOnset
-        ? candidateRaw
-        : composeSmart(candidateRaw);
+      let composed = composeSmart(candidateRaw);
       if (!isValidComposed(composed) && replacedTail) {
         candidateRaw = appendedRaw;
         composed = composeSmart(candidateRaw);
@@ -457,7 +450,22 @@ export class HangulComposer {
       this.emitted = composed;
       this.tailFromJamo =
         includesJamoDelta || (replacedTail && previousTailFromJamo);
-      this.pendingTenseOnset = startsTenseOnset;
+
+      const composedLastPart = buildParts(composed).at(-1);
+      const latestJamo =
+        runChars.length === 1 &&
+        decomposeChar(runChars[0])?.length === 1 &&
+        CHOSEONG_MAP.has(runChars[0])
+          ? runChars[0]
+          : null;
+      const latestJongSplit =
+        composedLastPart?.kind === "syllable" && composedLastPart.jong
+          ? JONG_SPLIT.get(composedLastPart.jong)
+          : undefined;
+      this.pendingOnsetJamo =
+        latestJamo && latestJongSplit?.[1] === latestJamo
+          ? latestJamo
+          : null;
     }
 
     return { erase, send };

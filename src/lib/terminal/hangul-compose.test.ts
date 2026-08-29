@@ -37,6 +37,12 @@ describe("HangulComposer", () => {
     expect(netText(["ㅇ", "ㅏ", "ㅆ", "ㅏ"])).toBe("아싸");
   });
 
+  test("mixed jamo and composed deliveries preserve syllable boundaries", () => {
+    expect(netText(["바", "ㄲ", "꿔", "도"])).toBe("바꿔도");
+    expect(netText(["ㅂ", "ㅏ", "ㄲㅝ", "ㄷ", "ㅗ"])).toBe("바꿔도");
+    expect(netText(["ㅁ", "메", "ㅁ", "모", "ㄹ", "리"])).toBe("메모리");
+  });
+
   test("direct tense consonants remain final when no vowel follows", () => {
     expect(netText(["ㅂ", "ㅏ", "ㄲ"])).toBe("밖");
     expect(netText(["ㅇ", "ㅣ", "ㅆ"])).toBe("있");
@@ -65,8 +71,13 @@ describe("HangulComposer", () => {
     expect(netText(["ㄱ", "ㅏ", "ㅣ"])).toBe("개");
   });
 
-  test("tense consonant: ㄱ ㄱ ㅏ → 까", () => {
-    expect(netText(["ㄱ", "ㄱ", "ㅏ"])).toBe("까");
+  test("repeated basic consonants stay separate", () => {
+    expect(netText(["ㄱ", "ㄱ"])).toBe("ㄱㄱ");
+    expect(netText(["ㄱ", "ㄱ", "ㅏ"])).toBe("ㄱ가");
+  });
+
+  test("direct tense consonant composes normally", () => {
+    expect(netText(["ㄲ", "ㅏ"])).toBe("까");
   });
 
   test("jong cluster: ㅁ ㅏ ㄱ ㅅ → 맋 (ㅁㅏㄳ)", () => {

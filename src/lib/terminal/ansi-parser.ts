@@ -195,7 +195,7 @@ export class AnsiParser {
   private mainScreenCursor = { x: 0, y: 0 };
   private mainScreenScrollRegion = { top: 0, bottom: 0 };
   private synchronizedOutput = false; // mode 2026: true이면 렌더링 보류
-  private mouseMode = 0; // 0=off, 1000=normal, 1002=button-event, 1003=any-event
+  private mouseMode = 0; // 0=off, 9=X10 press-only, 1000=normal, 1002=button-event, 1003=any-event
   private sgrMouseEncoding = false; // mode 1006: SGR 마우스 인코딩
 
   // 터미널 → 원격 앱 응답 콜백 (DA, DSR 등)
@@ -328,6 +328,13 @@ export class AnsiParser {
     const oldCursorX = this.cursorX;
     const oldScrollTop = this.scrollTop;
     const oldScrollBottom = this.scrollBottom;
+    const mainScreenUsesFullScrollRegion =
+      this.mainScreenBuffer !== null &&
+      this.isFullScreenRegion(
+        this.mainScreenScrollRegion.top,
+        this.mainScreenScrollRegion.bottom,
+        this.mainScreenBuffer.length,
+      );
     const canReflowMainScreen =
       !this.usingAlternateScreen &&
       oldScrollTop === 0 &&
@@ -462,10 +469,12 @@ export class AnsiParser {
     this.scrollTop = 0;
     this.scrollBottom = this.rows - 1;
 
-    this.mainScreenScrollRegion = {
-      top: Math.min(this.rows - 1, Math.max(0, this.mainScreenScrollRegion.top)),
-      bottom: Math.min(this.rows - 1, Math.max(0, this.mainScreenScrollRegion.bottom)),
-    };
+    this.mainScreenScrollRegion = mainScreenUsesFullScrollRegion
+      ? { top: 0, bottom: this.rows - 1 }
+      : {
+          top: Math.min(this.rows - 1, Math.max(0, this.mainScreenScrollRegion.top)),
+          bottom: Math.min(this.rows - 1, Math.max(0, this.mainScreenScrollRegion.bottom)),
+        };
     this.markFullBufferDirty();
     this.markAllRowsDirty();
   }
@@ -1636,7 +1645,7 @@ export class AnsiParser {
         // Auto-wrap mode (DECAWM) — 항상 켜져있는 것으로 처리
       } else if (mode === 2026) {
         this.synchronizedOutput = enabled;
-      } else if (mode === 1000 || mode === 1002 || mode === 1003) {
+      } else if (mode === 9 || mode === 1000 || mode === 1002 || mode === 1003) {
         this.mouseMode = enabled ? mode : 0;
       } else if (mode === 1006) {
         this.sgrMouseEncoding = enabled;
@@ -1670,10 +1679,27 @@ export class AnsiParser {
   private exitAlternateScreen() {
     if (!this.usingAlternateScreen) return;
 
-    this.buffer = this.mainScreenBuffer ? this.cloneBuffer(this.mainScreenBuffer) : this.createBuffer();
-    this.scrollback = this.cloneBuffer(this.mainScreenScrollback);
+    const preserveMainScreenLatestLines = this.isFullScreenRegion(
+      this.mainScreenScrollRegion.top,
+      this.mainScreenScrollRegion.bottom,
+      this.rows,
+    );
+    const mainScreenBuffer =
+      preserveMainScreenLatestLines &&
+      this.mainScreenBuffer &&
+      this.mainScreenBuffer.length > this.rows
+        ? this.mainScreenBuffer.slice(0, this.mainScreenCursor.y + 1)
+        : this.mainScreenBuffer;
+    const restoredMainScreen = this.restoreViewportState(
+      mainScreenBuffer ?? undefined,
+      this.mainScreenScrollback,
+      this.mainScreenCursor.y,
+      preserveMainScreenLatestLines,
+    );
+    this.buffer = this.mainScreenBuffer ? restoredMainScreen.buffer : this.createBuffer();
+    this.scrollback = restoredMainScreen.scrollback;
     this.cursorX = Math.min(this.cols - 1, Math.max(0, this.mainScreenCursor.x));
-    this.cursorY = Math.min(this.rows - 1, Math.max(0, this.mainScreenCursor.y));
+    this.cursorY = restoredMainScreen.cursorY;
 
     const restoredTop = Math.min(this.rows - 1, Math.max(0, this.mainScreenScrollRegion.top));
     const restoredBottom = Math.min(this.rows - 1, Math.max(0, this.mainScreenScrollRegion.bottom));
@@ -2119,6 +2145,10 @@ export class AnsiParser {
     return this.mouseMode === 1003 || (buttonPressed && this.mouseMode === 1002);
   }
 
+  shouldReportMouseRelease(): boolean {
+    return this.mouseMode !== 0 && this.mouseMode !== 9;
+  }
+
   isSgrMouseEncoding(): boolean {
     return this.sgrMouseEncoding;
   }
@@ -2175,7 +2205,10 @@ export class AnsiParser {
     this.applicationCursorKeys = snapshot.applicationCursorKeys;
     this.bracketedPasteMode = snapshot.bracketedPasteMode ?? false;
     this.mouseMode =
-      snapshot.mouseMode === 1000 || snapshot.mouseMode === 1002 || snapshot.mouseMode === 1003
+      snapshot.mouseMode === 9 ||
+      snapshot.mouseMode === 1000 ||
+      snapshot.mouseMode === 1002 ||
+      snapshot.mouseMode === 1003
         ? snapshot.mouseMode
         : 0;
     this.sgrMouseEncoding = snapshot.sgrMouseEncoding ?? false;
