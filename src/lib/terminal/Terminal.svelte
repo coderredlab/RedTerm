@@ -1848,7 +1848,16 @@
     resizeObserver.observe(terminalContainer);
 
     let attached = false;
-    if (existingSessionId) {
+    if (kind === "local" && existingSessionId) {
+      // A moved local shell is still running in the backend; re-subscribe to
+      // its event stream instead of spawning a second shell.
+      sessionId = existingSessionId;
+      connected = true;
+      statusMessage = "";
+      await bindLocalSessionListener(existingSessionId);
+      onConnected?.(existingSessionId);
+      attached = true;
+    } else if (existingSessionId) {
       attached = await attachExistingSession(existingSessionId);
     }
 
@@ -2530,6 +2539,16 @@
 
   export function focus() {
     focusInput();
+  }
+
+  /// Persist the current screen so a caller moving this terminal between
+  /// containers can restore it exactly after the remount.
+  export function storeSnapshot() {
+    if (sessionId && parser) {
+      void sshStoreSessionSnapshot(sessionId, parser.createSnapshot(), lastProcessedSeq).catch(
+        () => {}
+      );
+    }
   }
 
   export function blur() {

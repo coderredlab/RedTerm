@@ -249,10 +249,20 @@
   ) {
     const targetTabId = tabsStore.activeTabId;
     if (!targetTabId || targetTabId === sourceTabId) return;
-    if (!tabsStore.getTab(sourceTabId)) return;
+    const source = tabsStore.getTab(sourceTabId);
+    if (!source) return;
 
     const dir = zone === "left" || zone === "right" ? "row" : "col";
     const side = zone === "left" || zone === "top" ? "before" : "after";
+
+    // Persist each live screen so the remount after the move restores it
+    // exactly instead of replaying the full session output.
+    for (const pane of source.panes) {
+      if (pane.kind !== "local") {
+        terminals.get(pane.id)?.storeSnapshot();
+      }
+    }
+    await tick();
     await tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
   }
 
@@ -274,6 +284,9 @@
 
     const dir = zone === "left" || zone === "right" ? "row" : "col";
     const side = zone === "left" || zone === "top" ? "before" : "after";
+
+    terminals.get(paneId)?.storeSnapshot();
+    await tick();
     await tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side);
   }
 
