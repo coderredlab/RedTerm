@@ -2318,7 +2318,6 @@
         const response = automaticResponseQueue.shift()!;
         automaticResponseBytes -= response.length;
         sendSessionData(encoder.encode(response));
-        if (sessionId !== activeSessionId) break;
       }
     } catch (error) {
       handleWriteError(error);

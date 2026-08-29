@@ -360,6 +360,7 @@
     onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
     onEdit={handleEdit}
     onNewConnection={handleNewConnection}
+    onOpenLocal={() => void tabsStore.addLocalTab()}
     onPreview={(entry) => (previewEntry = entry)}
   />
 
@@ -653,7 +654,6 @@
   }
 
   .empty-action.secondary {
-    margin-left: 12px;
     background: transparent;
     color: var(--accent-primary);
   }

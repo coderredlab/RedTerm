@@ -538,7 +538,7 @@
   }
 
   .entry-mtime {
-    min-width: 96px;
+    min-width: 78px;
     text-align: right;
   }
 

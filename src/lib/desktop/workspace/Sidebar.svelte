@@ -17,6 +17,7 @@
     onWidthChange: (width: number) => void;
     onEdit: (connection: SavedConnection) => void;
     onNewConnection: () => void;
+    onOpenLocal: () => void;
     onPreview: (entry: { name: string; path: string; size: number }) => void;
   }
 
@@ -29,6 +30,7 @@
     onWidthChange,
     onEdit,
     onNewConnection,
+    onOpenLocal,
     onPreview,
   }: Props = $props();
 
@@ -135,6 +137,13 @@
     </div>
 
     {#if view === "connections"}
+      <button class="local-entry" onclick={onOpenLocal}>
+        <span class="local-entry-glyph" aria-hidden="true">&gt;_</span>
+        <span class="local-entry-text">
+          <span class="local-entry-name">Local Shell</span>
+          <span class="local-entry-sub">This machine</span>
+        </span>
+      </button>
       <ConnectionList onEdit={onEdit} onNewConnection={onNewConnection} />
     {:else}
       <FileExplorer kind={explorerKind} sessionId={activeSessionId} {onPreview} />
@@ -289,6 +298,58 @@
     min-height: 0;
     flex: 1;
     background: transparent;
+  }
+
+  .local-entry {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 8px 10px 4px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .local-entry:hover {
+    border-color: var(--accent-muted);
+    color: var(--text-primary);
+  }
+
+  .local-entry-glyph {
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--status-success);
+    border-radius: 4px;
+    color: var(--status-success);
+    font-size: 10px;
+    font-weight: 700;
+    flex: 0 0 auto;
+  }
+
+  .local-entry-text {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .local-entry-name {
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .local-entry-sub {
+    color: var(--text-muted);
+    font-size: 10px;
   }
 
   .panel-resizer {

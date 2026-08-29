@@ -179,13 +179,15 @@ export function formatBytes(bytes: number): string {
   return `${value >= 100 ? Math.round(value) : value.toFixed(1)} ${unit}`;
 }
 
+/** Compact format — long locale dates squeeze the file name column. */
 export function formatTimestamp(mtime: number): string {
   if (!mtime) return "";
-  return new Date(mtime * 1000).toLocaleString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  const date = new Date(mtime * 1000);
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const base = `${month}-${day} ${hours}:${minutes}`;
+  const year = date.getFullYear();
+  return year === new Date().getFullYear() ? base : `${year}-${base}`;
 }

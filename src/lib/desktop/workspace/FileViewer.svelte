@@ -140,6 +140,15 @@
     await loadInline(target, token);
   }
 
+  function decodeBase64ToBytes(base64: string): Uint8Array {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index++) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes;
+  }
+
   async function loadInline(target: PreviewEntry, token: number) {
     try {
       const content =
@@ -147,17 +156,21 @@
           ? await localReadFile(target.path)
           : await sftpReadFile(boundSessionId!, target.path);
       if (token !== loadToken) return;
-      const dataUrl = `data:text/plain;charset=utf-8;base64,${content.content_base64}`;
-      const response = await fetch(dataUrl);
-      const decoded = await response.text();
-      if (token !== loadToken) return;
-
+      // WKWebView's fetch() fails on data: URLs ("Load failed"), so decode
+      // manually and hand images a blob URL instead.
+      const bytes = decodeBase64ToBytes(content.content_base64);
+      if (fileKind === "image") {
+        mediaUrl = URL.createObjectURL(
+          new Blob([bytes], { type: mimeOf(target.name) })
+        );
+        loadState = "ready";
+        return;
+      }
+      const decoded = new TextDecoder().decode(bytes);
       if (fileKind === "markdown") {
         const parsed = await marked.parse(decoded);
         if (token !== loadToken) return;
         renderedMarkdown = DOMPurify.sanitize(parsed);
-      } else if (fileKind === "image") {
-        mediaUrl = `data:${mimeOf(target.name)};base64,${content.content_base64}`;
       } else {
         textContent = decoded;
       }
