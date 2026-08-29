@@ -10,17 +10,19 @@
   let { open, onClose }: Props = $props();
 
   const SHORTCUTS: Array<{ keys: string; action: string }> = [
-    { keys: "Ctrl/Cmd + T", action: "New connection" },
-    { keys: "Ctrl/Cmd + W", action: "Close pane" },
-    { keys: "Ctrl/Cmd + Shift + W", action: "Close tab" },
-    { keys: "Ctrl/Cmd + Tab", action: "Next tab" },
-    { keys: "Ctrl/Cmd + Shift + Tab", action: "Previous tab" },
+    { keys: "Ctrl/Cmd+T", action: "New connection" },
+    { keys: "Ctrl/Cmd+Shift+C", action: "Copy selection" },
+    { keys: "Cmd/Ctrl+V", action: "Paste (native)" },
+    { keys: "Ctrl/Cmd+W", action: "Close pane" },
+    { keys: "Ctrl/Cmd+Shift+W", action: "Close tab" },
+    { keys: "Ctrl/Cmd+Tab", action: "Next tab" },
+    { keys: "Ctrl/Cmd+Shift+Tab", action: "Previous tab" },
     { keys: "Ctrl + PageUp / PageDown", action: "Previous / next tab" },
-    { keys: "Ctrl/Cmd + 1…9", action: "Select tab by number" },
-    { keys: "Ctrl/Cmd + \\", action: "Split right" },
-    { keys: "Ctrl/Cmd + Shift + \\", action: "Split down" },
-    { keys: "Ctrl + Alt + Arrows", action: "Move pane focus" },
-    { keys: "Ctrl/Cmd + ,", action: "Settings" },
+    { keys: "Ctrl/Cmd+1…9", action: "Select tab by number" },
+    { keys: "Ctrl/Cmd+\\", action: "Split right" },
+    { keys: "Ctrl/Cmd+Shift+\\", action: "Split down" },
+    { keys: "Ctrl+Alt+Arrows", action: "Move pane focus" },
+    { keys: "Ctrl/Cmd+,", action: "Settings" },
   ];
 
   function stepFontSize(delta: number) {
