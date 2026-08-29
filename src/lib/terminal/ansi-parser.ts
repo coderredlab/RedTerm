@@ -307,6 +307,14 @@ export class AnsiParser {
     };
   }
 
+  private rowContentLength(row: Cell[]): number {
+    let last = 0;
+    for (let i = 0; i < row.length; i++) {
+      if (row[i].char !== ' ') last = i + 1;
+    }
+    return Math.max(1, last);
+  }
+
   resize(cols: number, rows: number) {
     if (cols === this.cols && rows === this.rows) return;
 
@@ -315,6 +323,7 @@ export class AnsiParser {
     const oldRows = this.rows;
     const oldCols = this.cols;
     const oldCursorY = this.cursorY;
+    const oldCursorX = this.cursorX;
     const oldScrollTop = this.scrollTop;
     const oldScrollBottom = this.scrollBottom;
     const canReflowMainScreen =
@@ -322,6 +331,7 @@ export class AnsiParser {
       oldScrollTop === 0 &&
       oldScrollBottom === oldRows - 1;
 
+    // --- Step 1: adjust the screen row count at the old column width ---
     let nextBufferRows = oldBuffer;
     let nextScrollback = oldScrollback;
     let nextCursorY = oldCursorY;
@@ -334,33 +344,94 @@ export class AnsiParser {
         nextBufferRows = oldBuffer.slice(trimmedCount);
         nextCursorY = Math.max(0, oldCursorY - trimmedCount);
       } else if (rows > oldRows) {
-        const pulledCount = Math.min(rows - oldRows, oldScrollback.length);
+        const pulledCount = Math.min(rows - oldRows, nextScrollback.length);
         const restoredRows =
-          pulledCount > 0 ? oldScrollback.slice(oldScrollback.length - pulledCount) : [];
+          pulledCount > 0 ? nextScrollback.slice(nextScrollback.length - pulledCount) : [];
         nextScrollback =
-          pulledCount > 0 ? oldScrollback.slice(0, oldScrollback.length - pulledCount) : oldScrollback;
+          pulledCount > 0 ? nextScrollback.slice(0, nextScrollback.length - pulledCount) : nextScrollback;
         nextBufferRows = restoredRows.concat(oldBuffer);
         nextCursorY = oldCursorY + pulledCount;
       }
     }
 
+    // --- Step 2: reflow columns ---
+    // Narrowing previously TRUNCATED each row (content past the new width
+    // was lost) which mangled prompts and duplicated redraws. Split every
+    // row into new-width chunks instead so no content is dropped.
+    let finalRows: Cell[][];
+    let finalCursorY = nextCursorY;
+    let finalCursorX = Math.min(oldCursorX, cols - 1);
+
+    if (canReflowMainScreen && cols < oldCols) {
+      const allRows: Cell[][] = [];
+      let cursorRowOffset = 0;
+      for (let y = 0; y < nextBufferRows.length; y++) {
+        const row = nextBufferRows[y];
+        const contentLength = this.rowContentLength(row);
+        const chunkCount = Math.max(1, Math.ceil(contentLength / cols));
+        for (let start = 0; start < contentLength; start += cols) {
+          allRows.push(row.slice(start, start + cols));
+        }
+        if (y < nextCursorY) {
+          cursorRowOffset += chunkCount;
+        }
+      }
+
+      // Map the cursor into the reflowed rows.
+      const cursorRow = nextBufferRows[nextCursorY];
+      if (cursorRow) {
+        const within = Math.min(
+          Math.floor(oldCursorX / cols),
+          Math.max(1, Math.ceil(this.rowContentLength(cursorRow) / cols)) - 1
+        );
+        finalCursorY = cursorRowOffset + within;
+        finalCursorX = oldCursorX % cols;
+      }
+
+      finalRows = allRows;
+    } else {
+      finalRows = nextBufferRows;
+      finalCursorY = nextCursorY;
+      finalCursorX = Math.min(oldCursorX, cols - 1);
+    }
+
     this.cols = cols;
     this.rows = rows;
-    this.scrollback = nextScrollback;
-    this.buffer = this.createBuffer();
 
-    // Preserve existing content. On normal main-screen resizes, keep the latest lines visible
-    // so viewport height changes from the mobile keyboard do not drop recent output.
-    const copyRows = Math.min(nextBufferRows.length, rows);
-    const copyCols = Math.min(oldCols, cols);
-    for (let y = 0; y < copyRows; y++) {
-      for (let x = 0; x < copyCols; x++) {
-        this.buffer[y][x] = nextBufferRows[y][x];
+    // --- Step 3: fit the reflowed screen into the viewport ---
+    // The cursor must stay visible: trailing rows below the cursor are
+    // dropped, and rows above the cursor overflow into scrollback.
+    if (finalRows.length > rows) {
+      finalRows = finalRows.slice(0, Math.min(finalRows.length, finalCursorY + 1));
+      const overflowCount = Math.max(0, finalRows.length - rows);
+      if (overflowCount > 0) {
+        nextScrollback = nextScrollback
+          .concat(finalRows.slice(0, overflowCount))
+          .slice(-this.maxScrollback);
+        finalRows = finalRows.slice(overflowCount);
+        finalCursorY -= overflowCount;
+      }
+    } else if (finalRows.length < rows) {
+      // The screen grows downward: blank rows are added below the content.
+      while (finalRows.length < rows) {
+        finalRows.push([]);
       }
     }
 
-    this.cursorX = Math.min(this.cursorX, cols - 1);
-    this.cursorY = Math.min(nextCursorY, rows - 1);
+    this.scrollback = nextScrollback;
+    this.buffer = this.createBuffer();
+
+    // Preserve existing content.
+    const copyRows = Math.min(finalRows.length, rows);
+    for (let y = 0; y < copyRows; y++) {
+      const source = finalRows[y];
+      for (let x = 0; x < source.length && x < cols; x++) {
+        this.buffer[y][x] = source[x];
+      }
+    }
+
+    this.cursorX = Math.min(finalCursorX, cols - 1);
+    this.cursorY = Math.min(finalCursorY, rows - 1);
 
     this.scrollTop = 0;
     this.scrollBottom = this.rows - 1;

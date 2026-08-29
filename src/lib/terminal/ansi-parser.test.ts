@@ -782,6 +782,18 @@ describe("AnsiParser resize", () => {
     ]);
     expect(parser.getCursor()).toEqual({ x: 5, y: 4 });
   });
+
+  test("reflows long rows instead of truncating when narrowing", () => {
+    const parser = new AnsiParser(20, 6);
+    parser.write("0123456789ABCDEFGHIJKL");
+
+    parser.resize(10, 6);
+
+    expect(visibleRowText(parser, 0)).toBe("0123456789");
+    expect(visibleRowText(parser, 1)).toBe("ABCDEFGHIJ");
+    expect(visibleRowText(parser, 2)).toBe("KL");
+    expect(parser.getCursor()).toEqual({ x: 2, y: 2 });
+  });
 });
 
 describe("AnsiParser erase in display", () => {
