@@ -1859,11 +1859,13 @@
     let attached = false;
     if (kind === "local" && existingSessionId) {
       // A moved local shell is still running in the backend; re-subscribe to
-      // its event stream instead of spawning a second shell.
+      // its event stream instead of spawning a second shell, and resync the
+      // PTY size to the new pane geometry.
       sessionId = existingSessionId;
       connected = true;
       statusMessage = "";
       await bindLocalSessionListener(existingSessionId);
+      localShellResize(existingSessionId, cols, rows);
       onConnected?.(existingSessionId);
       attached = true;
     } else if (existingSessionId) {
@@ -2569,6 +2571,14 @@
         () => {}
       );
     }
+  }
+
+  /// Re-measure the container and push the current geometry to the PTY.
+  /// Called after pane moves/splits, where the container may have settled
+  /// after the initial attach.
+  export function syncSize() {
+    calculateSize();
+    resizeSessionRemote();
   }
 
   export function blur() {

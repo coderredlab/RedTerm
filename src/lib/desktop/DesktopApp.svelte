@@ -264,6 +264,10 @@
     }
     await tick();
     await tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
+    // The moved panes remounted at the target geometry — resync PTY sizes.
+    for (const pane of tabsStore.getTab(targetTabId)?.panes ?? []) {
+      terminals.get(pane.id)?.syncSize();
+    }
   }
 
   async function handlePaneDrop(tabId: string, paneId: string) {
@@ -288,6 +292,7 @@
     terminals.get(paneId)?.storeSnapshot();
     await tick();
     await tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side);
+    terminals.get(paneId)?.syncSize();
   }
 
   const workspaceApi: WorkspaceApi = {
