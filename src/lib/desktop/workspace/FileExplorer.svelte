@@ -263,7 +263,7 @@
     {:else if errorMessage}
       <div class="explorer-status explorer-error">{errorMessage}</div>
     {:else if entries !== null}
-      {#if path !== "/"}
+      {#if !isRootPath(path) && !atLocalHome}
         <button
           class="entry dir"
           onclick={() => void navigate(parentPath(path))}
@@ -276,6 +276,7 @@
         <div class="entry" class:dir={entry.is_dir}>
           <button
             class="entry-main"
+            aria-label={entry.name}
             onclick={() =>
               entry.is_dir
                 ? void navigate(joinPath(path, entry.name))
@@ -488,7 +489,7 @@
     cursor: pointer;
     transition: background-color 120ms ease;
     content-visibility: auto;
-    contain-intrinsic-size: auto 26px;
+    contain-intrinsic-size: auto 22px;
   }
 
   .entry-main {

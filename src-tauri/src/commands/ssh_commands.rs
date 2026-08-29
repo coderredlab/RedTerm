@@ -941,11 +941,13 @@ pub(crate) fn make_download_progress_emitter(
     let last_emitted = std::sync::Mutex::new(0_u64);
     move |transferred: u64| {
         let should_emit = {
-            let mut last = last_emitted.lock().unwrap();
-            if transferred >= *last + (1 << 20) {
-                *last = transferred;
-                true
-            } else if total.is_some_and(|size| transferred >= size) {
+            let mut last = last_emitted.lock().unwrap_or_else(|p| p.into_inner());
+            let crossed_mib = transferred >= *last + (1 << 20);
+            let reached_total = total.is_some_and(|size| transferred >= size);
+            // Unknown total (stat failed): still emit on advancement so the
+            // bar keeps moving.
+            let advanced = total.is_none() && transferred > *last;
+            if crossed_mib || reached_total || advanced {
                 *last = transferred;
                 true
             } else {
@@ -1237,7 +1239,6 @@ pub async fn sftp_download_to_dir(
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
     let safe_name = sanitize_file_name(file_name);
-
     let destination = claim_download_destination(&downloads_dir, &safe_name)?;
     if !destination.starts_with(&downloads_dir) {
         return Err("Invalid download destination path".to_string());

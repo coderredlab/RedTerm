@@ -12,9 +12,9 @@
 
   const statusLabel: Record<VoiceInputStatus, string> = {
     idle: "Idle",
-    preparing: "Preparing...",
-    listening: "Listening...",
-    partial: "Listening...",
+    preparing: "Preparing…",
+    listening: "Listening…",
+    partial: "Listening…",
     final: "Recognized",
     error: "Error",
   };

@@ -404,11 +404,11 @@
               <label for="keyFile">SSH Key File</label>
               <input type="file" id="keyFile" class="sr-only-file-input" onchange={handleKeyFileChange} />
               <label for="keyFile" class="file-picker-button" aria-busy={keyUploading}>
-                {keyUploading ? "Uploading key..." : selectedKeyName ? "Choose another key" : "Choose private key"}
+                {keyUploading ? "Uploading key…" : selectedKeyName ? "Choose another key" : "Choose private key"}
               </label>
               <div class="key-help">
                 {#if keyUploading}
-                  <span>Uploading key file...</span>
+                  <span>Uploading key file…</span>
                 {:else if selectedKeyName}
                   <span>Selected: {selectedKeyName}</span>
                 {:else}
@@ -680,7 +680,10 @@
     color: var(--text-secondary);
     cursor: pointer;
     font-size: 13px;
-    transition: all 0.15s;
+    transition:
+      background-color 0.15s,
+      border-color 0.15s,
+      color 0.15s;
   }
 
   .auth-tab:first-child {

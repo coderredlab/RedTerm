@@ -22,9 +22,11 @@ pub struct LocalShellManager {
 
 struct LocalShell {
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
 }
+
+const MAX_CONCURRENT_LOCAL_SHELLS: usize = 16;
 
 impl LocalShellManager {
     pub fn new() -> Self {
@@ -41,6 +43,16 @@ pub async fn local_shell_start(
     cols: u16,
     rows: u16,
 ) -> Result<String, String> {
+    {
+        let shells = manager.shells.read().await;
+        if shells.len() >= MAX_CONCURRENT_LOCAL_SHELLS {
+            return Err(format!(
+                "Too many local shells open (limit {})",
+                MAX_CONCURRENT_LOCAL_SHELLS
+            ));
+        }
+    }
+
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -78,7 +90,7 @@ pub async fn local_shell_start(
         session_id.clone(),
         LocalShell {
             master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
+            writer: Arc::new(Mutex::new(writer)),
             child: Mutex::new(child),
         },
     );
@@ -117,18 +129,27 @@ pub async fn local_shell_write(
     session_id: String,
     data: Vec<u8>,
 ) -> Result<(), String> {
-    let shells = manager.shells.read().await;
-    let shell = shells
-        .get(&session_id)
-        .ok_or_else(|| "Local shell not found".to_string())?;
-    let mut writer = shell
-        .writer
-        .lock()
-        .map_err(|_| "Local shell writer is unavailable".to_string())?;
-    writer
-        .write_all(&data)
-        .and_then(|_| writer.flush())
-        .map_err(|e| format!("Failed to write to local shell: {}", e))
+    // Clone the writer handle so the (potentially blocking) PTY write runs
+    // off the async worker via spawn_blocking.
+    let writer = {
+        let shells = manager.shells.read().await;
+        let shell = shells
+            .get(&session_id)
+            .ok_or_else(|| "Local shell not found".to_string())?;
+        Arc::clone(&shell.writer)
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let mut writer = writer
+            .lock()
+            .map_err(|_| "Local shell writer is unavailable".to_string())?;
+        writer
+            .write_all(&data)
+            .and_then(|_| writer.flush())
+            .map_err(|e| format!("Failed to write to local shell: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Local shell write task failed: {}", e))?
 }
 
 #[tauri::command]
@@ -161,8 +182,13 @@ pub async fn local_shell_disconnect(
     manager: State<'_, Arc<LocalShellManager>>,
     session_id: String,
 ) -> Result<(), String> {
-    let mut shells = manager.shells.write().await;
-    if let Some(shell) = shells.remove(&session_id) {
+    // Remove outside any guard scope so kill/wait (which can block) never
+    // stalls other local shell commands.
+    let shell = {
+        let mut shells = manager.shells.write().await;
+        shells.remove(&session_id)
+    };
+    if let Some(shell) = shell {
         if let Ok(mut child) = shell.child.lock() {
             let _ = child.kill();
             let _ = child.wait();
@@ -201,6 +227,14 @@ fn ensure_within_home(path: &Path) -> Result<std::path::PathBuf, String> {
     let canonical_home = std::fs::canonicalize(&home)
         .map(|path| std::path::PathBuf::from(normalize_local_path_text(&path.to_string_lossy())))
         .unwrap_or_else(|_| home.clone());
+    // `..` components would defeat the textual prefix check when
+    // canonicalize fails (nonexistent path), so reject them outright.
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err("Path is outside the home directory".to_string());
+    }
     let canonical = std::fs::canonicalize(path)
         .map(|path| std::path::PathBuf::from(normalize_local_path_text(&path.to_string_lossy())))
         .unwrap_or_else(|_| path.to_path_buf());

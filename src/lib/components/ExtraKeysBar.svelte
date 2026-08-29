@@ -147,7 +147,7 @@
     }
 
     imageUploadBusy = true;
-    showStatus("Uploading image...");
+    showStatus("Uploading image…");
 
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());

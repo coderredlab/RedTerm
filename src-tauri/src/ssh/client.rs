@@ -507,6 +507,11 @@ impl SshConnection {
             .flush()
             .await
             .map_err(|e| SshError::SessionError(e.to_string()))?;
+        // Always report the final position so progress bars can complete
+        // even when the advertised size was missing.
+        if let Some(on_progress) = on_progress {
+            on_progress(total.min(total_size.unwrap_or(total)));
+        }
 
         Ok(total)
     }

@@ -24,6 +24,7 @@
       },
       "csp": {
         "default-src": "'self' customprotocol: asset:",
+        "script-src": "'self'",
         "connect-src": "ipc: http://ipc.localhost",
         "font-src": "'self' asset: http://asset.localhost",
         "img-src": "'self' asset: http://asset.localhost blob: data:",

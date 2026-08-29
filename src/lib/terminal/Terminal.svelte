@@ -1705,6 +1705,7 @@
     sessionId = null;
     lastProcessedSeq = 0;
     resetParser();
+    clearAutomaticResponses();
 
     try {
       const reconnected = await connectNewSession(false);
@@ -2339,6 +2340,9 @@
       automaticResponseWindowStartedAt = now;
       automaticResponseCount = 0;
     }
+    // Identical consecutive replies are coalesced and must not consume the
+    // flood budget (prompt themes legitimately re-ask the same query).
+    if (automaticResponseQueue.at(-1) === data) return;
     automaticResponseCount++;
     if (automaticResponseCount > MAX_AUTOMATIC_RESPONSES_PER_SECOND) {
       stopForAutomaticResponseFlood();
@@ -2351,7 +2355,6 @@
       stopForAutomaticResponseFlood();
       return;
     }
-    if (automaticResponseQueue.at(-1) === data) return;
     automaticResponseQueue.push(data);
     automaticResponseBytes += data.length;
     void drainAutomaticResponses();
