@@ -18,6 +18,10 @@
       }
     ],
     "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPCACHE/sftp-preview/**"]
+      },
       "csp": {
         "default-src": "'self' customprotocol: asset:",
         "connect-src": "ipc: http://ipc.localhost",
