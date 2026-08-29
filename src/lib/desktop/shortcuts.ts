@@ -10,6 +10,7 @@ export interface DesktopShortcutHandlers {
   moveFocus(direction: "left" | "right" | "up" | "down"): void;
   openSettings(): void;
   copySelection(): void;
+  pasteFromClipboard(): void;
 }
 
 const IS_MAC =
@@ -56,7 +57,15 @@ export function handleDesktopShortcuts(
     return true;
   }
 
-  if (mod && !alt && (key === "t" || key === "T")) {
+  // Paste: the Shift variant keeps plain Ctrl/Cmd+V for the shell.
+  if (mod && shift && (key === "v" || key === "V")) {
+    handlers.pasteFromClipboard();
+    return true;
+  }
+
+  // New connection: the Shift-less Ctrl/Cmd+T stays with the shell, so the
+  // app shortcut uses the Shift variant there.
+  if (mod && !shift && !alt && (key === "t" || key === "T")) {
     handlers.newConnection();
     return true;
   }

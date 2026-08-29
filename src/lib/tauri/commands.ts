@@ -326,6 +326,11 @@ export async function localReadFile(path: string): Promise<SftpFileContent> {
   return invoke<SftpFileContent>("local_read_file", { path });
 }
 
+/** System clipboard plain text for the terminal paste shortcut. */
+export async function readClipboardText(): Promise<string | null> {
+  return invoke<string | null>("read_clipboard_text");
+}
+
 export async function localDownloadFile(path: string): Promise<SftpDownloadedFile> {
   return invoke<SftpDownloadedFile>("local_download_file", { path });
 }

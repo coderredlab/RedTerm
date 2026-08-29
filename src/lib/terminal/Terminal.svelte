@@ -2578,6 +2578,11 @@
     focusInput();
   }
 
+  /// Paste clipboard text into the PTY (keyboard paste shortcut path).
+  export function pasteText(text: string) {
+    if (text) sendPastedText(text);
+  }
+
   /// Persist the current screen so a caller moving this terminal between
   /// containers can restore it exactly after the remount.
   export function storeSnapshot() {
@@ -2648,7 +2653,7 @@
     </div>
   {/if}
 
-  {#if showSelectionToolbar || selectionFeedback}
+  {#if !isDesktopTarget && (showSelectionToolbar || selectionFeedback)}
     <div class="selection-toolbar">
       {#if showSelectionToolbar}
         <button class="selection-action-btn secondary" onclick={(e) => { swallowPointerClick(e); cancelSelection(); }}>

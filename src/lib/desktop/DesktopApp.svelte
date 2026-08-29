@@ -9,6 +9,7 @@
   } from "$lib/session/reconcile";
   import Terminal from "$lib/terminal/Terminal.svelte";
   import { handleDesktopShortcuts } from "./shortcuts";
+  import { readClipboardText } from "$lib/tauri/commands";
   import Sidebar from "./workspace/Sidebar.svelte";
   import PaneView from "./workspace/PaneView.svelte";
   import TabStrip from "./workspace/TabStrip.svelte";
@@ -334,6 +335,21 @@
     }
   }
 
+  async function pasteFromClipboardToActivePane() {
+    const tab = tabsStore.activeTab;
+    const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
+    const terminal = paneId ? terminals.get(paneId) : null;
+    if (!terminal) return;
+    try {
+      const text = await readClipboardText();
+      if (text) {
+        terminal.pasteText(text);
+      }
+    } catch (error) {
+      console.error("[Terminal] paste failed:", error);
+    }
+  }
+
   function onKeydownCapture(event: KeyboardEvent) {
     const terminalTarget =
       event.target instanceof Element &&
@@ -351,6 +367,7 @@
         splitDown: () => splitActivePane("col"),
         moveFocus,
         copySelection: copyActiveSelection,
+        pasteFromClipboard: () => void pasteFromClipboardToActivePane(),
         openSettings: () => {
           settingsOpen = true;
         },

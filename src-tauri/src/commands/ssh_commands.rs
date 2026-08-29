@@ -1127,6 +1127,19 @@ pub async fn sftp_download_file(
     })
 }
 
+/// Read plain text from the system clipboard (terminal paste shortcut).
+#[tauri::command]
+pub async fn read_clipboard_text() -> Result<Option<String>, String> {
+    use arboard::Clipboard;
+
+    let mut clipboard =
+        Clipboard::new().map_err(|e| format!("Failed to open clipboard: {}", e))?;
+    clipboard
+        .get_text()
+        .map(Some)
+        .map_err(|e| format!("Failed to read clipboard: {}", e))
+}
+
 #[tauri::command]
 pub async fn sftp_home_dir(
     session_manager: State<'_, Arc<SessionManager>>,

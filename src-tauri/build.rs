@@ -23,6 +23,7 @@ fn main() {
             "sftp_download_file",
             "sftp_download_to_dir",
             "sftp_home_dir",
+            "read_clipboard_text",
             "local_shell_start",
             "local_shell_write",
             "local_shell_resize",
