@@ -1,0 +1,202 @@
+#!/usr/bin/env bun
+
+import { join } from "node:path";
+
+const realHdiutil = "/usr/bin/hdiutil";
+const arguments_ = Bun.argv.slice(2);
+const projectRoot = process.env.REDTERM_PROJECT_ROOT;
+
+interface CommandResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+}
+
+interface Position {
+  x: number;
+  y: number;
+}
+
+interface DmgConfig {
+  background?: string;
+  windowPosition?: Position;
+  windowSize?: { width: number; height: number };
+  appPosition?: Position;
+  applicationFolderPosition?: Position;
+}
+
+interface TauriConfig {
+  productName?: string;
+  bundle?: {
+    macOS?: {
+      dmg?: DmgConfig;
+    };
+  };
+}
+
+interface DSStoreCore {
+  push(entry: unknown): void;
+  write(path: string, callback: (error?: Error) => void): void;
+}
+
+interface EntryFactory {
+  new (
+    filename: string,
+    structureId: string,
+    dataType: string,
+    blob: Buffer
+  ): unknown;
+  construct(filename: string, structureId: string, options: object): unknown;
+}
+
+interface BplistCreator {
+  (value: object): Buffer;
+  Real: new (value: number) => unknown;
+}
+
+async function capture(command: string[]): Promise<CommandResult> {
+  const child = Bun.spawn(command, {
+    stdin: "inherit",
+    stdout: "pipe",
+    stderr: "pipe"
+  });
+  const stdout = new Response(child.stdout).text();
+  const stderr = new Response(child.stderr).text();
+
+  return {
+    exitCode: await child.exited,
+    stdout: await stdout,
+    stderr: await stderr
+  };
+}
+
+async function findMountPoint(device: string): Promise<string> {
+  const disk = device.match(/^\/dev\/(disk\d+)/)?.[1];
+  if (!disk) {
+    throw new Error(`Invalid disk image device: ${device}`);
+  }
+
+  const info = await capture([realHdiutil, "info"]);
+  if (info.exitCode !== 0) {
+    throw new Error(info.stderr.trim() || "Unable to inspect mounted disk images");
+  }
+
+  const mountLine = info.stdout
+    .split("\n")
+    .find((line) => line.startsWith(`/dev/${disk}s`) && line.includes("/Volumes/"));
+  const mountPoint = mountLine?.match(/(\/Volumes\/.*)$/)?.[1]?.trim();
+  if (!mountPoint) {
+    throw new Error(`Unable to find the mount point for ${device}`);
+  }
+
+  return mountPoint;
+}
+
+function createIconViewEntry(iconSize: number, textSize: number): unknown {
+  const Entry = require("ds-store/lib/entry") as EntryFactory;
+  const bplist = require("bplist-creator") as BplistCreator;
+  const plist = bplist({
+    backgroundType: 1,
+    backgroundColorRed: new bplist.Real(1),
+    backgroundColorGreen: new bplist.Real(1),
+    backgroundColorBlue: new bplist.Real(1),
+    showIconPreview: true,
+    showItemInfo: false,
+    textSize: new bplist.Real(textSize),
+    iconSize: new bplist.Real(iconSize),
+    viewOptionsVersion: 1,
+    gridSpacing: new bplist.Real(100),
+    gridOffsetX: new bplist.Real(0),
+    gridOffsetY: new bplist.Real(0),
+    labelOnBottom: true,
+    arrangeBy: "none"
+  });
+  const blob = Buffer.alloc(plist.length + 4);
+  blob.writeUInt32BE(plist.length, 0);
+  plist.copy(blob, 4);
+
+  return new Entry(".", "icvp", "blob", blob);
+}
+
+async function writeDmgLayout(device: string): Promise<void> {
+  if (!projectRoot) {
+    return;
+  }
+
+  const [baseConfig, desktopConfig] = await Promise.all([
+    Bun.file(join(projectRoot, "src-tauri/tauri.conf.json")).json() as Promise<TauriConfig>,
+    Bun.file(join(projectRoot, "src-tauri/tauri.desktop.conf.json")).json() as Promise<TauriConfig>
+  ]);
+  const dmg: DmgConfig = {
+    ...baseConfig.bundle?.macOS?.dmg,
+    ...desktopConfig.bundle?.macOS?.dmg
+  };
+  const productName = desktopConfig.productName ?? baseConfig.productName;
+  if (!productName) {
+    throw new Error("Tauri productName is required to create the DMG layout");
+  }
+  if (dmg.background) {
+    throw new Error("Custom DMG backgrounds are not supported by the direct layout writer");
+  }
+
+  const mountPoint = await findMountPoint(device);
+  const windowPosition = dmg.windowPosition ?? { x: 10, y: 60 };
+  const windowSize = dmg.windowSize ?? { width: 660, height: 400 };
+  const appPosition = dmg.appPosition ?? { x: 180, y: 170 };
+  const applicationPosition = dmg.applicationFolderPosition ?? { x: 480, y: 170 };
+  const appName = `${productName}.app`;
+  const Entry = require("ds-store/lib/entry") as EntryFactory;
+  const DSStore = require("ds-store/lib/ds-store") as new () => DSStoreCore;
+  const store = new DSStore();
+
+  store.push(Entry.construct(appName, "Iloc", appPosition));
+  store.push(Entry.construct("Applications", "Iloc", applicationPosition));
+  store.push(
+    Entry.construct(".", "bwsp", {
+      x: windowPosition.x,
+      y: windowPosition.y,
+      width: windowSize.width,
+      height: windowSize.height + 22
+    })
+  );
+  store.push(createIconViewEntry(128, 16));
+
+  await new Promise<void>((resolve, reject) => {
+    store.write(join(mountPoint, ".DS_Store"), (error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
+let layoutError: unknown;
+const device = arguments_.find((argument) => /^\/dev\/disk\d+$/.test(argument));
+
+if (arguments_[0] === "detach" && device) {
+  try {
+    await writeDmgLayout(device);
+  } catch (error) {
+    layoutError = error;
+  }
+}
+
+const command = Bun.spawn([realHdiutil, ...arguments_], {
+  stdin: "inherit",
+  stdout: "inherit",
+  stderr: "inherit"
+});
+const exitCode = await command.exited;
+
+if (layoutError) {
+  console.error(
+    `Failed to write the DMG Finder layout: ${
+      layoutError instanceof Error ? layoutError.message : String(layoutError)
+    }`
+  );
+  process.exit(1);
+}
+
+process.exit(exitCode);

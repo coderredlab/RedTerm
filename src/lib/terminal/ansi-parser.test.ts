@@ -794,6 +794,22 @@ describe("AnsiParser resize", () => {
     expect(visibleRowText(parser, 2)).toBe("KL");
     expect(parser.getCursor()).toEqual({ x: 2, y: 2 });
   });
+
+  test("does not create persistent scrollback while alternate screen resizes", () => {
+    const parser = new AnsiParser(20, 6);
+    parser.write("\x1b[?1049h\x1b[6;1Hstatus");
+
+    parser.resize(20, 3);
+
+    expect(parser.isAlternateScreen()).toBe(true);
+    expect(parser.getScrollbackLength()).toBe(0);
+    expect(parser.getFullBuffer()).toHaveLength(3);
+
+    parser.resize(20, 6);
+
+    expect(parser.getScrollbackLength()).toBe(0);
+    expect(parser.getFullBuffer()).toHaveLength(6);
+  });
 });
 
 describe("AnsiParser erase in display", () => {
@@ -895,6 +911,28 @@ describe("AnsiParser CSI work limits", () => {
 
     restored.write("\x1b[?2004l");
     expect(restored.isBracketedPasteMode()).toBe(false);
+  });
+
+  test("tracks mouse motion modes and preserves them across snapshots", () => {
+    const parser = new AnsiParser(40, 2);
+    parser.write("\x1b[?1002h\x1b[?1006h");
+
+    expect(parser.isMouseEnabled()).toBe(true);
+    expect(parser.shouldReportMouseMotion(false)).toBe(false);
+    expect(parser.shouldReportMouseMotion(true)).toBe(true);
+    expect(parser.isSgrMouseEncoding()).toBe(true);
+
+    const restored = new AnsiParser(40, 2);
+    restored.restoreSnapshot(parser.createSnapshot());
+    expect(restored.isMouseEnabled()).toBe(true);
+    expect(restored.shouldReportMouseMotion(true)).toBe(true);
+    expect(restored.isSgrMouseEncoding()).toBe(true);
+
+    restored.write("\x1b[?1003h");
+    expect(restored.shouldReportMouseMotion(false)).toBe(true);
+    restored.write("\x1b[?1003l\x1b[?1006l");
+    expect(restored.isMouseEnabled()).toBe(false);
+    expect(restored.isSgrMouseEncoding()).toBe(false);
   });
 
 });

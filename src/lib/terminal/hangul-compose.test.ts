@@ -19,6 +19,29 @@ describe("HangulComposer", () => {
     expect(netText(["안", "녕", "하", "세", "요"])).toBe("안녕하세요");
   });
 
+  test("same-initial composed syllables stay distinct", () => {
+    expect(netText(["메", "모", "리"])).toBe("메모리");
+  });
+
+  test("jamo deltas preserve syllable boundaries", () => {
+    expect(netText(["ㅁ", "ㅔ", "ㅁ", "ㅗ", "ㄹ", "ㅣ"])).toBe("메모리");
+    expect(netText(["ㄴ", "ㅡ", "ㄴ"])).toBe("는");
+    expect(netText(["ㄹ", "ㅡ", "ㄹ"])).toBe("를");
+    expect(netText(["ㅇ", "ㅣ", "ㅂ", "ㄹ", "ㅕ", "ㄱ", "ㄱ", "ㅣ", "ㄱ", "ㅏ"])).toBe(
+      "입력기가"
+    );
+  });
+
+  test("tense consonants move whole into the next syllable", () => {
+    expect(netText(["ㅂ", "ㅏ", "ㄲ", "ㅝ", "ㄷ", "ㅗ"])).toBe("바꿔도");
+    expect(netText(["ㅇ", "ㅏ", "ㅆ", "ㅏ"])).toBe("아싸");
+  });
+
+  test("direct tense consonants remain final when no vowel follows", () => {
+    expect(netText(["ㅂ", "ㅏ", "ㄲ"])).toBe("밖");
+    expect(netText(["ㅇ", "ㅣ", "ㅆ"])).toBe("있");
+  });
+
   test("jamo delta mode reassembles syllables with corrections", () => {
     // Each keystroke is committed individually: ㅎ ㅏ ㄴ ㄱ ㅡ ㄹ
     expect(netText(["ㅎ", "ㅏ", "ㄴ", "ㄱ", "ㅡ", "ㄹ"])).toBe("한글");

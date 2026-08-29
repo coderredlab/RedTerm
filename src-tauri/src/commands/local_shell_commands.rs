@@ -15,6 +15,7 @@ use crate::ssh::SftpDirEntry;
 
 const MAX_LOCAL_PREVIEW_READ_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_LOCAL_LIST_ENTRIES: usize = 10_000;
+const LOCAL_SHELL_TERM: &str = "xterm-256color";
 
 pub struct LocalShellManager {
     shells: RwLock<HashMap<String, LocalShell>>,
@@ -68,9 +69,7 @@ pub async fn local_shell_start(
     // Uses the user's default login shell ($SHELL / passwd entry, PowerShell
     // on Windows) with a working directory at the user's home.
     let mut command = CommandBuilder::new_default_prog();
-    if let Some(home) = local_home_dir_path() {
-        command.cwd(home);
-    }
+    configure_local_shell_command(&mut command);
 
     let child = pair
         .slave
@@ -139,6 +138,13 @@ fn local_home_dir_path() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)
+}
+
+fn configure_local_shell_command(command: &mut CommandBuilder) {
+    command.env("TERM", LOCAL_SHELL_TERM);
+    if let Some(home) = local_home_dir_path() {
+        command.cwd(home);
+    }
 }
 
 #[tauri::command]
@@ -502,4 +508,37 @@ pub async fn local_download_to_dir(
     let scoped_label = path.clone();
 
     local_download(&app, scoped, destination, scoped_label, u64::MAX).await
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_shell_sets_supported_terminal_type() {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open test PTY");
+        let mut command = CommandBuilder::new("/usr/bin/env");
+        configure_local_shell_command(&mut command);
+        let mut reader = pair.master.try_clone_reader().expect("attach test reader");
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn test command");
+        drop(pair.slave);
+
+        let mut output = String::new();
+        reader.read_to_string(&mut output).expect("read test output");
+        child.wait().expect("wait for test command");
+
+        assert!(output
+            .lines()
+            .any(|line| line.trim_end() == "TERM=xterm-256color"));
+    }
 }

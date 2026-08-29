@@ -37,6 +37,7 @@
   import { findUrlAtCell, validateTerminalUrl, type SafeTerminalUrl } from "./terminal-links";
   import { extractTerminalSelection } from "./terminal-selection";
   import { formatTerminalPaste } from "./terminal-paste";
+  import { encodeTerminalMouseEvent } from "./terminal-mouse";
   import { SshOutputDecoder } from "./ssh-output-decoder";
   import { cleanupFailedSessionAttach } from "./session-attach-cleanup";
   import { composeJamoSequence, HangulComposer } from "./hangul-compose";
@@ -201,6 +202,8 @@
   let touchPointerMoved = false;
   let longPressTriggered = false;
   let terminalMousePointerId: number | null = null;
+  let lastTerminalMouseCell: { row: number; col: number } | null = null;
+  let desktopWheelRows = 0;
   let pendingMouseClick: {
     pointerId: number;
     startX: number;
@@ -301,7 +304,7 @@
     );
   }
 
-  function pointerToCell(e: PointerEvent): { row: number; col: number } {
+  function pointerToCell(e: { clientX: number; clientY: number }): { row: number; col: number } {
     if (!scrollContainer) return { row: 0, col: 0 };
     const rect = scrollContainer.getBoundingClientRect();
     const x = e.clientX - rect.left - TERMINAL_HORIZONTAL_PADDING_PX;
@@ -454,20 +457,30 @@
 
   function sendMouseButton(button: number, point: { row: number; col: number }, pressed: boolean) {
     if (!sessionId || !parser) return;
+    sendSessionData(
+      encodeTerminalMouseEvent({
+        action: pressed ? "press" : "release",
+        button,
+        col: point.col,
+        row: point.row,
+        sgr: parser.isSgrMouseEncoding(),
+      }),
+      true,
+    );
+  }
 
-    const col = point.col + 1;
-    const row = point.row + 1;
-
-    if (parser.isSgrMouseEncoding()) {
-      const code = pressed ? button : 3;
-      const suffix = pressed ? 'M' : 'm';
-      sendSessionData(encoder.encode(`\x1b[<${code};${col};${row}${suffix}`), true);
-      return;
-    }
-
-    const code = pressed ? button : 3;
-    const payload = `\x1b[M${String.fromCharCode(32 + code, 32 + col, 32 + row)}`;
-    sendSessionData(encoder.encode(payload), true);
+  function sendMouseMotion(button: number, point: { row: number; col: number }) {
+    if (!sessionId || !parser) return;
+    sendSessionData(
+      encodeTerminalMouseEvent({
+        action: "move",
+        button,
+        col: point.col,
+        row: point.row,
+        sgr: parser.isSgrMouseEncoding(),
+      }),
+      true,
+    );
   }
 
   function beginSelectionAt(e: PointerEvent) {
@@ -1233,20 +1246,39 @@
   }
 
   function sendMouseWheel(up: boolean, lines: number, point: { row: number; col: number }) {
-    if (!sessionId || !parser) return;
-    const button = up ? 64 : 65; // 64=wheel up, 65=wheel down
-    const col = point.col + 1;
-    const row = point.row + 1;
-    const enc = parser.isSgrMouseEncoding();
-    const data: string[] = [];
-    for (let i = 0; i < lines; i++) {
-      if (enc) {
-        data.push(`\x1b[<${button};${col};${row}M`);
-      } else {
-        data.push(`\x1b[M${String.fromCharCode(32 + button, 32 + col, 32 + row)}`);
-      }
+    if (!sessionId || !parser || lines <= 0) return;
+    sendSessionData(
+      encodeTerminalMouseEvent({
+        action: "press",
+        button: up ? 64 : 65,
+        col: point.col,
+        row: point.row,
+        sgr: parser.isSgrMouseEncoding(),
+        repeat: lines,
+      }),
+      true,
+    );
+  }
+
+  function handleTerminalWheel(e: WheelEvent) {
+    if (!shouldForwardTerminalMouseEvents() || e.deltaY === 0) return;
+    e.preventDefault();
+
+    const deltaRows =
+      e.deltaMode === 1
+        ? e.deltaY
+        : e.deltaMode === 2
+          ? e.deltaY * rows
+          : e.deltaY / Math.max(1, charHeight);
+    if (desktopWheelRows !== 0 && Math.sign(desktopWheelRows) !== Math.sign(deltaRows)) {
+      desktopWheelRows = 0;
     }
-    sendSessionData(encoder.encode(data.join('')), true);
+    desktopWheelRows = Math.max(-rows, Math.min(rows, desktopWheelRows + deltaRows));
+
+    const signedLines = Math.trunc(desktopWheelRows);
+    if (signedLines === 0) return;
+    sendMouseWheel(signedLines < 0, Math.abs(signedLines), pointerToCell(e));
+    desktopWheelRows -= signedLines;
   }
 
   function handleTouchStart(e: TouchEvent) {
@@ -1966,10 +1998,12 @@
         e.preventDefault();
         suppressNextFocus = true;
         terminalMousePointerId = e.pointerId;
+        const point = pointerToCell(e);
+        lastTerminalMouseCell = point;
         if (scrollContainer && !scrollContainer.hasPointerCapture(e.pointerId)) {
           scrollContainer.setPointerCapture(e.pointerId);
         }
-        sendMouseButton(0, pointerToCell(e), true);
+        sendMouseButton(0, point, true);
         return;
       }
 
@@ -2015,6 +2049,24 @@
 
 
   function handleScreenPointerMove(e: PointerEvent) {
+    if (e.pointerType === "mouse") {
+      const buttonPressed = terminalMousePointerId === e.pointerId;
+      const reportsHover = parser?.shouldReportMouseMotion(false) ?? false;
+      if ((buttonPressed || shouldForwardTerminalMouseEvents()) && parser?.shouldReportMouseMotion(buttonPressed)) {
+        const point = pointerToCell(e);
+        if (
+          !lastTerminalMouseCell ||
+          point.row !== lastTerminalMouseCell.row ||
+          point.col !== lastTerminalMouseCell.col
+        ) {
+          e.preventDefault();
+          sendMouseMotion(buttonPressed ? 0 : 3, point);
+          lastTerminalMouseCell = point;
+        }
+      }
+      if (buttonPressed || reportsHover) return;
+    }
+
     if (pendingMouseClick?.pointerId === e.pointerId) {
       const dx = e.clientX - pendingMouseClick.startX;
       const dy = e.clientY - pendingMouseClick.startY;
@@ -2071,6 +2123,7 @@
         scrollContainer.releasePointerCapture(e.pointerId);
       }
       terminalMousePointerId = null;
+      lastTerminalMouseCell = null;
     }
 
     if (pendingMouseClick?.pointerId === e.pointerId) {
@@ -2962,6 +3015,7 @@
     class:selection-mode={selectionMode}
     bind:this={scrollContainer}
     onscroll={handleTerminalScroll}
+    onwheel={handleTerminalWheel}
     oncontextmenu={(e) => e.preventDefault()}
     onpointerdown={handleScreenPointerDown}
     onpointermove={handleScreenPointerMove}

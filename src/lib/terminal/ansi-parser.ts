@@ -91,6 +91,8 @@ export interface TerminalSnapshot {
   cursorY: number;
   applicationCursorKeys: boolean;
   bracketedPasteMode?: boolean;
+  mouseMode?: number;
+  sgrMouseEncoding?: boolean;
   usingAlternateScreen: boolean;
   scrollTop: number;
   scrollBottom: number;
@@ -333,7 +335,7 @@ export class AnsiParser {
 
     // --- Step 1: adjust the screen row count at the old column width ---
     let nextBufferRows = oldBuffer;
-    let nextScrollback = oldScrollback;
+    let nextScrollback = this.usingAlternateScreen ? [] : oldScrollback;
     let nextCursorY = oldCursorY;
 
     if (canReflowMainScreen) {
@@ -427,9 +429,11 @@ export class AnsiParser {
       finalRows = finalRows.slice(0, Math.min(finalRows.length, finalCursorY + 1));
       const overflowCount = Math.max(0, finalRows.length - rows);
       if (overflowCount > 0) {
-        nextScrollback = nextScrollback
-          .concat(finalRows.slice(0, overflowCount))
-          .slice(-this.maxScrollback);
+        if (!this.usingAlternateScreen) {
+          nextScrollback = nextScrollback
+            .concat(finalRows.slice(0, overflowCount))
+            .slice(-this.maxScrollback);
+        }
         finalRows = finalRows.slice(overflowCount);
         finalCursorY -= overflowCount;
       }
@@ -2111,6 +2115,10 @@ export class AnsiParser {
     return this.mouseMode > 0;
   }
 
+  shouldReportMouseMotion(buttonPressed: boolean): boolean {
+    return this.mouseMode === 1003 || (buttonPressed && this.mouseMode === 1002);
+  }
+
   isSgrMouseEncoding(): boolean {
     return this.sgrMouseEncoding;
   }
@@ -2136,6 +2144,8 @@ export class AnsiParser {
       cursorY: this.cursorY,
       applicationCursorKeys: this.applicationCursorKeys,
       bracketedPasteMode: this.bracketedPasteMode,
+      mouseMode: this.mouseMode,
+      sgrMouseEncoding: this.sgrMouseEncoding,
       usingAlternateScreen: this.usingAlternateScreen,
       scrollTop: this.scrollTop,
       scrollBottom: this.scrollBottom,
@@ -2164,6 +2174,11 @@ export class AnsiParser {
     this.cursorY = restoredState.cursorY;
     this.applicationCursorKeys = snapshot.applicationCursorKeys;
     this.bracketedPasteMode = snapshot.bracketedPasteMode ?? false;
+    this.mouseMode =
+      snapshot.mouseMode === 1000 || snapshot.mouseMode === 1002 || snapshot.mouseMode === 1003
+        ? snapshot.mouseMode
+        : 0;
+    this.sgrMouseEncoding = snapshot.sgrMouseEncoding ?? false;
     this.usingAlternateScreen = snapshot.usingAlternateScreen;
     this.scrollTop = Math.min(this.rows - 1, Math.max(0, snapshot.scrollTop));
     this.scrollBottom = Math.min(this.rows - 1, Math.max(this.scrollTop, snapshot.scrollBottom));
