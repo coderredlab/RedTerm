@@ -39,6 +39,8 @@
   import { formatTerminalPaste } from "./terminal-paste";
   import { SshOutputDecoder } from "./ssh-output-decoder";
   import { cleanupFailedSessionAttach } from "./session-attach-cleanup";
+  import { composeJamoSequence, HangulComposer } from "./hangul-compose";
+  import type { HangulFeedResult } from "./hangul-compose";
   import { getThemeById, THEMES } from "$lib/styles/themes";
   import {
     runHostKeyGate,
@@ -963,6 +965,8 @@
   let isComposing = false;
   let immediateCompositionText = "";
   let compositionTimeout: number | null = null;
+  const hangulComposer = new HangulComposer();
+  let pendingCommitKey: string | null = null;
   let pendingWrite = "";
   let writeFlushScheduled = false;
   const MAX_AUTOMATIC_RESPONSES_PER_SECOND = 32;
@@ -2153,7 +2157,15 @@
     isComposing = false;
     if (sessionId) {
       const data = e.data ?? "";
-      if (data.startsWith(immediateCompositionText)) {
+      if (isDesktopTarget) {
+        // Empty data means the IME canceled the composition: erase whatever
+        // was already shown. Otherwise feed the final text; the composer
+        // keeps accumulating if the IME commits in jamo deltas.
+        writeComposed(data ? hangulComposer.feed(data) : hangulComposer.flushReset());
+        const pending = pendingCommitKey;
+        pendingCommitKey = null;
+        if (pending) queueWrite(pending);
+      } else if (data.startsWith(immediateCompositionText)) {
         const remainingText = data.slice(immediateCompositionText.length);
         if (remainingText) sendText(remainingText);
       } else if (immediateCompositionText.startsWith(data)) {
@@ -2270,6 +2282,36 @@
   // Handle keydown for special keys
   function handleKeyDown(e: KeyboardEvent) {
     if (!sessionId) return;
+
+    if (isDesktopTarget && e.isComposing) {
+      // The IME owns this keystroke. Backspace and Escape edit or cancel
+      // the marked syllable (the following compositionend reports the
+      // shrink/cancel), and the Hangul IME has no candidate window — but
+      // Enter/Space commit it: defer them so the committed text lands
+      // before the newline/space.
+      if (e.key === "Enter" || e.key === " ") {
+        pendingCommitKey = e.key === "Enter" ? "\r" : " ";
+      }
+      return;
+    }
+
+    // Any physical key that ends text flow also ends the Hangul word the
+    // composer is accumulating. Printable keys are excluded so jamo
+    // delivered as plain (non-composition) input keeps accumulating.
+    if (
+      e.key === "Enter" ||
+      e.key === "Backspace" ||
+      e.key === "Tab" ||
+      e.key === "Escape" ||
+      e.key === "ArrowUp" ||
+      e.key === "ArrowDown" ||
+      e.key === "ArrowLeft" ||
+      e.key === "ArrowRight" ||
+      (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey)
+    ) {
+      hangulComposer.breakWord();
+      pendingCommitKey = null;
+    }
 
     // Enter key
     if (e.key === "Enter") {
@@ -2427,12 +2469,36 @@
     });
   }
 
+  // Apply on-screen modifier state to a single composed character and write.
+  function writeComposed(result: HangulFeedResult) {
+    if (result.erase > 0) queueWrite("\x7f".repeat(result.erase));
+    let data = result.send;
+    if (data.length === 1) {
+      if (modifiersStore.ctrlActive) {
+        data = ctrlKey(data);
+        modifiersStore.resetCtrl();
+      } else if (modifiersStore.altActive) {
+        data = altKey(data);
+        modifiersStore.resetAlt();
+      }
+    }
+    if (data) queueWrite(data);
+  }
+
   function sendText(text: string) {
     if (!sessionId) return;
 
-    // macOS IMEs can deliver decomposed Hangul (NFD); normalize so the
-    // shell sees composed syllables.
-    let data = text.normalize("NFC");
+    if (isDesktopTarget) {
+      // Desktop IMEs deliver Hangul as jamo deltas, in-progress syllable
+      // resends, or composed syllables depending on timing; the composer
+      // reassembles all three and reports DEL corrections.
+      writeComposed(hangulComposer.feed(text.normalize("NFC")));
+      return;
+    }
+
+    // Mobile IMEs deliver composed text; only NFC + one-shot Jamo
+    // composition is needed.
+    let data = composeJamoSequence(text.normalize("NFC"));
 
     // Apply modifiers for single character
     if (data.length === 1) {
@@ -2485,6 +2551,8 @@
     if (compositionTimeout) {
       clearTimeout(compositionTimeout);
     }
+    hangulComposer.reset();
+    pendingCommitKey = null;
     if (deferredUpdateTimer) {
       clearTimeout(deferredUpdateTimer);
       deferredUpdateTimer = null;
