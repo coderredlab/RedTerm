@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 
 use super::ssh_commands::{
     claim_download_destination, ensure_local_sftp_preview_dir, make_download_progress_emitter,
@@ -22,7 +22,9 @@ pub struct LocalShellManager {
 
 struct LocalShell {
     master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    /// FIFO to the writer pump — keystrokes must reach the PTY in the order
+    /// they were sent, even though each write command is a separate task.
+    writer_tx: mpsc::Sender<Vec<u8>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
 }
 
@@ -85,12 +87,28 @@ pub async fn local_shell_start(
         .take_writer()
         .map_err(|e| format!("Failed to attach terminal writer: {}", e))?;
 
+    // Serialized writer pump: writes arrive from separate async command
+    // invocations, so they must go through a FIFO or fast typing reorders
+    // the bytes on the PTY.
+    let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(256);
+    std::thread::spawn(move || {
+        let mut writer = writer;
+        while let Some(data) = writer_rx.blocking_recv() {
+            if data.is_empty() {
+                continue;
+            }
+            if writer.write_all(&data).and_then(|_| writer.flush()).is_err() {
+                break;
+            }
+        }
+    });
+
     let session_id = uuid::Uuid::new_v4().to_string();
     manager.shells.write().await.insert(
         session_id.clone(),
         LocalShell {
             master: Mutex::new(pair.master),
-            writer: Arc::new(Mutex::new(writer)),
+            writer_tx,
             child: Mutex::new(child),
         },
     );
@@ -129,27 +147,18 @@ pub async fn local_shell_write(
     session_id: String,
     data: Vec<u8>,
 ) -> Result<(), String> {
-    // Clone the writer handle so the (potentially blocking) PTY write runs
-    // off the async worker via spawn_blocking.
-    let writer = {
+    // Queue onto the shell's FIFO; the pump preserves send order even when
+    // writes come from separate concurrent command invocations.
+    let tx = {
         let shells = manager.shells.read().await;
-        let shell = shells
+        shells
             .get(&session_id)
-            .ok_or_else(|| "Local shell not found".to_string())?;
-        Arc::clone(&shell.writer)
+            .map(|shell| shell.writer_tx.clone())
+            .ok_or_else(|| "Local shell not found".to_string())?
     };
-
-    tokio::task::spawn_blocking(move || {
-        let mut writer = writer
-            .lock()
-            .map_err(|_| "Local shell writer is unavailable".to_string())?;
-        writer
-            .write_all(&data)
-            .and_then(|_| writer.flush())
-            .map_err(|e| format!("Failed to write to local shell: {}", e))
-    })
-    .await
-    .map_err(|e| format!("Local shell write task failed: {}", e))?
+    tx.send(data)
+        .await
+        .map_err(|_| "Local shell is no longer running".to_string())
 }
 
 #[tauri::command]
