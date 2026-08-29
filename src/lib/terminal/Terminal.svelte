@@ -682,7 +682,10 @@
       viewportTop = scrollContainer.scrollTop;
     }
 
-    const startRow = Math.floor(viewportTop / charHeight);
+    const startRow = Math.max(
+      0,
+      Math.min(Math.floor(viewportTop / charHeight), buf.length - 1)
+    );
     const fracOffsetY = viewportTop % charHeight;
     const endRow = Math.min(startRow + rows + 2, buf.length);
 
@@ -818,7 +821,10 @@
           parserCursorVisible = parser.isCursorVisible();
           buffer = buf;
 
-          const startRow = Math.floor(viewportTop / charHeight);
+          const startRow = Math.max(
+            0,
+            Math.min(Math.floor(viewportTop / charHeight), parser.getBuffer().length - 1)
+          );
           const fracOffsetY = viewportTop % charHeight;
           const endRow = Math.min(startRow + rows + 2, buf.length);
 
@@ -1130,7 +1136,10 @@
       }
 
       // visible range 계산
-      const startRow = Math.floor(viewportTop / charHeight);
+      const startRow = Math.max(
+        0,
+        Math.min(Math.floor(viewportTop / charHeight), newBuffer.length - 1)
+      );
       const fracOffsetY = viewportTop % charHeight;
       const endRow = Math.min(startRow + rows + 2, newBuffer.length);
 
@@ -2291,6 +2300,17 @@
       queueWrite(getArrowKeyCode("left", appCursorMode));
       return;
     }
+
+    // Control characters: Ctrl+letter → C0 control byte (Ctrl+C = SIGINT,
+    // Ctrl+D = EOF, Ctrl+U, Ctrl+W ...). The shell cannot work without them.
+    if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+      const lower = e.key.toLowerCase();
+      if (lower >= "a" && lower <= "z") {
+        e.preventDefault();
+        queueWrite(String.fromCharCode(lower.charCodeAt(0) - 96));
+        return;
+      }
+    }
   }
 
   function handleWriteError(e: unknown) {
@@ -3178,6 +3198,9 @@
     padding: 0 var(--terminal-horizontal-padding, 4px);
     overflow-y: auto;
     overflow-x: clip;
+    /* Edge rubber-band + scroll chaining fight the sticky canvas repaint
+       on macOS — contain them inside the terminal scroller. */
+    overscroll-behavior-y: contain;
     box-sizing: border-box;
     -webkit-overflow-scrolling: touch; /* 모바일 스크롤 부드럽게 */
     contain: layout style paint;
