@@ -663,6 +663,10 @@
   }
 
   // ─── Canvas helpers ─────────────────────────────────────
+  // Selection drag handles are a touch UX (mobile); the desktop build
+  // selects by mouse drag directly.
+  const isDesktopTarget = import.meta.env.VITE_REDTERM_TARGET === "desktop";
+
   function redrawCanvas(force = false) {
     if (!renderer || !parser) return;
     // synchronized output 중에는 중간 상태 노출 방지를 위해 렌더 스킵
@@ -2834,7 +2838,7 @@
       class="terminal-canvas"
     ></canvas>
 
-    {#if selectionMode && selectionStart && selectionEnd}
+    {#if !isDesktopTarget && selectionMode && selectionStart && selectionEnd}
       <button
         type="button"
         class="selection-handle selection-handle-start"
