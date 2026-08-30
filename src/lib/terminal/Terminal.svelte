@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
-  import { AnsiParser, type Cell, type TerminalSnapshot } from "./ansi-parser";
+  import { AnsiParser, type Cell, type TerminalOscEvent, type TerminalSnapshot } from "./ansi-parser";
   import { CanvasRenderer } from './CanvasRenderer';
   import {
     MAX_CLIPBOARD_IMAGE_BYTES,
@@ -19,6 +19,7 @@
     readClipboardImage,
     sshCheckHostKey,
     sshTrustHostKey,
+    localShellGetOutput,
     localShellStart,
     localShellWrite,
     localShellResize,
@@ -40,6 +41,12 @@
   import { encodeTerminalMouseEvent, terminalMouseCellFromPoint } from "./terminal-mouse";
   import { SshOutputDecoder } from "./ssh-output-decoder";
   import { cleanupFailedSessionAttach } from "./session-attach-cleanup";
+  import { AutomaticResponseBuffer } from "./automatic-response-buffer";
+  import {
+    clearRuntimeSessionSnapshot,
+    storeRuntimeSessionSnapshot,
+    takeRuntimeSessionSnapshot,
+  } from "./session-runtime-snapshot";
   import { composeJamoSequence, HangulComposer } from "./hangul-compose";
   import type { HangulFeedResult } from "./hangul-compose";
   import { getThemeById, THEMES } from "$lib/styles/themes";
@@ -77,6 +84,7 @@
     onConnected?: (sessionId: string) => void;
     onDisconnected?: () => void;
     onError?: (error: string) => void;
+    onTitleChange?: (title: string) => void;
   }
   type TerminalMouseModifiers = Pick<
     MouseEvent,
@@ -97,12 +105,14 @@
     kind = "ssh",
     onConnected,
     onDisconnected,
-    onError
+    onError,
+    onTitleChange
   }: Props = $props();
 
   // Terminal state
   let terminalContainer: HTMLDivElement;
   let scrollContainer: HTMLDivElement;
+  let currentDirectoryUri: string | null = null;
   let hiddenInput: HTMLTextAreaElement;
   let parser: AnsiParser | null = null;
   let sessionId: string | null = null;
@@ -110,6 +120,9 @@
   let unlistenExit: (() => void) | null = null;
   let connected = $state(false);
   let resizeObserver: ResizeObserver | null = null;
+  let surfaceVisibilityObserver: IntersectionObserver | null = null;
+  let terminalSurfaceIntersecting = false;
+  let terminalSurfaceVisible = false;
 
   // Render state
   let buffer = $state<Cell[][]>([]);
@@ -126,6 +139,8 @@
   let canvasEl: HTMLCanvasElement | undefined = $state();
   let heightFiller: HTMLDivElement | undefined = $state();
   let renderer: CanvasRenderer | null = null;
+  let destroyed = false;
+  let parserGeneration = 0;
   let pendingHostKeyChallenge = $state<HostKeyPromptChallenge | null>(null);
   let resolvingHostKeyTrust = $state(false);
   let hostKeyPromptResolver: ((decision: HostKeyPromptDecision) => void) | null = null;
@@ -168,6 +183,7 @@
   let androidImagePasteHandler: ((e: Event) => void) | null = null;
   let visibilityChangeHandler: (() => void) | null = null;
   let replayBufferedChunks: Array<{ seq: number; data: Uint8Array }> | null = null;
+  let replayBufferOverflowed = false;
   let replayBufferedBytes = 0;
   let sshDataPaused = false;
   let resumingSshData = false;
@@ -175,6 +191,7 @@
   let autoStickToBottom = true;
   let reconnecting = false;
   let disconnectRequested = false;
+  let connectionGeneration = 0;
   let lastProcessedSeq = 0;
   let startupScriptDispatcher: StartupScriptDispatcher | null = null;
   const REPLAY_SLICE_BUDGET_MS = 8;
@@ -207,6 +224,7 @@
   let longPressTriggered = false;
   let terminalMousePointerId: number | null = null;
   let terminalMouseButton: number | null = null;
+  let localSelectionPointerId: number | null = null;
   let lastTerminalMouseCell: { row: number; col: number } | null = null;
   let desktopWheelRows = 0;
   let pendingMouseClick: {
@@ -277,11 +295,37 @@
     }
   }
 
+  function createTerminalSnapshot(activeParser: AnsiParser): TerminalSnapshot {
+    return {
+      ...activeParser.createSnapshot(),
+      utf8PendingBytes: sshOutputDecoder.getPendingBytes(),
+      outputOffset: lastProcessedSeq,
+    };
+  }
+  function createRuntimeTerminalSnapshot(activeParser: AnsiParser): TerminalSnapshot {
+    return {
+      ...activeParser.createRuntimeSnapshot(),
+      utf8PendingBytes: sshOutputDecoder.getPendingBytes(),
+      outputOffset: lastProcessedSeq,
+    };
+  }
+
+  function restoreTerminalSnapshot(activeParser: AnsiParser, snapshot: TerminalSnapshot) {
+    activeParser.restoreSnapshot(snapshot);
+    sshOutputDecoder.restorePendingBytes(snapshot.utf8PendingBytes);
+  }
+
+  function snapshotOutputOffset(snapshot: TerminalSnapshot): number {
+    return Number.isSafeInteger(snapshot.outputOffset) && snapshot.outputOffset >= 0
+      ? snapshot.outputOffset
+      : 0;
+  }
+
   function saveSessionSnapshot(targetSessionId: string) {
     if (!parser || !canUseStorage()) return;
     const snapshots = loadSessionSnapshots();
     snapshots[targetSessionId] = {
-      snapshot: parser.createSnapshot(),
+      snapshot: createTerminalSnapshot(parser),
       savedAt: Date.now(),
     };
     const prunedSnapshots = pruneSessionSnapshots(snapshots);
@@ -293,13 +337,16 @@
     const storedSnapshot = loadSessionSnapshots()[targetSessionId];
     if (!storedSnapshot) return null;
 
-    parser.restoreSnapshot(storedSnapshot.snapshot);
+    restoreTerminalSnapshot(parser, storedSnapshot.snapshot);
+    lastProcessedSeq = snapshotOutputOffset(storedSnapshot.snapshot);
     updateBuffer();
     return storedSnapshot.snapshot;
   }
 
   function clearSessionSnapshot(targetSessionId: string | null | undefined) {
-    if (!targetSessionId || !canUseStorage()) return;
+    if (!targetSessionId) return;
+    clearRuntimeSessionSnapshot(targetSessionId);
+    if (!canUseStorage()) return;
     const snapshots = loadSessionSnapshots();
     if (!(targetSessionId in snapshots)) return;
     delete snapshots[targetSessionId];
@@ -311,9 +358,10 @@
 
   function pointerToCell(e: { clientX: number; clientY: number }): { row: number; col: number } {
     if (!scrollContainer) return { row: 0, col: 0 };
-    const rect = scrollContainer.getBoundingClientRect();
-    const x = e.clientX - rect.left - TERMINAL_HORIZONTAL_PADDING_PX;
-    const y = e.clientY - rect.top + scrollContainer.scrollTop;
+    const scrollRect = scrollContainer.getBoundingClientRect();
+    const canvasLeft = canvasEl?.getBoundingClientRect().left ?? scrollRect.left;
+    const x = e.clientX - canvasLeft - TERMINAL_HORIZONTAL_PADDING_PX;
+    const y = e.clientY - scrollRect.top + scrollContainer.scrollTop;
     const col = Math.max(0, Math.min(cols - 1, Math.floor(x / charWidth)));
     const row = Math.max(0, Math.floor(y / charHeight));
     return { row, col };
@@ -324,12 +372,13 @@
     col: number;
   } {
     if (!scrollContainer) return { row: 0, col: 0 };
-    const rect = scrollContainer.getBoundingClientRect();
+    const scrollRect = scrollContainer.getBoundingClientRect();
+    const canvasLeft = canvasEl?.getBoundingClientRect().left ?? scrollRect.left;
     return terminalMouseCellFromPoint({
       clientX: point.clientX,
       clientY: point.clientY,
-      viewportLeft: rect.left,
-      viewportTop: rect.top,
+      viewportLeft: canvasLeft,
+      viewportTop: scrollRect.top,
       horizontalPadding: TERMINAL_HORIZONTAL_PADDING_PX,
       charWidth,
       charHeight,
@@ -632,35 +681,43 @@
 
 
   async function uploadClipboardImageBytes(bytes: Uint8Array) {
-    if (!sessionId || kind === "local") return;
+    const targetSessionId = sessionId;
+    if (!targetSessionId || kind === "local") return;
+    const generation = connectionGeneration;
 
     const prevStatusMessage = statusMessage;
     statusMessage = "Uploading pasted image...";
 
     try {
-      const uploadResult = await sshUploadClipboardImage(sessionId, bytes);
+      const uploadResult = await sshUploadClipboardImage(targetSessionId, bytes);
+      if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       statusMessage = prevStatusMessage;
       queueWrite(uploadResult.remote_path);
     } catch (error) {
+      if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       const message = error instanceof Error ? error.message : String(error);
-      statusMessage = `Image upload failed: ${message}`;
+      statusMessage = "Image upload failed: " + message;
       console.error("[SSH] image upload failed:", error);
     }
   }
 
   async function uploadClipboardImageFromLocalPath(localPath: string) {
-    if (!sessionId || kind === "local") return;
+    const targetSessionId = sessionId;
+    if (!targetSessionId || kind === "local") return;
+    const generation = connectionGeneration;
 
     const prevStatusMessage = statusMessage;
     statusMessage = "Uploading pasted image...";
 
     try {
-      const uploadResult = await sshUploadClipboardImageFromLocalPath(sessionId, localPath);
+      const uploadResult = await sshUploadClipboardImageFromLocalPath(targetSessionId, localPath);
+      if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       statusMessage = prevStatusMessage;
       queueWrite(uploadResult.remote_path);
     } catch (error) {
+      if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       const message = error instanceof Error ? error.message : String(error);
-      statusMessage = `Image upload failed: ${message}`;
+      statusMessage = "Image upload failed: " + message;
       console.error("[SSH] local image upload failed:", error);
     }
   }
@@ -752,8 +809,12 @@
 
     renderer.clear();
     renderer.beginDraw(fracOffsetY);
-    renderer.drawVisibleRows(buf, startRow, endRow);
-    renderer.drawImages(parser.getImages(), startRow, endRow);
+    const images = parser.getImages(startRow, endRow);
+    renderer.drawImages(images, startRow, endRow, 'background');
+    renderer.drawVisibleRowBackgrounds(buf, startRow, endRow);
+    renderer.drawImages(images, startRow, endRow, 'below');
+    renderer.drawVisibleRowText(buf, startRow, endRow);
+    renderer.drawImages(images, startRow, endRow, 'above');
 
     // 커서
     if (connected && cursorVisible && parserCursorVisible) {
@@ -768,12 +829,12 @@
   }
 
   function requestRedraw() {
-    if (redrawPending) return;
+    if (destroyed || redrawPending) return;
     // updatePending 체크 제거: resize로 캔버스가 클리어된 후 반드시 다시 그려야 함
     redrawPending = true;
     requestAnimationFrame(() => {
       redrawPending = false;
-      redrawCanvas();
+      if (!destroyed) redrawCanvas();
     });
   }
 
@@ -803,6 +864,7 @@
 
     if (typeof document !== "undefined" && "fonts" in document) {
       void (document as Document & { fonts: FontFaceSet }).fonts.ready.then(() => {
+        if (destroyed) return;
         measureFont();
         calculateSize();
       });
@@ -810,12 +872,14 @@
 
     // Cursor blink
     cursorInterval = window.setInterval(() => {
+      if (destroyed) return;
       cursorVisible = !cursorVisible;
       requestRedraw();
     }, 530);
 
     // Setup input handlers BEFORE initTerminal
     await tick();
+    if (destroyed) return;
     if (hiddenInput) {
       hiddenInput.addEventListener('input', handleInput);
       hiddenInput.addEventListener('keydown', handleKeyDown);
@@ -856,8 +920,10 @@
     // Periodic focus check (every 200ms - isComposing 체크 제거로 빠른 복구)
     // Now connect
     await initTerminal();
+    if (destroyed) return;
 
     visibilityChangeHandler = () => {
+      updateImageAnimationVisibility();
       if (document.visibilityState === "visible") {
         if (!parser || !renderer) { void probeAndReconnect(); return; }
         parser.markAllDirty();
@@ -884,15 +950,19 @@
 
           const startRow = Math.max(
             0,
-            Math.min(Math.floor(viewportTop / charHeight), parser.getBuffer().length - 1)
+            Math.min(Math.floor(viewportTop / charHeight), buf.length - 1)
           );
           const fracOffsetY = viewportTop % charHeight;
           const endRow = Math.min(startRow + rows + 2, buf.length);
 
           renderer.clear();
           renderer.beginDraw(fracOffsetY);
-          renderer.drawVisibleRows(buf, startRow, endRow);
-          renderer.drawImages(parser.getImages(), startRow, endRow);
+          const images = parser.getImages(startRow, endRow);
+          renderer.drawImages(images, startRow, endRow, 'background');
+          renderer.drawVisibleRowBackgrounds(buf, startRow, endRow);
+          renderer.drawImages(images, startRow, endRow, 'below');
+          renderer.drawVisibleRowText(buf, startRow, endRow);
+          renderer.drawImages(images, startRow, endRow, 'above');
           if (connected && cursorVisible && parserCursorVisible) {
             const cursorScreenY = cursorPos.y - startRow;
             if (cursorScreenY >= 0 && cursorScreenY < rows + 2) {
@@ -906,9 +976,11 @@
         forceScrollToBottomAndRedraw();
         requestAnimationFrame(forceScrollToBottomAndRedraw);
         setTimeout(forceScrollToBottomAndRedraw, 150);
+        scheduleImageAnimation();
 
         void resumeAfterBackground();
       } else if (document.visibilityState === "hidden") {
+        clearImageAnimationTimer();
         pauseSshDataForBackground();
       }
     };
@@ -920,6 +992,7 @@
     renderer.measureFont();
     charWidth = renderer.charWidth;
     charHeight = renderer.charHeight;
+    parser?.setCellSize(charWidth, charHeight);
   }
 
   let resizeTimer: number | null = null;
@@ -1014,21 +1087,17 @@
   let suppressPlainSpace = false;
   let pendingWrite = "";
   let writeFlushScheduled = false;
-  const MAX_AUTOMATIC_RESPONSES_PER_SECOND = 32;
-  const MAX_AUTOMATIC_RESPONSE_QUEUE = 32;
-  const MAX_AUTOMATIC_RESPONSE_BYTES = 4096;
-  let automaticResponseQueue: string[] = [];
-  let automaticResponseBytes = 0;
-  let automaticResponseSending = false;
-  let automaticResponseWindowStartedAt = 0;
-  let automaticResponseCount = 0;
-  let protocolFloodDetected = false;
+  const automaticResponseBuffer = new AutomaticResponseBuffer();
+  let automaticResponseFlushScheduled = false;
+  let automaticResponseGeneration = 0;
   let deferredUpdateTimer: number | null = null;
   let synchronizedOutputTimer: number | null = null;
+  let imageAnimationTimer: number | null = null;
   let lastNonBottomRenderAt = 0;
   let prevScrollbackLength = 0;
   const NON_BOTTOM_RENDER_INTERVAL_MS = 90;
   const SYNCHRONIZED_OUTPUT_TIMEOUT_MS = 150;
+  const MIN_IMAGE_ANIMATION_DELAY_MS = 16;
   type PendingOutputChunk = { seq: number; text: string; completesSeq: boolean };
   let pendingDataChunks: PendingOutputChunk[] = [];
   let pendingDataHead = 0;
@@ -1129,6 +1198,59 @@
       updateBuffer(true);
     }, SYNCHRONIZED_OUTPUT_TIMEOUT_MS);
   }
+  function clearImageAnimationTimer() {
+    if (imageAnimationTimer === null) return;
+    clearTimeout(imageAnimationTimer);
+    imageAnimationTimer = null;
+  }
+
+  function getVisibleKittyImageIds(): Set<number> {
+    if (!parser) return new Set();
+    const startRow = Math.max(0, Math.floor(viewportTop / Math.max(1, charHeight)));
+    const endRow = Math.min(parser.getFullBuffer().length, startRow + parser.getRows() + 2);
+    const imageIds = new Set<number>();
+    for (const image of parser.getImages(startRow, endRow)) {
+      if (
+        image.protocol === "kitty" &&
+        image.imageId !== undefined &&
+        image.col < cols &&
+        image.col + image.widthCells > 0
+      ) {
+        imageIds.add(image.imageId);
+      }
+    }
+    return imageIds;
+  }
+
+  function isTerminalSurfaceVisible(): boolean {
+    return (
+      document.visibilityState === "visible" &&
+      terminalSurfaceIntersecting &&
+      terminalContainer.getClientRects().length > 0 &&
+      terminalContainer.clientWidth > 0 &&
+      terminalContainer.clientHeight > 0
+    );
+  }
+
+  function updateImageAnimationVisibility() {
+    terminalSurfaceVisible = isTerminalSurfaceVisible();
+    renderer?.setAnimationsEnabled(terminalSurfaceVisible);
+    if (terminalSurfaceVisible) scheduleImageAnimation();
+    else clearImageAnimationTimer();
+  }
+
+  function scheduleImageAnimation() {
+    clearImageAnimationTimer();
+    if (!parser || !terminalSurfaceVisible) return;
+    const delay = parser.getKittyAnimationDelay(getVisibleKittyImageIds());
+    if (delay === null) return;
+    imageAnimationTimer = window.setTimeout(() => {
+      imageAnimationTimer = null;
+      if (!parser || !terminalSurfaceVisible) return;
+      if (parser.advanceKittyAnimations(getVisibleKittyImageIds())) updateBuffer();
+      scheduleImageAnimation();
+    }, Math.max(MIN_IMAGE_ANIMATION_DELAY_MS, delay));
+  }
 
   function updateBuffer(force = false) {
     // force=true: 앱 복귀 시 selection/throttle 무시하고 강제 렌더링
@@ -1184,6 +1306,9 @@
         }
       }
 
+      const retainedImageCacheIds = parser.consumeImageCachePruneRequest();
+      if (retainedImageCacheIds) renderer.pruneImageCache(retainedImageCacheIds);
+
       const synchronizedOutput = parser.isSynchronizedOutput();
       if (!synchronizedOutput || force) {
         clearSynchronizedOutputTimer();
@@ -1231,8 +1356,12 @@
       // 항상 전체 다시 그리기
       renderer.clear();
       renderer.beginDraw(fracOffsetY);
-      renderer.drawVisibleRows(newBuffer, startRow, endRow);
-      renderer.drawImages(parser.getImages(), startRow, endRow);
+      const images = parser.getImages(startRow, endRow);
+      renderer.drawImages(images, startRow, endRow, 'background');
+      renderer.drawVisibleRowBackgrounds(newBuffer, startRow, endRow);
+      renderer.drawImages(images, startRow, endRow, 'below');
+      renderer.drawVisibleRowText(newBuffer, startRow, endRow);
+      renderer.drawImages(images, startRow, endRow, 'above');
 
       prevCursorY = cursorPos.y;
 
@@ -1247,6 +1376,7 @@
       drawSelectionIfActive(startRow);
       renderer.endDraw();
       parser.clearDirtyRows();
+      scheduleImageAnimation();
       if (pendingDataHead < pendingDataChunks.length) {
         updateBuffer();
       } else if (
@@ -1282,6 +1412,7 @@
 
     viewportTop = newScrollTop;
     viewportHeight = scrollContainer.clientHeight;
+    scheduleImageAnimation();
     requestRedraw();
   }
 
@@ -1324,7 +1455,7 @@
   }
 
   function handleTerminalWheel(e: WheelEvent) {
-    if (!shouldForwardTerminalMouseEvents() || e.deltaY === 0) return;
+    if (e.shiftKey || !shouldForwardTerminalMouseEvents() || e.deltaY === 0) return;
     e.preventDefault();
 
     const deltaRows =
@@ -1418,11 +1549,17 @@
     return sshConnect(host, port, resolvedAuth, cols, rows);
   }
 
-  async function connectWithKeyPassphraseRetry(): Promise<string> {
-    startupScriptDispatcher = createStartupScriptDispatcher(startupScript, startupScriptReadyText);
+  async function connectWithKeyPassphraseRetry(generation: number): Promise<string> {
+    if (!isConnectionAttemptActive(generation)) throw new Error("Connection attempt superseded");
     try {
-      return await connectWithResolvedAuth();
+      const connectedSessionId = await connectWithResolvedAuth();
+      if (!isConnectionAttemptActive(generation)) {
+        await sshDisconnect(connectedSessionId).catch(() => {});
+        throw new Error("Connection attempt superseded");
+      }
+      return connectedSessionId;
     } catch (error) {
+      if (!isConnectionAttemptActive(generation)) throw error;
       if (
         auth.method.type !== "key" ||
         !shouldPromptForKeyPassphraseRetry({
@@ -1435,24 +1572,37 @@
       }
 
       const passphrase = await promptKeyPassphrase(auth.method.key_id);
+      if (!isConnectionAttemptActive(generation)) {
+        throw new Error("Connection attempt superseded");
+      }
       if (passphrase === null) {
         throw new Error("Key passphrase entry cancelled");
       }
 
       keyPassphraseRetryCache = stageKeyPassphraseRetry(keyPassphraseRetryCache, passphrase);
       try {
-        startupScriptDispatcher = createStartupScriptDispatcher(startupScript, startupScriptReadyText);
-        const sessionId = await connectWithResolvedAuth();
+        const connectedSessionId = await connectWithResolvedAuth();
+        if (!isConnectionAttemptActive(generation)) {
+          await sshDisconnect(connectedSessionId).catch(() => {});
+          throw new Error("Connection attempt superseded");
+        }
         keyPassphraseRetryCache = commitKeyPassphraseRetry(keyPassphraseRetryCache);
-        return sessionId;
+        return connectedSessionId;
       } catch (retryError) {
-        keyPassphraseRetryCache = rollbackKeyPassphraseRetry(keyPassphraseRetryCache);
+        if (isConnectionAttemptActive(generation)) {
+          keyPassphraseRetryCache = rollbackKeyPassphraseRetry(keyPassphraseRetryCache);
+        }
         throw retryError;
       }
     }
   }
 
-  async function bindSessionListener(nextSessionId: string) {
+
+  async function bindSessionListener(
+    nextSessionId: string,
+    generation: number
+  ): Promise<boolean> {
+    if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
     sshDataPaused = false;
     if (unlisten) {
       unlisten();
@@ -1463,7 +1613,8 @@
       unlistenExit = null;
     }
 
-    unlisten = await listenSshData(nextSessionId, (data, seq) => {
+    const dataUnlisten = await listenSshData(nextSessionId, (data, seq) => {
+      if (!isConnectionAttemptActive(generation, nextSessionId)) return;
       if (replayBufferedChunks) {
         if (replayBufferedBytes + data.byteLength > MAX_REPLAY_BUFFER_BYTES) {
           pauseSshDataSource();
@@ -1473,30 +1624,36 @@
         replayBufferedBytes += data.byteLength;
         return;
       }
+      if (seq <= lastProcessedSeq) return;
       const text = sshOutputDecoder.decode(data);
       const startupPayload = startupScriptDispatcher?.consumeOutput(text);
-      if (startupPayload) {
+      if (startupPayload && isConnectionAttemptActive(generation, nextSessionId)) {
         queueWrite(startupPayload);
       }
-
       if (parser) {
         enqueuePendingOutput(seq, text);
         updateBuffer();
       }
     });
+    if (!isConnectionAttemptActive(generation, nextSessionId)) {
+      dataUnlisten();
+      return false;
+    }
+    unlisten = dataUnlisten;
 
-    unlistenExit = await listenSshExit(nextSessionId, () => {
-      if (sessionId !== nextSessionId || disconnectRequested) return;
+    const exitUnlisten = await listenSshExit(nextSessionId, () => {
+      if (
+        !isConnectionAttemptActive(generation, nextSessionId) ||
+        disconnectRequested
+      ) return;
       connected = false;
-
-      // If app is in background, defer cleanup and attempt reconnect on resume
       if (document.visibilityState === "hidden") {
         statusMessage = "Connection lost (backgrounded)";
         void reconnectSession("background disconnect");
         return;
       }
-
       sessionId = null;
+      connectionGeneration++;
       lastProcessedSeq = 0;
       terminalModesStore.clearSession(nextSessionId);
       clearSessionSnapshot(nextSessionId);
@@ -1504,9 +1661,22 @@
       onDisconnected?.();
       startupScriptDispatcher = null;
     });
+    if (!isConnectionAttemptActive(generation, nextSessionId)) {
+      exitUnlisten();
+      if (unlisten === dataUnlisten) {
+        dataUnlisten();
+        unlisten = null;
+      }
+      return false;
+    }
+    unlistenExit = exitUnlisten;
+    return true;
   }
 
-  async function attachExistingSession(nextSessionId: string): Promise<boolean> {
+  async function attachExistingSession(
+    nextSessionId: string,
+    generation = ++connectionGeneration
+  ): Promise<boolean> {
     sshOutputDecoder.reset();
     try {
       replayBufferedChunks = [];
@@ -1514,29 +1684,43 @@
       sessionId = nextSessionId;
       connected = true;
       statusMessage = "";
-      await bindSessionListener(nextSessionId);
+      if (!(await bindSessionListener(nextSessionId, generation))) return false;
 
       const backendSnapshot = await sshGetSessionSnapshot(nextSessionId);
+      if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
       const historyChunks = await sshGetSessionOutput(nextSessionId);
-      if (backendSnapshot && parser) {
-        parser.restoreSnapshot(backendSnapshot.snapshot);
+      if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
+      const runtimeSnapshot = takeRuntimeSessionSnapshot(nextSessionId);
+      if (runtimeSnapshot && parser) {
+        restoreTerminalSnapshot(parser, runtimeSnapshot);
+        lastProcessedSeq = snapshotOutputOffset(runtimeSnapshot);
+        updateBuffer();
+      } else if (backendSnapshot && parser) {
+        restoreTerminalSnapshot(parser, backendSnapshot.snapshot);
         lastProcessedSeq = backendSnapshot.last_seq;
         updateBuffer();
       } else {
         restoreSessionSnapshot(nextSessionId);
       }
-
-      await replayAndDrainSessionChunks(historyChunks);
+      if (
+        !(await replayAndDrainSessionChunks(historyChunks, generation, nextSessionId)) ||
+        !isConnectionAttemptActive(generation, nextSessionId)
+      ) return false;
 
       terminalModesStore.setAppCursorMode(
         nextSessionId,
         parser?.isApplicationCursorKeys() ?? terminalModesStore.isAppCursorMode(nextSessionId)
       );
       await sshResize(nextSessionId, cols, rows);
+      if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
       clearSessionSnapshot(nextSessionId);
       onConnected?.(nextSessionId);
       return true;
     } catch {
+      if (!isConnectionAttemptActive(generation, nextSessionId)) {
+        if (sessionId !== nextSessionId) await sshDisconnect(nextSessionId).catch(() => {});
+        return false;
+      }
       const cleanupError = await cleanupFailedSessionAttach({
         sessionId: nextSessionId,
         unlistenData: unlisten,
@@ -1545,6 +1729,7 @@
         clearSnapshot: (id) => clearSessionSnapshot(id),
         disconnect: (id) => sshDisconnect(id),
       });
+      if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
       unlisten = null;
       unlistenExit = null;
       replayBufferedChunks = null;
@@ -1562,6 +1747,7 @@
       return false;
     }
   }
+
 
   function requestNotificationPermission() {
     if ("Notification" in window && Notification.permission === "default") {
@@ -1622,11 +1808,18 @@
   }
 
   function sendSessionData(bytes: Uint8Array, silent = false) {
-    if (!sessionId) return;
+    const targetSessionId = sessionId;
+    if (!targetSessionId) return;
+    const generation = connectionGeneration;
+    const onWriteError = silent
+      ? () => {}
+      : (error: unknown) => {
+          if (isConnectionAttemptActive(generation, targetSessionId)) handleWriteError(error);
+        };
     if (kind === "local") {
-      localShellWrite(sessionId, bytes).catch(silent ? () => {} : handleWriteError);
+      localShellWrite(targetSessionId, bytes).catch(onWriteError);
     } else {
-      sshWrite(sessionId, bytes).catch(silent ? () => {} : handleWriteError);
+      sshWrite(targetSessionId, bytes).catch(onWriteError);
     }
   }
 
@@ -1647,7 +1840,19 @@
     }
   }
 
-  async function bindLocalSessionListener(nextSessionId: string) {
+  function isConnectionAttemptActive(generation: number, expectedSessionId?: string): boolean {
+    return (
+      !destroyed &&
+      connectionGeneration === generation &&
+      (expectedSessionId === undefined || sessionId === expectedSessionId)
+    );
+  }
+
+  async function bindLocalSessionListener(
+    nextSessionId: string,
+    generation: number
+  ): Promise<boolean> {
+    if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
     sshDataPaused = false;
     if (unlisten) {
       unlisten();
@@ -1658,86 +1863,241 @@
       unlistenExit = null;
     }
 
-    let localSeq = lastProcessedSeq;
-    unlisten = await listenLocalData(nextSessionId, (data) => {
-      const text = sshOutputDecoder.decode(data);
+    const dataUnlisten = await listenLocalData(nextSessionId, (chunk) => {
+      if (!isConnectionAttemptActive(generation, nextSessionId)) return;
+      if (replayBufferedChunks) {
+        if (replayBufferOverflowed) return;
+        if (replayBufferedBytes + chunk.data.byteLength > MAX_REPLAY_BUFFER_BYTES) {
+          replayBufferOverflowed = true;
+          replayBufferedChunks = [];
+          replayBufferedBytes = 0;
+          return;
+        }
+        replayBufferedChunks.push({ seq: chunk.seq, data: chunk.data.slice() });
+        replayBufferedBytes += chunk.data.byteLength;
+        return;
+      }
+      if (chunk.seq <= lastProcessedSeq) return;
+      const text = sshOutputDecoder.decode(chunk.data);
       if (parser) {
-        enqueuePendingOutput(++localSeq, text);
-        // WebKit suspends animation frames in the background. Local-shell
-        // output has no replay API, so parse it without painting instead of
-        // dropping the listener when the pending queue reaches its limit.
+        enqueuePendingOutput(chunk.seq, text);
         if (
           document.visibilityState === "hidden" ||
           pendingDataCharacters >= MAX_PENDING_OUTPUT_CHARACTERS
-        ) {
-          processPendingOutputSlice(true);
-        }
-        if (document.visibilityState !== "hidden") {
-          updateBuffer();
-        }
+        ) processPendingOutputSlice(true);
+        if (document.visibilityState !== "hidden") updateBuffer();
       }
     });
+    if (!isConnectionAttemptActive(generation, nextSessionId)) {
+      dataUnlisten();
+      return false;
+    }
+    unlisten = dataUnlisten;
 
-    unlistenExit = await listenLocalExit(nextSessionId, () => {
-      if (sessionId !== nextSessionId || disconnectRequested) return;
+    const exitUnlisten = await listenLocalExit(nextSessionId, () => {
+      if (
+        !isConnectionAttemptActive(generation, nextSessionId) ||
+        disconnectRequested
+      ) return;
       connected = false;
       sessionId = null;
+      connectionGeneration++;
+      lastProcessedSeq = 0;
+      terminalModesStore.clearSession(nextSessionId);
+      clearSessionSnapshot(nextSessionId);
       statusMessage = "Local shell exited";
       onDisconnected?.();
     });
+    if (!isConnectionAttemptActive(generation, nextSessionId)) {
+      exitUnlisten();
+      if (unlisten === dataUnlisten) {
+        dataUnlisten();
+        unlisten = null;
+      }
+      return false;
+    }
+    unlistenExit = exitUnlisten;
+    return true;
   }
 
-  async function connectLocalSession(showError = true): Promise<boolean> {
-    sshOutputDecoder.reset();
-    statusMessage = "Starting local shell...";
-    try {
-      const nextSessionId = await localShellStart(cols, rows);
-      sessionId = nextSessionId;
-      connected = true;
-      statusMessage = "";
-      terminalModesStore.setAppCursorMode(nextSessionId, false);
-      await bindLocalSessionListener(nextSessionId);
-      onConnected?.(nextSessionId);
+  async function replayAndDrainLocalSession(
+    nextSessionId: string,
+    generation: number,
+    historyChunks: Array<{ seq: number; data: Uint8Array }>
+  ): Promise<boolean> {
+    let chunks = historyChunks;
+    while (isConnectionAttemptActive(generation, nextSessionId)) {
+      if (!(await writeChunksTimeSliced(chunks, generation, nextSessionId))) return false;
+      if (replayBufferOverflowed) {
+        replayBufferOverflowed = false;
+        replayBufferedChunks = [];
+        replayBufferedBytes = 0;
+        chunks = await localShellGetOutput(nextSessionId, lastProcessedSeq);
+        if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
+        continue;
+      }
+      if (replayBufferedChunks && replayBufferedChunks.length > 0) {
+        chunks = replayBufferedChunks;
+        replayBufferedChunks = [];
+        replayBufferedBytes = 0;
+        continue;
+      }
+      replayBufferedChunks = null;
+      replayBufferedBytes = 0;
       return true;
+    }
+    return false;
+  }
+
+  async function completeLocalSessionAttach(
+    nextSessionId: string,
+    generation: number,
+    restoreStoredSnapshot: boolean
+  ): Promise<boolean> {
+    replayBufferedChunks = [];
+    replayBufferedBytes = 0;
+    replayBufferOverflowed = false;
+    sessionId = nextSessionId;
+    connected = true;
+    statusMessage = "";
+    if (!(await bindLocalSessionListener(nextSessionId, generation))) return false;
+
+    if (restoreStoredSnapshot && parser) {
+      const runtimeSnapshot = takeRuntimeSessionSnapshot(nextSessionId);
+      if (runtimeSnapshot) {
+        restoreTerminalSnapshot(parser, runtimeSnapshot);
+        lastProcessedSeq = snapshotOutputOffset(runtimeSnapshot);
+        updateBuffer();
+      } else {
+        restoreSessionSnapshot(nextSessionId);
+      }
+    }
+    const historyChunks = await localShellGetOutput(nextSessionId, lastProcessedSeq);
+    if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
+    if (!(await replayAndDrainLocalSession(nextSessionId, generation, historyChunks))) return false;
+    await localShellResize(nextSessionId, cols, rows);
+    if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
+    terminalModesStore.setAppCursorMode(nextSessionId, false);
+    clearSessionSnapshot(nextSessionId);
+    onConnected?.(nextSessionId);
+    return true;
+  }
+
+  async function connectLocalSession(
+    showError = true,
+    generation = ++connectionGeneration
+  ): Promise<boolean> {
+    sshOutputDecoder.reset();
+    lastProcessedSeq = 0;
+    statusMessage = "Starting local shell...";
+    let nextSessionId: string | null = null;
+    try {
+      nextSessionId = await localShellStart(cols, rows);
+      if (!isConnectionAttemptActive(generation)) {
+        await localShellDisconnect(nextSessionId);
+        return false;
+      }
+      const attached = await completeLocalSessionAttach(nextSessionId, generation, false);
+      if (!attached) await localShellDisconnect(nextSessionId).catch(() => {});
+      return attached;
     } catch (e) {
+      if (nextSessionId) {
+        await localShellDisconnect(nextSessionId).catch(() => {});
+      }
+      if (!isConnectionAttemptActive(generation)) return false;
       connected = false;
       sessionId = null;
+      replayBufferedChunks = null;
+      replayBufferedBytes = 0;
+      replayBufferOverflowed = false;
       const message = e instanceof Error ? e.message : String(e);
-      statusMessage = `Failed to start local shell: ${message}`;
-      if (showError) {
-        onError?.(message);
-      }
+      statusMessage = "Failed to start local shell: " + message;
+      if (showError) onError?.(message);
       return false;
     }
   }
 
-  async function connectNewSession(showError = true): Promise<boolean> {
-    if (kind === "local") {
-      return connectLocalSession(showError);
-    }
+  async function attachExistingLocalSession(
+    nextSessionId: string,
+    generation = ++connectionGeneration
+  ): Promise<boolean> {
     sshOutputDecoder.reset();
-    statusMessage = `Connecting to ${host}:${port}...`;
+    lastProcessedSeq = 0;
+    try {
+      return await completeLocalSessionAttach(nextSessionId, generation, true);
+    } catch (error) {
+      if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
+      await localShellDisconnect(nextSessionId).catch(() => {});
+      if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
+      unlisten?.();
+      unlistenExit?.();
+      unlisten = null;
+      unlistenExit = null;
+      replayBufferedChunks = null;
+      replayBufferedBytes = 0;
+      replayBufferOverflowed = false;
+      sessionId = null;
+      connected = false;
+      lastProcessedSeq = 0;
+      resetParser();
+      const message = error instanceof Error ? error.message : String(error);
+      statusMessage = "Failed to restore local shell: " + message;
+      return false;
+    }
+  }
+
+
+  async function connectNewSession(
+    showError = true,
+    generation = ++connectionGeneration
+  ): Promise<boolean> {
+    if (kind === "local") return connectLocalSession(showError, generation);
+    if (keyPassphrasePromptResolver) resolveKeyPassphrasePrompt(null);
+    if (hostKeyPromptResolver) resolveHostKeyPrompt("cancel");
+    sshOutputDecoder.reset();
+    statusMessage = "Connecting to " + host + ":" + port + "...";
     let nextSessionId: string | null = null;
 
     try {
       const gateResult = await runHostKeyGate({
         target: { host, port },
-        preflightHostKey,
-        promptHostKey,
-        trustHostKey: trustPresentedHostKey,
-        clearTrustedHostKeyPrompt: clearHostKeyPrompt,
-        connect: connectWithKeyPassphraseRetry,
+        preflightHostKey: async (targetHost, targetPort) => {
+          const result = await preflightHostKey(targetHost, targetPort);
+          if (!isConnectionAttemptActive(generation)) {
+            throw new Error("Connection attempt superseded");
+          }
+          return result;
+        },
+        promptHostKey: (challenge) =>
+          isConnectionAttemptActive(generation)
+            ? promptHostKey(challenge)
+            : Promise.resolve("cancel"),
+        trustHostKey: async (request) => {
+          if (!isConnectionAttemptActive(generation)) {
+            throw new Error("Connection attempt superseded");
+          }
+          await trustPresentedHostKey(request);
+          if (!isConnectionAttemptActive(generation)) {
+            throw new Error("Connection attempt superseded");
+          }
+        },
+        clearTrustedHostKeyPrompt: () => {
+          if (isConnectionAttemptActive(generation)) clearHostKeyPrompt();
+        },
+        connect: () => connectWithKeyPassphraseRetry(generation),
       });
 
+      if (!isConnectionAttemptActive(generation)) {
+        if (gateResult.status !== "blocked") await sshDisconnect(gateResult.sessionId).catch(() => {});
+        return false;
+      }
       if (gateResult.status === "blocked") {
         clearHostKeyPrompt();
         startupScriptDispatcher = null;
         connected = false;
         if (gateResult.reason === "preflight-failed") {
-          statusMessage = `Connection failed: ${gateResult.error}`;
-          if (showError) {
-            onError?.(gateResult.error);
-          }
+          statusMessage = "Connection failed: " + gateResult.error;
+          if (showError) onError?.(gateResult.error);
         } else {
           statusMessage = "Connection cancelled";
         }
@@ -1750,61 +2110,114 @@
       connected = true;
       lastProcessedSeq = 0;
       statusMessage = "";
+      startupScriptDispatcher = createStartupScriptDispatcher(startupScript, startupScriptReadyText);
       terminalModesStore.setAppCursorMode(nextSessionId, false);
       replayBufferedChunks = [];
       replayBufferedBytes = 0;
-      await bindSessionListener(nextSessionId);
+      if (!(await bindSessionListener(nextSessionId, generation))) {
+        throw new Error("Connection attempt superseded");
+      }
       const historyChunks = await sshGetSessionOutput(nextSessionId);
-      await replayAndDrainSessionChunks(historyChunks);
+      if (!isConnectionAttemptActive(generation, nextSessionId)) {
+        throw new Error("Connection attempt superseded");
+      }
+      if (!(await replayAndDrainSessionChunks(historyChunks, generation, nextSessionId))) {
+        throw new Error("Connection attempt superseded");
+      }
+      if (!isConnectionAttemptActive(generation, nextSessionId)) {
+        throw new Error("Connection attempt superseded");
+      }
       const dispatcher = startupScriptDispatcher;
-      if (!dispatcher) {
-        throw new Error("Startup script dispatcher was not initialized");
-      }
+      if (!dispatcher) throw new Error("Startup script dispatcher was not initialized");
       const startupPayload = dispatcher.takeImmediatePayload();
-      if (startupPayload) {
-        queueWrite(startupPayload);
-      }
+      if (startupPayload) queueWrite(startupPayload);
+      if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
       onConnected?.(nextSessionId);
       requestNotificationPermission();
       return true;
     } catch (e) {
+      if (!isConnectionAttemptActive(generation)) {
+        if (nextSessionId) {
+          await sshDisconnect(nextSessionId).catch(() => {});
+        }
+        return false;
+      }
       replayBufferedChunks = null;
       replayBufferedBytes = 0;
       if (nextSessionId) {
-        if (unlisten) {
-          unlisten();
-          unlisten = null;
-        }
-        if (unlistenExit) {
-          unlistenExit();
-          unlistenExit = null;
-        }
-        if (sessionId === nextSessionId) {
-          sessionId = null;
-        }
+        unlisten?.();
+        unlistenExit?.();
+        unlisten = null;
+        unlistenExit = null;
+        if (sessionId === nextSessionId) sessionId = null;
         terminalModesStore.clearSession(nextSessionId);
         clearSessionSnapshot(nextSessionId);
         try {
           await sshDisconnect(nextSessionId);
         } catch (cleanupError) {
-          console.error("Failed to clean up partially initialized SSH session:", cleanupError);
+          if (isConnectionAttemptActive(generation)) {
+            console.error("Failed to clean up partially initialized SSH session:", cleanupError);
+          }
         }
       }
+      if (!isConnectionAttemptActive(generation)) return false;
       clearHostKeyPrompt();
       startupScriptDispatcher = null;
       connected = false;
       const errorMsg = e instanceof Error ? e.message : String(e);
-      statusMessage = `Connection failed: ${errorMsg}`;
-      if (showError) {
-        onError?.(errorMsg);
-      }
+      statusMessage = "Connection failed: " + errorMsg;
+      if (showError) onError?.(errorMsg);
       return false;
     }
   }
 
-  function resetParser() {
+  function handleOscEvent(event: TerminalOscEvent) {
+    if (destroyed) return;
+    if (event.type === "title") {
+      onTitleChange?.(event.value);
+      return;
+    }
+    if (event.type === "current-directory") {
+      currentDirectoryUri = event.uri;
+      return;
+    }
+    if (event.type === "colors") {
+      renderer?.updateConfig({
+        defaultFg: event.colors.foreground,
+        defaultBg: event.colors.background,
+        cursorColor: event.colors.cursor,
+      });
+      requestRedraw();
+      return;
+    }
+    if (!interactive || !navigator.clipboard?.writeText) return;
+    void navigator.clipboard.writeText(event.text).catch((error) => {
+      console.error("[Terminal] OSC 52 clipboard write failed:", error);
+    });
+  }
+
+  function resetParser(notifyTitleReset = true) {
+    if (destroyed) return;
     clearSynchronizedOutputTimer();
+    parserGeneration++;
+    clearImageAnimationTimer();
+    renderer?.resetImageCache();
+    currentDirectoryUri = null;
+    if (notifyTitleReset) onTitleChange?.("");
     parser = new AnsiParser(cols, rows);
+    parser.setCellSize(charWidth, charHeight);
+    const theme = getThemeById(settingsStore.theme) ?? THEMES[0];
+    renderer?.updateConfig({
+      defaultFg: theme.colors.terminalFg,
+      defaultBg: theme.colors.terminalBg,
+      cursorColor: theme.colors.terminalCursor,
+    });
+    parser.setOscColorDefaults({
+      foreground: theme.colors.terminalFg,
+      background: theme.colors.terminalBg,
+      cursor: theme.colors.terminalCursor,
+    });
+    parser.setOscEventHandler(handleOscEvent);
     parser.setResponseHandler((data: string) => {
       enqueueAutomaticResponse(data);
     });
@@ -1812,71 +2225,81 @@
   }
 
   async function reconnectSession(reason: string) {
-    if (reconnecting || disconnectRequested) return;
+    if (reconnecting || disconnectRequested || destroyed) return;
     reconnecting = true;
-
-    const oldSessionId = sessionId;
-    connected = false;
-    statusMessage = `Reconnecting (${reason})...`;
-
-    if (unlisten) {
-      unlisten();
-      unlisten = null;
-    }
-    if (unlistenExit) {
-      unlistenExit();
-      unlistenExit = null;
-    }
-
-    startupScriptDispatcher = null;
-    if (oldSessionId) {
-      terminalModesStore.clearSession(oldSessionId);
-      clearSessionSnapshot(oldSessionId);
-      try {
-        await disconnectSessionRemote(oldSessionId);
-      } catch {
-        // old session may already be gone
-      }
-    }
-    sessionId = null;
-    lastProcessedSeq = 0;
-    resetParser();
-    clearAutomaticResponses();
-    hangulComposer.reset();
-    pendingCommitKey = null;
-    suppressPlainSpace = false;
+    const generation = ++connectionGeneration;
+    resumingSshData = false;
+    replayBufferedChunks = null;
+    replayBufferedBytes = 0;
 
     try {
-      const reconnected = await connectNewSession(false);
+      const oldSessionId = sessionId;
+      connected = false;
+      statusMessage = "Reconnecting (" + reason + ")...";
+
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
+      }
+      if (unlistenExit) {
+        unlistenExit();
+        unlistenExit = null;
+      }
+      clearPendingOutput();
+      parserGeneration++;
+      clearAutomaticResponses();
+
+      startupScriptDispatcher = null;
+      if (oldSessionId) {
+        terminalModesStore.clearSession(oldSessionId);
+        clearSessionSnapshot(oldSessionId);
+        try {
+          await disconnectSessionRemote(oldSessionId);
+        } catch {
+          // old session may already be gone
+        }
+      }
+      if (!isConnectionAttemptActive(generation)) return;
+
+      sessionId = null;
+      lastProcessedSeq = 0;
+      resetParser();
+      hangulComposer.reset();
+      pendingCommitKey = null;
+      suppressPlainSpace = false;
+
+      const reconnected = await connectNewSession(false, generation);
+      if (!isConnectionAttemptActive(generation)) return;
       if (reconnected) {
         await tick();
-        focusInput();
+        if (isConnectionAttemptActive(generation)) focusInput();
       } else {
         onDisconnected?.();
       }
     } finally {
-      reconnecting = false;
+      if (connectionGeneration === generation) reconnecting = false;
     }
   }
-
   async function probeAndReconnect() {
     if (disconnectRequested || reconnecting) return;
-    // Local shells need no liveness probe or history replay on resume.
     if (kind === "local") return;
 
     if (!sessionId) {
-      // Session was lost while backgrounded, try to reconnect
       if (!connected && host) {
         await reconnectSession("resume after disconnect");
       }
       return;
     }
 
+    const activeId = sessionId;
+    const generation = connectionGeneration;
     try {
-      await sshResize(sessionId, cols, rows);
-      connected = true;
+      await sshResize(activeId, cols, rows);
+      if (isConnectionAttemptActive(generation, activeId)) connected = true;
     } catch {
-      await reconnectSession("resume");
+      if (isConnectionAttemptActive(generation, activeId)) {
+        await reconnectSession("resume");
+      }
     }
   }
 
@@ -1886,31 +2309,41 @@
 
     pauseSshDataSource();
     processPendingOutputSlice(true);
-    void sshStoreSessionSnapshot(sessionId, parser.createSnapshot(), lastProcessedSeq).catch(() => {});
+    void sshStoreSessionSnapshot(sessionId, createTerminalSnapshot(parser), lastProcessedSeq).catch(() => {});
   }
 
-  async function writeChunksTimeSliced(chunks: Array<{ seq: number; data: Uint8Array }>) {
+  async function writeChunksTimeSliced(
+    chunks: Array<{ seq: number; data: Uint8Array }>,
+    generation = connectionGeneration,
+    expectedSessionId = sessionId ?? undefined
+  ): Promise<boolean> {
+    const replayGeneration = parserGeneration;
+    const replayParser = parser;
+    const replayIsActive = () =>
+      isConnectionAttemptActive(generation, expectedSessionId) &&
+      parserGeneration === replayGeneration &&
+      parser === replayParser;
+    if (!replayParser || !replayIsActive()) return false;
+
     let sliceStart = performance.now();
     for (const chunk of chunks) {
+      if (!replayIsActive()) return false;
       if (chunk.seq <= lastProcessedSeq) continue;
       const text = sshOutputDecoder.decode(chunk.data);
       const startupPayload = startupScriptDispatcher?.consumeOutput(text);
-      if (startupPayload) {
-        queueWrite(startupPayload);
-      }
+      if (startupPayload && replayIsActive()) queueWrite(startupPayload);
 
       let offset = 0;
       while (offset < text.length) {
         let end = Math.min(offset + 4096, text.length);
         const finalCodeUnit = text.charCodeAt(end - 1);
-        if (end < text.length && finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff) {
-          end--;
-        }
-        parser?.write(text.slice(offset, end));
+        if (end < text.length && finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff) end--;
+        replayParser.write(text.slice(offset, end));
         offset = end;
         if (offset < text.length && performance.now() - sliceStart >= REPLAY_SLICE_BUDGET_MS) {
           updateBuffer();
           await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          if (!replayIsActive()) return false;
           sliceStart = performance.now();
         }
       }
@@ -1918,25 +2351,33 @@
       if (performance.now() - sliceStart >= REPLAY_SLICE_BUDGET_MS) {
         updateBuffer();
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        if (!replayIsActive()) return false;
         sliceStart = performance.now();
       }
     }
+    if (!replayIsActive()) return false;
     updateBuffer();
+    return true;
   }
 
-  async function replayAndDrainSessionChunks(historyChunks: Array<{ seq: number; data: Uint8Array }>) {
-    if (parser && historyChunks.length > 0) {
-      await writeChunksTimeSliced(historyChunks);
-    }
+  async function replayAndDrainSessionChunks(
+    historyChunks: Array<{ seq: number; data: Uint8Array }>,
+    generation = connectionGeneration,
+    expectedSessionId = sessionId ?? undefined
+  ): Promise<boolean> {
+    if (!(await writeChunksTimeSliced(historyChunks, generation, expectedSessionId))) return false;
 
     while (replayBufferedChunks && replayBufferedChunks.length > 0) {
+      if (!isConnectionAttemptActive(generation, expectedSessionId)) return false;
       const buffered = replayBufferedChunks;
       replayBufferedChunks = [];
       replayBufferedBytes = 0;
-      await writeChunksTimeSliced(buffered);
+      if (!(await writeChunksTimeSliced(buffered, generation, expectedSessionId))) return false;
     }
+    if (!isConnectionAttemptActive(generation, expectedSessionId)) return false;
     replayBufferedChunks = null;
     replayBufferedBytes = 0;
+    return true;
   }
 
   async function resumeAfterBackground() {
@@ -1947,15 +2388,18 @@
       return;
     }
 
+    const generation = connectionGeneration;
     resumingSshData = true;
     try {
       do {
         const activeId = sessionId;
+        if (!activeId || !isConnectionAttemptActive(generation, activeId)) return;
         replayBufferedChunks = [];
         replayBufferedBytes = 0;
-        await bindSessionListener(activeId);
+        if (!(await bindSessionListener(activeId, generation))) return;
         const chunks = await sshGetSessionOutput(activeId);
-        await replayAndDrainSessionChunks(chunks);
+        if (!isConnectionAttemptActive(generation, activeId)) return;
+        if (!(await replayAndDrainSessionChunks(chunks, generation, activeId))) return;
       } while (
         sshDataPaused &&
         pendingDataCharacters === 0 &&
@@ -1965,49 +2409,57 @@
     } catch {
       // probeAndReconnect below decides between reconnect and teardown.
     } finally {
-      replayBufferedChunks = null;
-      replayBufferedBytes = 0;
-      resumingSshData = false;
+      if (connectionGeneration === generation) {
+        replayBufferedChunks = null;
+        replayBufferedBytes = 0;
+        resumingSshData = false;
+      }
     }
-    await probeAndReconnect();
+    if (connectionGeneration === generation) await probeAndReconnect();
   }
 
   async function initTerminal() {
     // 레이아웃이 안정될 때까지 대기 (ExtraKeysBar 등 조건부 컴포넌트 렌더 후)
     await tick();
     await new Promise(r => requestAnimationFrame(r));
+    if (destroyed) return;
 
     calculateSize();
-    resetParser();
+    resetParser(false);
 
-    // Setup resize observer
     resizeObserver = new ResizeObserver(() => {
+      if (destroyed) return;
       calculateSize();
+      updateImageAnimationVisibility();
     });
     resizeObserver.observe(terminalContainer);
+    surfaceVisibilityObserver = new IntersectionObserver(([entry]) => {
+      terminalSurfaceIntersecting = entry?.isIntersecting ?? false;
+      updateImageAnimationVisibility();
+      if (terminalSurfaceVisible && parser) {
+        parser.markAllDirty();
+        updateBuffer(true);
+      }
+    });
+    surfaceVisibilityObserver.observe(terminalContainer);
+    updateImageAnimationVisibility();
 
     let attached = false;
     if (kind === "local" && existingSessionId) {
-      // A moved local shell is still running in the backend; re-subscribe to
-      // its event stream instead of spawning a second shell, and resync the
-      // PTY size to the new pane geometry.
-      sessionId = existingSessionId;
-      connected = true;
-      statusMessage = "";
-      await bindLocalSessionListener(existingSessionId);
-      localShellResize(existingSessionId, cols, rows).catch(console.error);
-      onConnected?.(existingSessionId);
-      attached = true;
+      attached = await attachExistingLocalSession(existingSessionId);
+      if (destroyed || disconnectRequested) return;
     } else if (existingSessionId) {
       attached = await attachExistingSession(existingSessionId);
+      if (destroyed || disconnectRequested) return;
     }
 
     if (!attached) {
       await connectNewSession();
+      if (destroyed || disconnectRequested) return;
     }
 
     await tick();
-    focusInput();
+    if (!destroyed) focusInput();
   }
 
   function focusInput() {
@@ -2056,6 +2508,11 @@
     const themeId = settingsStore.theme;
     if (!renderer) return;
     const def = getThemeById(themeId) ?? THEMES[0];
+    parser?.setOscColorDefaults({
+      foreground: def.colors.terminalFg,
+      background: def.colors.terminalBg,
+      cursor: def.colors.terminalCursor,
+    });
     renderer.updateConfig({
       defaultFg: def.colors.terminalFg,
       defaultBg: def.colors.terminalBg,
@@ -2068,7 +2525,9 @@
     if (statusMessage) return;
 
     if (e.pointerType === "mouse") {
-      if (shouldForwardTerminalMouseEvents()) {
+      const localSelectionOverride =
+        e.button === 0 && e.shiftKey && shouldForwardTerminalMouseEvents();
+      if (shouldForwardTerminalMouseEvents() && !localSelectionOverride) {
         if (e.button < 0 || e.button > 2) return;
         e.preventDefault();
         suppressNextFocus = true;
@@ -2084,6 +2543,7 @@
       }
       if (e.button !== 0) return;
 
+      if (localSelectionOverride) localSelectionPointerId = e.pointerId;
       e.preventDefault();
       suppressNextFocus = true;
 
@@ -2126,7 +2586,7 @@
 
 
   function handleScreenPointerMove(e: PointerEvent) {
-    if (e.pointerType === "mouse") {
+    if (e.pointerType === "mouse" && localSelectionPointerId !== e.pointerId) {
       const buttonPressed =
         terminalMousePointerId === e.pointerId && terminalMouseButton !== null;
       const reportsHover = parser?.shouldReportMouseMotion(false) ?? false;
@@ -2197,6 +2657,7 @@
   }
 
   function handleScreenPointerEnd(e: PointerEvent) {
+    if (localSelectionPointerId === e.pointerId) localSelectionPointerId = null;
     if (terminalMousePointerId === e.pointerId) {
       e.preventDefault();
       sendMouseButton(
@@ -2255,7 +2716,13 @@
     }
 
     if (touchPointerId === e.pointerId) {
-      if (e.pointerType === "touch" && !touchPointerMoved && !longPressTriggered && touchPointerStart) {
+      if (
+        e.type === "pointerup" &&
+        e.pointerType === "touch" &&
+        !touchPointerMoved &&
+        !longPressTriggered &&
+        touchPointerStart
+      ) {
         if (shouldForwardTerminalMouseEvents()) {
           const point = pointerToViewportCell(e);
           sendMouseButton(0, point, true, e);
@@ -2572,90 +3039,58 @@
   }
 
   function clearAutomaticResponses() {
-    automaticResponseQueue = [];
-    automaticResponseBytes = 0;
-    automaticResponseSending = false;
-    automaticResponseWindowStartedAt = 0;
-    automaticResponseCount = 0;
-    protocolFloodDetected = false;
+    automaticResponseBuffer.clear();
+    automaticResponseFlushScheduled = false;
+    automaticResponseGeneration++;
   }
 
-  function stopForAutomaticResponseFlood() {
-    if (protocolFloodDetected) return;
-    protocolFloodDetected = true;
-    automaticResponseQueue = [];
-    automaticResponseBytes = 0;
-    statusMessage = "Connection closed: excessive terminal status requests";
-    void disconnect();
-  }
-
-  async function drainAutomaticResponses() {
-    if (automaticResponseSending) return;
-    automaticResponseSending = true;
-    try {
-      while (automaticResponseQueue.length > 0) {
-        const activeSessionId = sessionId;
-        if (!activeSessionId) break;
-        const response = automaticResponseQueue.shift()!;
-        automaticResponseBytes -= response.length;
-        sendSessionData(encoder.encode(response));
-      }
-    } catch (error) {
-      handleWriteError(error);
-    } finally {
-      automaticResponseSending = false;
-      if (automaticResponseQueue.length > 0 && sessionId) {
-        void drainAutomaticResponses();
-      }
+  function flushAutomaticResponses(generation: number, expectedSessionId: string) {
+    if (generation !== automaticResponseGeneration) return;
+    automaticResponseFlushScheduled = false;
+    if (sessionId !== expectedSessionId) {
+      automaticResponseBuffer.clear();
+      return;
     }
+
+    const data = automaticResponseBuffer.drain();
+    if (data.length > 0) sendSessionData(encoder.encode(data));
   }
 
   function enqueueAutomaticResponse(data: string) {
-    if (!sessionId || data.length === 0) return;
-    const now = performance.now();
-    if (
-      automaticResponseWindowStartedAt === 0 ||
-      now - automaticResponseWindowStartedAt >= 1000
-    ) {
-      automaticResponseWindowStartedAt = now;
-      automaticResponseCount = 0;
-    }
-    // Identical consecutive replies are coalesced and must not consume the
-    // flood budget (prompt themes legitimately re-ask the same query).
-    if (automaticResponseQueue.at(-1) === data) return;
-    automaticResponseCount++;
-    if (automaticResponseCount > MAX_AUTOMATIC_RESPONSES_PER_SECOND) {
-      stopForAutomaticResponseFlood();
-      return;
-    }
-    if (
-      automaticResponseQueue.length >= MAX_AUTOMATIC_RESPONSE_QUEUE ||
-      automaticResponseBytes + data.length > MAX_AUTOMATIC_RESPONSE_BYTES
-    ) {
-      stopForAutomaticResponseFlood();
-      return;
-    }
-    automaticResponseQueue.push(data);
-    automaticResponseBytes += data.length;
-    void drainAutomaticResponses();
+    const activeSessionId = sessionId;
+    if (!activeSessionId || !automaticResponseBuffer.enqueue(data)) return;
+    if (automaticResponseFlushScheduled) return;
+
+    automaticResponseFlushScheduled = true;
+    const generation = automaticResponseGeneration;
+    queueMicrotask(() => {
+      flushAutomaticResponses(generation, activeSessionId);
+    });
   }
 
   function queueWrite(data: string) {
-    if (!sessionId || data.length === 0) return;
+    const queuedSessionId = sessionId;
+    if (!queuedSessionId || data.length === 0) return;
     pendingWrite += data;
     if (writeFlushScheduled) return;
 
+    const generation = connectionGeneration;
     writeFlushScheduled = true;
     queueMicrotask(() => {
       writeFlushScheduled = false;
-      if (!sessionId || pendingWrite.length === 0) return;
+      if (
+        !isConnectionAttemptActive(generation, queuedSessionId) ||
+        pendingWrite.length === 0
+      ) {
+        pendingWrite = "";
+        return;
+      }
 
       const payload = pendingWrite;
       pendingWrite = "";
       sendSessionData(encoder.encode(payload));
     });
   }
-
   // Apply on-screen modifier state to a single composed character and write.
   function writeComposed(result: HangulFeedResult) {
     if (result.erase > 0) queueWrite("\x7f".repeat(result.erase));
@@ -2702,16 +3137,43 @@
   }
 
   onDestroy(() => {
+    connectionGeneration++;
+    if (hostKeyPromptResolver) resolveHostKeyPrompt("cancel");
+    if (keyPassphrasePromptResolver) resolveKeyPassphrasePrompt(null);
+    destroyed = true;
+    parserGeneration++;
+    const activeParser = parser;
+    activeParser?.setOscEventHandler(() => {});
     const activeSessionId = sessionId;
+    if (
+      activeSessionId &&
+      terminalMouseButton !== null &&
+      lastTerminalMouseCell &&
+      activeParser?.shouldReportMouseRelease()
+    ) {
+      sendMouseButton(terminalMouseButton, lastTerminalMouseCell, false);
+    }
+    if (
+      terminalMousePointerId !== null &&
+      scrollContainer?.hasPointerCapture(terminalMousePointerId)
+    ) {
+      scrollContainer.releasePointerCapture(terminalMousePointerId);
+    }
+    terminalMousePointerId = null;
+    terminalMouseButton = null;
+    lastTerminalMouseCell = null;
+    localSelectionPointerId = null;
     const isBackgroundTeardown =
       typeof document !== "undefined" && document.visibilityState === "hidden";
 
-    if (activeSessionId && isBackgroundTeardown && kind === "ssh") {
-      if (parser) {
-        void sshStoreSessionSnapshot(activeSessionId, parser.createSnapshot(), lastProcessedSeq).catch((e) => {
-          console.error("Store session snapshot error:", e);
-        });
-      }
+    if (activeSessionId && isBackgroundTeardown && kind === "ssh" && activeParser) {
+      void sshStoreSessionSnapshot(
+        activeSessionId,
+        createTerminalSnapshot(activeParser),
+        lastProcessedSeq
+      ).catch((e) => {
+        console.error("Store session snapshot error:", e);
+      });
     }
 
     // Disconnect SSH session when tab is closed. Callers moving a live
@@ -2727,6 +3189,10 @@
     clearTouchLongPressTimer();
 
     clearSelectionFeedbackTimer();
+    surfaceVisibilityObserver?.disconnect();
+    surfaceVisibilityObserver = null;
+    terminalSurfaceIntersecting = false;
+    renderer?.setAnimationsEnabled(false);
     if (visibilityChangeHandler) {
       document.removeEventListener("visibilitychange", visibilityChangeHandler);
       visibilityChangeHandler = null;
@@ -2745,9 +3211,11 @@
       deferredUpdateTimer = null;
     }
     clearSynchronizedOutputTimer();
+    clearImageAnimationTimer();
     if (cursorInterval) {
       clearInterval(cursorInterval);
     }
+    parser = null;
     if (renderer) {
       renderer.destroy();
       renderer = null;
@@ -2806,6 +3274,9 @@
   }
 
   export async function disconnect() {
+    connectionGeneration++;
+    if (hostKeyPromptResolver) resolveHostKeyPrompt("cancel");
+    if (keyPassphrasePromptResolver) resolveKeyPassphrasePrompt(null);
     disconnectRequested = true;
 
     const activeSessionId = sessionId;
@@ -2837,6 +3308,10 @@
     onDisconnected?.();
   }
 
+  export function getCurrentDirectoryUri(): string | null {
+    return currentDirectoryUri;
+  }
+
   export function focus() {
     focusInput();
   }
@@ -2852,9 +3327,19 @@
   /// is nothing to store).
   export function storeSnapshot(): Promise<void> {
     if (sessionId && parser) {
+      processPendingOutputSlice(true);
+      storeRuntimeSessionSnapshot(sessionId, createRuntimeTerminalSnapshot(parser));
+      if (kind === "local") {
+        try {
+          saveSessionSnapshot(sessionId);
+        } catch (error) {
+          console.error("Store local terminal snapshot error:", error);
+        }
+        return Promise.resolve();
+      }
       return sshStoreSessionSnapshot(
         sessionId,
-        parser.createSnapshot(),
+        createTerminalSnapshot(parser),
         lastProcessedSeq
       ).catch(() => {});
     }

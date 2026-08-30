@@ -14,6 +14,18 @@ describe("SshOutputDecoder", () => {
     expect(decoder.decode(bytes.slice(6))).toBe("🙂B");
   });
 
+  test("restores an incomplete UTF-8 character from a snapshot", () => {
+    const source = new SshOutputDecoder();
+    const bytes = new TextEncoder().encode("한");
+    expect(source.decode(bytes.slice(0, 2))).toBe("");
+
+    const restored = new SshOutputDecoder();
+    restored.restorePendingBytes(source.getPendingBytes());
+
+    expect(restored.decode(bytes.slice(2))).toBe("한");
+    expect(restored.getPendingBytes()).toEqual([]);
+  });
+
   test("does not carry an incomplete character into a new SSH session", () => {
     const decoder = new SshOutputDecoder();
     const bytes = new TextEncoder().encode("한");

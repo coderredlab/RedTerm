@@ -171,7 +171,6 @@
     const next = tabsStore.tabs[(index + delta + count) % count]!;
     tabsStore.setActiveTab(next.id);
   }
-
   function selectTabByIndex(index: number) {
     const tab = tabsStore.tabs[index];
     if (tab) {
@@ -179,11 +178,45 @@
     }
   }
 
+  let layoutSnapshotOperation: Promise<void> = Promise.resolve();
+
+  function serializeLayoutSnapshotOperation(operation: () => Promise<void>): Promise<void> {
+    const next = layoutSnapshotOperation.then(operation, operation);
+    layoutSnapshotOperation = next.catch(() => {});
+    return next;
+  }
+
+  async function storeTabSnapshots(tabIds: string[]) {
+    const paneIds = new Set(
+      tabIds.flatMap((tabId) => tabsStore.getTab(tabId)?.panes.map((pane) => pane.id) ?? [])
+    );
+    await Promise.all(
+      [...paneIds].map(
+        (paneId) => terminals.get(paneId)?.storeSnapshot() ?? Promise.resolve()
+      )
+    );
+  }
+
+  async function splitPaneWithSnapshot(
+    tabId: string,
+    paneId: string,
+    dir: "row" | "col"
+  ): Promise<void> {
+    return serializeLayoutSnapshotOperation(async () => {
+      await storeTabSnapshots([tabId]);
+      await tick();
+      await tabsStore.splitPane(tabId, paneId, dir);
+      for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {
+        terminals.get(pane.id)?.syncSize();
+      }
+    });
+  }
+
   function splitActivePane(dir: "row" | "col") {
     const tab = tabsStore.activeTab;
     const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
     if (tab && paneId) {
-      tabsStore.splitPane(tab.id, paneId, dir);
+      void splitPaneWithSnapshot(tab.id, paneId, dir);
     }
   }
 
@@ -255,21 +288,14 @@
 
     const dir = zone === "left" || zone === "right" ? "row" : "col";
     const side = zone === "left" || zone === "top" ? "before" : "after";
-
-    // Persist each live screen so the remount after the move restores it
-    // exactly instead of replaying the full session output. The writes
-    // must complete before the remount reads the snapshot back.
-    await Promise.all(
-      source.panes
-        .filter((pane) => pane.kind !== "local")
-        .map((pane) => terminals.get(pane.id)?.storeSnapshot() ?? Promise.resolve())
-    );
-    await tick();
-    await tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
-    // The moved panes remounted at the target geometry — resync PTY sizes.
-    for (const pane of tabsStore.getTab(targetTabId)?.panes ?? []) {
-      terminals.get(pane.id)?.syncSize();
-    }
+    await serializeLayoutSnapshotOperation(async () => {
+      await storeTabSnapshots([sourceTabId, targetTabId]);
+      await tick();
+      await tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
+      for (const pane of tabsStore.getTab(targetTabId)?.panes ?? []) {
+        terminals.get(pane.id)?.syncSize();
+      }
+    });
   }
 
   async function handlePaneDrop(tabId: string, paneId: string) {
@@ -291,10 +317,14 @@
     const dir = zone === "left" || zone === "right" ? "row" : "col";
     const side = zone === "left" || zone === "top" ? "before" : "after";
 
-    await terminals.get(paneId)?.storeSnapshot();
-    await tick();
-    await tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side);
-    terminals.get(paneId)?.syncSize();
+    await serializeLayoutSnapshotOperation(async () => {
+      await storeTabSnapshots([tabId]);
+      await tick();
+      await tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side);
+      for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {
+        terminals.get(pane.id)?.syncSize();
+      }
+    });
   }
 
   const workspaceApi: WorkspaceApi = {
@@ -311,13 +341,18 @@
       tabsStore.setPaneDisconnected(tabId, paneId);
     },
     closePane(tabId, paneId) {
-      void (async () => {
+      void serializeLayoutSnapshotOperation(async () => {
+        await storeTabSnapshots([tabId]);
         await disconnectTerminal(paneId);
-        tabsStore.closePane(tabId, paneId);
-      })();
+        await tabsStore.closePane(tabId, paneId);
+        await tick();
+        for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {
+          terminals.get(pane.id)?.syncSize();
+        }
+      });
     },
     splitPane(tabId, paneId, dir) {
-      tabsStore.splitPane(tabId, paneId, dir);
+      void splitPaneWithSnapshot(tabId, paneId, dir);
     },
     activatePane(tabId, paneId) {
       tabsStore.setActivePane(tabId, paneId);

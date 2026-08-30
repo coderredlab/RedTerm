@@ -23,9 +23,20 @@ const DEFAULT_CONFIG: CanvasRendererConfig = {
 
 const MAX_IMAGE_CACHE_ENTRIES = 64;
 const MAX_IMAGE_CACHE_PIXELS = 8 * 1024 * 1024;
+const KITTY_Z_INDEX_BELOW_CELL_BACKGROUNDS = -0x40000000;
+
+export function compareTerminalImageOrder(left: TerminalImage, right: TerminalImage): number {
+  const zOrder = left.zIndex - right.zIndex;
+  if (zOrder !== 0) return zOrder;
+  if (left.protocol === 'kitty' && right.protocol === 'kitty') {
+    const imageOrder = (left.imageId ?? left.id) - (right.imageId ?? right.id);
+    if (imageOrder !== 0) return imageOrder;
+  }
+  return left.id - right.id;
+}
 
 type ImageCacheEntry =
-  | { kind: 'ready'; canvas: HTMLCanvasElement; pixelCount: number }
+  | { kind: 'ready'; source: CanvasImageSource; pixelCount: number; url?: string; animated: boolean }
   | { kind: 'loading'; url: string; pixelCount: number };
 
 export class CanvasRenderer {
@@ -38,7 +49,9 @@ export class CanvasRenderer {
   private dpr: number;
   private imageCache = new Map<number, ImageCacheEntry>();
   private imageCachePixels = 0;
-  private activeImageIds = new Set<number>();
+  private animatedImageTimer: ReturnType<typeof setInterval> | null = null;
+  private animatedImageSeenThisFrame = false;
+  private animationsEnabled = true;
 
 
   charWidth = 0;
@@ -128,6 +141,7 @@ export class CanvasRenderer {
 
   /** 스크롤 소수점 오프셋 적용 — clear() 후, 모든 draw 호출 전에 호출 */
   beginDraw(scrollFracY: number) {
+    this.animatedImageSeenThisFrame = false;
     this.ctx.save();
     this.ctx.translate(0, -scrollFracY);
   }
@@ -135,115 +149,91 @@ export class CanvasRenderer {
   /** beginDraw 후 draw 완료 시 호출 — 오프스크린 버퍼를 visible canvas에 한번에 복사 */
   endDraw() {
     this.ctx.restore();
-    // restore() 후 폰트/baseline 재설정
     this.ctx.font = `${this.config.fontSize}px ${this.config.fontFamily}`;
     this.ctx.textBaseline = 'top';
-
-    // 더블 버퍼링: 완성된 프레임을 visible canvas에 한번에 복사
     this.visibleCtx.drawImage(this.offscreen, 0, 0);
+    this.updateAnimatedImageTimer();
+  }
+  drawRow(screenY: number, cells: Cell[]) {
+    this.drawRowBackground(screenY, cells, true);
+    this.drawRowText(screenY, cells);
   }
 
-  drawRow(screenY: number, cells: Cell[]) {
-    const { horizontalPadding, defaultBg, fontSize, fontFamily } = this.config;
+  private drawRowBackground(screenY: number, cells: Cell[], clearDefaultBackground = false) {
+    const { horizontalPadding, defaultBg } = this.config;
     const y = screenY * this.charHeight;
-    const baseFont = `${fontSize}px ${fontFamily}`;
-
-    // 행 배경 클리어 (+1px overlap으로 서브픽셀 갭 방지)
     const rowH = this.charHeight + 1;
-    this.ctx.fillStyle = defaultBg;
-    this.ctx.fillRect(0, y, this.canvas.width / this.dpr, rowH);
-
-    // Pass 1: 셀 배경 그리기 (같은 색 연속 셀을 하나의 rect로 합쳐서 서브픽셀 갭 방지)
+    if (clearDefaultBackground) {
+      this.ctx.fillStyle = defaultBg;
+      this.ctx.fillRect(0, y, this.canvas.width / this.dpr, rowH);
+    }
     let x = horizontalPadding;
     let runBg = '';
     let runX = 0;
     let runW = 0;
-
-    for (let i = 0; i < cells.length; i++) {
-      const cell = cells[i];
+    for (const cell of cells) {
       if (cell.char === '') continue;
       const cellWidth = this.isWideChar(cell.char) ? this.charWidth * 2 : this.charWidth;
       const bg = this.resolveBg(cell.style);
-
       if (bg !== defaultBg) {
         if (bg === runBg) {
-          // 같은 배경색 연속 — run 확장
           runW += cellWidth;
         } else {
-          // 이전 run flush
           if (runW > 0) {
             this.ctx.fillStyle = runBg;
             this.ctx.fillRect(runX, y, runW, rowH);
           }
-          // 새 run 시작
           runBg = bg;
           runX = x;
           runW = cellWidth;
         }
-      } else {
-        // default bg — 이전 run flush
-        if (runW > 0) {
-          this.ctx.fillStyle = runBg;
-          this.ctx.fillRect(runX, y, runW, rowH);
-          runW = 0;
-        }
+      } else if (runW > 0) {
+        this.ctx.fillStyle = runBg;
+        this.ctx.fillRect(runX, y, runW, rowH);
+        runW = 0;
       }
       x += cellWidth;
     }
-    // 마지막 run flush
     if (runW > 0) {
       this.ctx.fillStyle = runBg;
       this.ctx.fillRect(runX, y, runW, rowH);
     }
+  }
 
-    // Pass 2: 모든 텍스트 그리기 (배경 위에 — 너드폰트 overflow 보호)
-    // textAlign='center'로 모든 문자를 셀 중앙에 배치 (DOM text-align:center 재현)
-    x = horizontalPadding;
+  private drawRowText(screenY: number, cells: Cell[]) {
+    const { horizontalPadding, fontSize, fontFamily } = this.config;
+    const y = screenY * this.charHeight;
+    const baseFont = `${fontSize}px ${fontFamily}`;
+    let x = horizontalPadding;
     let currentFont = '';
     const textY = y + (this.charHeight - fontSize) / 2;
     this.ctx.textAlign = 'center';
 
-    for (let i = 0; i < cells.length; i++) {
-      const cell = cells[i];
-      // wide char placeholder: skip (wide char already advanced x by 2 cells)
+    for (const cell of cells) {
       if (cell.char === '') continue;
-
       const style = cell.style;
       const cellWidth = this.isWideChar(cell.char) ? this.charWidth * 2 : this.charWidth;
-
-      // hidden(SGR 8): 텍스트를 그리지 않음
-      if (!style.hidden) {
-        // 전경색
+      if (!style.hidden && !cell.imagePlaceholder) {
         this.ctx.fillStyle = this.resolveFg(style);
-
-        // 폰트 (변경 시에만 설정 — 성능 최적화)
         const fontPrefix = this.getFontPrefix(style);
         const targetFont = fontPrefix ? `${fontPrefix}${baseFont}` : baseFont;
         if (targetFont !== currentFont) {
           this.ctx.font = targetFont;
           currentFont = targetFont;
         }
-
-        // 셀 중앙점에 텍스트 그리기
         this.ctx.fillText(cell.char, x + cellWidth / 2, textY);
       }
-
-      // 밑줄
-      if (style.underline) {
+      if (style.underline && !cell.imagePlaceholder) {
         this.ctx.fillStyle = this.resolveFg(style);
         this.ctx.fillRect(x, y + this.charHeight - 1, cellWidth, 1);
       }
-
-      // 취소선 (SGR 9)
-      if (style.strikethrough) {
+      if (style.strikethrough && !cell.imagePlaceholder) {
         this.ctx.fillStyle = this.resolveFg(style);
         this.ctx.fillRect(x, y + this.charHeight / 2, cellWidth, 1);
       }
-
       x += cellWidth;
     }
-
-    this.ctx.textAlign = 'start'; // 복원
+    this.ctx.textAlign = 'start';
   }
 
   drawCursor(cursorX: number, screenY: number) {
@@ -280,27 +270,67 @@ export class CanvasRenderer {
     }
   }
 
-  drawImages(images: TerminalImage[], startRow: number, endRow: number) {
-    this.activeImageIds.clear();
-    for (const image of images) this.activeImageIds.add(image.id);
-    this.pruneImageCache(this.activeImageIds);
-    for (const image of images) {
+  drawVisibleRowBackgrounds(buffer: Cell[][], startRow: number, endRow: number) {
+    for (let bufferY = startRow; bufferY < endRow && bufferY < buffer.length; bufferY++) {
+      this.drawRowBackground(bufferY - startRow, buffer[bufferY]);
+    }
+  }
+
+  drawVisibleRowText(buffer: Cell[][], startRow: number, endRow: number) {
+    for (let bufferY = startRow; bufferY < endRow && bufferY < buffer.length; bufferY++) {
+      this.drawRowText(bufferY - startRow, buffer[bufferY]);
+    }
+  }
+
+  drawImages(
+    images: TerminalImage[],
+    startRow: number,
+    endRow: number,
+    layer: 'background' | 'below' | 'above' | 'all' = 'all',
+  ) {
+    const orderedImages = images
+      .filter((image) => {
+        if (layer === 'all') return true;
+        if (layer === 'background') return image.zIndex < KITTY_Z_INDEX_BELOW_CELL_BACKGROUNDS;
+        if (layer === 'below') {
+          return image.zIndex >= KITTY_Z_INDEX_BELOW_CELL_BACKGROUNDS && image.zIndex < 0;
+        }
+        return image.zIndex >= 0;
+      })
+      .sort(compareTerminalImageOrder);
+    for (const image of orderedImages) {
       if (image.row >= endRow || image.row + image.heightCells <= startRow) continue;
       const source = this.getImageCanvas(image);
       if (!source) continue;
 
-      const x = this.config.horizontalPadding + image.col * this.charWidth;
-      const y = (image.row - startRow) * this.charHeight;
-      const width = image.widthCells * this.charWidth;
-      const height = image.heightCells * this.charHeight;
-      this.ctx.drawImage(source, x, y, width, height);
+      const x = this.config.horizontalPadding + image.col * this.charWidth + image.offsetX;
+      const y = (image.row - startRow) * this.charHeight + image.offsetY;
+      const width = image.destinationPixelWidth ?? image.widthCells * this.charWidth;
+      const height = image.destinationPixelHeight ?? image.heightCells * this.charHeight;
+      this.ctx.drawImage(
+        source,
+        image.sourceX,
+        image.sourceY,
+        image.sourceWidth,
+        image.sourceHeight,
+        x,
+        y,
+        width,
+        height,
+      );
     }
   }
 
-  private getImageCanvas(image: TerminalImage): HTMLCanvasElement | null {
-    const cached = this.imageCache.get(image.id);
-    if (cached?.kind === 'ready') return cached.canvas;
-    if (cached?.kind === 'loading') return null;
+  private getImageCanvas(image: TerminalImage): CanvasImageSource | null {
+    const cacheId = image.dataId ?? image.id;
+    const cached = this.imageCache.get(cacheId);
+    if (cached) {
+      this.imageCache.delete(cacheId);
+      this.imageCache.set(cacheId, cached);
+      if (cached.kind !== 'ready') return null;
+      if (cached.animated) this.animatedImageSeenThisFrame = true;
+      return cached.source;
+    }
 
     const pixelCount = image.pixelWidth * image.pixelHeight;
     if (!this.evictImageCacheIfNeeded(pixelCount)) return null;
@@ -310,32 +340,34 @@ export class CanvasRenderer {
       const url = URL.createObjectURL(blob);
       const img = new Image();
       const loadingEntry: ImageCacheEntry = { kind: 'loading', url, pixelCount };
-      this.imageCache.set(image.id, loadingEntry);
+      this.imageCache.set(cacheId, loadingEntry);
       this.imageCachePixels += pixelCount;
       img.onload = () => {
-        if (this.imageCache.get(image.id) !== loadingEntry) {
+        if (this.imageCache.get(cacheId) !== loadingEntry) {
           URL.revokeObjectURL(url);
           return;
         }
-
-        const canvas = document.createElement('canvas');
-        canvas.width = image.pixelWidth;
-        canvas.height = image.pixelHeight;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          this.deleteImageCacheEntry(image.id);
-          return;
+        if (image.kind === 'encoded' && image.animated) {
+          this.imageCache.set(cacheId, { kind: 'ready', source: img, pixelCount, url, animated: true });
+        } else {
+          const canvas = document.createElement('canvas');
+          canvas.width = image.pixelWidth;
+          canvas.height = image.pixelHeight;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            this.deleteImageCacheEntry(cacheId);
+            return;
+          }
+          ctx.drawImage(img, 0, 0, image.pixelWidth, image.pixelHeight);
+          URL.revokeObjectURL(url);
+          this.imageCache.set(cacheId, { kind: 'ready', source: canvas, pixelCount, animated: false });
         }
-
-        ctx.drawImage(img, 0, 0, image.pixelWidth, image.pixelHeight);
-        URL.revokeObjectURL(url);
-        this.imageCache.set(image.id, { kind: 'ready', canvas, pixelCount });
         this.config.onImageLoad?.();
       };
 
       img.onerror = () => {
-        if (this.imageCache.get(image.id) === loadingEntry) {
-          this.deleteImageCacheEntry(image.id);
+        if (this.imageCache.get(cacheId) === loadingEntry) {
+          this.deleteImageCacheEntry(cacheId);
         }
       };
       img.src = url;
@@ -349,7 +381,7 @@ export class CanvasRenderer {
     if (!ctx) throw new Error('Failed to get image canvas context');
     ctx.putImageData(new ImageData(image.data, image.pixelWidth, image.pixelHeight), 0, 0);
 
-    this.imageCache.set(image.id, { kind: 'ready', canvas, pixelCount });
+    this.imageCache.set(cacheId, { kind: 'ready', source: canvas, pixelCount, animated: false });
     this.imageCachePixels += pixelCount;
     return canvas;
   }
@@ -368,22 +400,40 @@ export class CanvasRenderer {
     return true;
   }
 
-  private pruneImageCache(activeImageIds: Set<number>) {
-    for (const imageId of this.imageCache.keys()) {
-      if (!activeImageIds.has(imageId)) {
-        this.deleteImageCacheEntry(imageId);
-      }
+
+  pruneImageCache(retainedCacheIds: ReadonlySet<number>) {
+    for (const cacheId of this.imageCache.keys()) {
+      if (!retainedCacheIds.has(cacheId)) this.deleteImageCacheEntry(cacheId);
     }
   }
 
   private deleteImageCacheEntry(imageId: number) {
     const entry = this.imageCache.get(imageId);
     if (!entry) return;
-    if (entry.kind === 'loading') {
-      URL.revokeObjectURL(entry.url);
-    }
+    if (entry.kind === 'loading') URL.revokeObjectURL(entry.url);
+    else if (entry.url) URL.revokeObjectURL(entry.url);
     this.imageCachePixels -= entry.pixelCount;
     this.imageCache.delete(imageId);
+  }
+
+  setAnimationsEnabled(enabled: boolean) {
+    if (this.animationsEnabled === enabled) return;
+    this.animationsEnabled = enabled;
+    this.updateAnimatedImageTimer();
+    if (enabled && this.animatedImageSeenThisFrame) this.config.onImageLoad?.();
+  }
+
+  private updateAnimatedImageTimer() {
+    if (this.animationsEnabled && this.animatedImageSeenThisFrame) {
+      if (this.animatedImageTimer === null) {
+        this.animatedImageTimer = setInterval(() => this.config.onImageLoad?.(), 33);
+      }
+      return;
+    }
+    if (this.animatedImageTimer !== null) {
+      clearInterval(this.animatedImageTimer);
+      this.animatedImageTimer = null;
+    }
   }
 
   drawDirtyRows(
@@ -518,13 +568,22 @@ export class CanvasRenderer {
     return isWide;
   }
 
-  destroy() {
+  resetImageCache() {
+    if (this.animatedImageTimer !== null) {
+      clearInterval(this.animatedImageTimer);
+      this.animatedImageTimer = null;
+    }
     while (this.imageCache.size > 0) {
       const imageId = this.imageCache.keys().next().value as number | undefined;
       if (imageId === undefined) break;
       this.deleteImageCacheEntry(imageId);
     }
-    this.activeImageIds.clear();
+    this.imageCachePixels = 0;
+    this.animatedImageSeenThisFrame = false;
+  }
+
+  destroy() {
+    this.resetImageCache();
     this.colorCache.clear();
     this.wideCharCache.clear();
   }

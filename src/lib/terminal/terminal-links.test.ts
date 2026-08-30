@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { describe, expect, test } from "bun:test";
 
-import { DEFAULT_STYLE, type Cell } from "./ansi-parser";
+import { AnsiParser, DEFAULT_STYLE, type Cell } from "./ansi-parser";
 import { findUrlAtCell, validateTerminalUrl } from "./terminal-links";
 
 function bufferFromRows(...texts: string[]): Cell[][] {
@@ -79,6 +79,49 @@ describe("findUrlAtCell", () => {
 
     expect(findUrlAtCell(buffer, { row: 0, col: 10 })).toBeNull();
   });
+  test("uses an OSC 8 hyperlink across its contiguous cell range", () => {
+    const buffer = bufferFromRows("click plain");
+    for (let col = 0; col < 5; col++) {
+      buffer[0][col].hyperlink = { uri: "https://example.com/docs", id: "docs" };
+    }
+
+    expect(findUrlAtCell(buffer, { row: 0, col: 2 })).toEqual({
+      url: "https://example.com/docs",
+      startCol: 0,
+      endCol: 4,
+    });
+    expect(findUrlAtCell(buffer, { row: 0, col: 6 })).toBeNull();
+    buffer[0][0].hyperlink = { uri: "javascript:alert(1)" };
+    expect(findUrlAtCell(buffer, { row: 0, col: 0 })).toBeNull();
+  });
+
+  test("maps UTF-16 match offsets back to terminal cell columns", () => {
+    const url = "https://example.com";
+    const buffer = bufferFromRows(`😀${url}`);
+
+    expect(findUrlAtCell(buffer, { row: 0, col: 1 })).toEqual({
+      url: "https://example.com/",
+      startCol: 1,
+      endCol: url.length,
+    });
+    expect(findUrlAtCell(buffer, { row: 0, col: url.length + 1 })).toBeNull();
+  });
+  test("keeps wide characters and their continuation cells inside one URL", () => {
+    const parser = new AnsiParser(80, 3);
+    const url = "https://example.com/경로";
+    parser.write(url);
+    const endCol = "https://example.com/".length + 3;
+
+    const expected = {
+      url: new URL(url).href,
+      startCol: 0,
+      endCol,
+    };
+    expect(findUrlAtCell(parser.getFullBuffer(), { row: 0, col: 8 })).toEqual(expected);
+    expect(findUrlAtCell(parser.getFullBuffer(), { row: 0, col: endCol })).toEqual(expected);
+  });
+
+
 });
 
 describe("validateTerminalUrl", () => {

@@ -1135,8 +1135,7 @@ pub async fn sftp_download_file(
 pub async fn read_clipboard_text() -> Result<Option<String>, String> {
     use arboard::Clipboard;
 
-    let mut clipboard =
-        Clipboard::new().map_err(|e| format!("Failed to open clipboard: {}", e))?;
+    let mut clipboard = Clipboard::new().map_err(|e| format!("Failed to open clipboard: {}", e))?;
     clipboard
         .get_text()
         .map(Some)

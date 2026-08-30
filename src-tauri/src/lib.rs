@@ -7,16 +7,16 @@ mod storage;
 
 use commands::{
     cancel_voice_input, check_voice_input_permissions, delete_known_host, get_runtime_instance_id,
-    list_known_hosts, list_voice_input_languages, local_download_file,
-    local_download_to_dir, local_home_dir, local_list_dir, local_read_file,
-    local_shell_disconnect, local_shell_resize, local_shell_start, local_shell_write,
-    read_clipboard_image, read_clipboard_text, request_voice_input_permissions,
-    set_keep_screen_on, set_keyboard_visible, sftp_download_file, sftp_download_to_dir,
-    sftp_home_dir, sftp_list_dir, sftp_read_file, ssh_check_host_key, ssh_connect, ssh_disconnect,
-    ssh_get_session_output, ssh_get_session_snapshot, ssh_resize, ssh_session_exists,
-    ssh_store_session_snapshot, ssh_trust_host_key, ssh_upload_clipboard_image,
-    ssh_upload_clipboard_image_from_local_path, ssh_write, start_voice_input, stop_voice_input,
-    HostKeyChallengeStore, LocalShellManager, RuntimeState, SessionManager,
+    list_known_hosts, list_voice_input_languages, local_download_file, local_download_to_dir,
+    local_home_dir, local_list_dir, local_read_file, local_shell_disconnect,
+    local_shell_get_output, local_shell_resize, local_shell_start, local_shell_write,
+    read_clipboard_image, read_clipboard_text, request_voice_input_permissions, set_keep_screen_on,
+    set_keyboard_visible, sftp_download_file, sftp_download_to_dir, sftp_home_dir, sftp_list_dir,
+    sftp_read_file, ssh_check_host_key, ssh_connect, ssh_disconnect, ssh_get_session_output,
+    ssh_get_session_snapshot, ssh_resize, ssh_session_exists, ssh_store_session_snapshot,
+    ssh_trust_host_key, ssh_upload_clipboard_image, ssh_upload_clipboard_image_from_local_path,
+    ssh_write, start_voice_input, stop_voice_input, HostKeyChallengeStore, LocalShellManager,
+    RuntimeState, SessionManager,
 };
 use storage::{
     delete_connection, delete_uploaded_ssh_key, load_connections, save_connection, upload_ssh_key,
@@ -71,6 +71,7 @@ pub fn run() {
             local_shell_write,
             local_shell_resize,
             local_shell_disconnect,
+            local_shell_get_output,
             local_home_dir,
             local_list_dir,
             local_read_file,
@@ -92,4 +93,21 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn default_capability_allows_local_shell_output_replay() {
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json"))
+                .expect("default capability must be valid JSON");
+        let permissions = capability["permissions"]
+            .as_array()
+            .expect("default capability permissions must be an array");
+
+        assert!(permissions
+            .iter()
+            .any(|permission| permission == "allow-local-shell-get-output"));
+    }
 }

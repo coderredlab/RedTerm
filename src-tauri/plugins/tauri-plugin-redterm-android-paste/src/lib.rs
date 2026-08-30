@@ -140,10 +140,9 @@ impl<R: Runtime> AndroidPaste<R> {
             .map_err(|e| e.to_string())
             .and_then(|result| {
                 if result.found {
-                    result
-                        .password
-                        .map(Some)
-                        .ok_or_else(|| "Android credential response omitted the password".to_string())
+                    result.password.map(Some).ok_or_else(|| {
+                        "Android credential response omitted the password".to_string()
+                    })
                 } else {
                     Ok(None)
                 }
@@ -153,10 +152,7 @@ impl<R: Runtime> AndroidPaste<R> {
     #[cfg(target_os = "android")]
     fn delete_credential(&self, credential_id: String) -> Result<(), String> {
         self._android_plugin_handle
-            .run_mobile_plugin::<()>(
-                "deleteCredential",
-                CredentialIdPayload { credential_id },
-            )
+            .run_mobile_plugin::<()>("deleteCredential", CredentialIdPayload { credential_id })
             .map_err(|e| e.to_string())
     }
 
@@ -211,7 +207,6 @@ impl<R: Runtime> AndroidPaste<R> {
             )
             .map_err(|e| e.to_string())
     }
-
 
     #[cfg(target_os = "android")]
     fn check_voice_input_permissions(&self) -> Result<VoicePermissionStates, String> {
@@ -268,7 +263,6 @@ impl<R: Runtime> AndroidPaste<R> {
     fn set_keyboard_visible(&self, _visible: bool) -> Result<(), String> {
         Ok(())
     }
-
 
     #[cfg(not(target_os = "android"))]
     fn check_voice_input_permissions(&self) -> Result<VoicePermissionStates, String> {
@@ -378,7 +372,6 @@ pub fn set_keyboard_visible<R: Runtime, M: Manager<R>>(
         .inner()
         .set_keyboard_visible(visible)
 }
-
 
 pub fn check_voice_input_permissions<R: Runtime, M: Manager<R>>(
     manager: &M,

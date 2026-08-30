@@ -9,7 +9,7 @@ RedTerm is a cross-platform SSH terminal built with Tauri, Svelte and Rust. It s
 - Host key verification
 - Persistent SSH sessions
 - Mobile keyboard, voice input and clipboard image upload
-- Custom canvas terminal renderer with Kitty and iTerm2 inline image support
+- Custom canvas terminal renderer with Kitty, iTerm2, and Sixel inline graphics support
 - Separate mobile and desktop application shells
 - Native Android and iOS integrations for mobile platform features
 

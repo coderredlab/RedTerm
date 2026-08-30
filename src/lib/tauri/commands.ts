@@ -388,16 +388,33 @@ export async function localShellDisconnect(sessionId: string): Promise<void> {
   return invoke("local_shell_disconnect", { sessionId });
 }
 
-export interface LocalShellDataEvent {
-  payload: number[];
+interface LocalShellDataChunkPayload {
+  seq: number;
+  data: number[];
+}
+
+export interface LocalShellDataChunk {
+  seq: number;
+  data: Uint8Array;
+}
+
+export async function localShellGetOutput(
+  sessionId: string,
+  afterSeq: number,
+): Promise<LocalShellDataChunk[]> {
+  const chunks = await invoke<LocalShellDataChunkPayload[]>("local_shell_get_output", {
+    sessionId,
+    afterSeq,
+  });
+  return chunks.map((chunk) => ({ seq: chunk.seq, data: new Uint8Array(chunk.data) }));
 }
 
 export async function listenLocalData(
   sessionId: string,
-  callback: (data: Uint8Array) => void
+  callback: (chunk: LocalShellDataChunk) => void
 ): Promise<UnlistenFn> {
-  return listen<number[]>(`local-data-${sessionId}`, (event) => {
-    callback(new Uint8Array(event.payload));
+  return listen<LocalShellDataChunkPayload>("local-data-" + sessionId, (event) => {
+    callback({ seq: event.payload.seq, data: new Uint8Array(event.payload.data) });
   });
 }
 

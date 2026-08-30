@@ -24,6 +24,7 @@
   let splitEl: HTMLDivElement | null = $state(null);
   let liveRatio = $state(0.5);
   let term: Terminal | null = $state(null);
+  let resizePointerId: number | null = null;
 
   $effect(() => {
     if (node.type === "split") {
@@ -42,22 +43,33 @@
 
   function startResize(event: PointerEvent) {
     const divider = event.currentTarget as HTMLElement | null;
-    if (node.type !== "split" || !splitEl || event.button !== 0 || !divider) {
-      return;
-    }
+    if (
+      node.type !== "split" ||
+      !splitEl ||
+      event.button !== 0 ||
+      !divider ||
+      resizePointerId !== null
+    ) return;
+
     event.preventDefault();
     const rect = splitEl.getBoundingClientRect();
+    const dividerSize = node.dir === "row" ? divider.offsetWidth : divider.offsetHeight;
+    const availableSize = Math.max(
+      1,
+      (node.dir === "row" ? rect.width : rect.height) - dividerSize,
+    );
     liveRatio = node.ratio;
 
     let settled = false;
     const capturedPointerId = event.pointerId;
-    const windowUp = (e: PointerEvent) => {
-      if (e.pointerId !== capturedPointerId) return;
-      finish();
-    };
-    const windowCancel = (e: PointerEvent) => {
-      if (e.pointerId !== capturedPointerId) return;
-      cancel();
+    resizePointerId = capturedPointerId;
+    const onMove = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== capturedPointerId) return;
+      const offset =
+        node.dir === "row"
+          ? moveEvent.clientX - rect.left - dividerSize / 2
+          : moveEvent.clientY - rect.top - dividerSize / 2;
+      liveRatio = Math.min(0.9, Math.max(0.1, offset / availableSize));
     };
     const teardown = (commit: boolean) => {
       if (settled) return;
@@ -65,27 +77,29 @@
       divider.removeEventListener("pointermove", onMove);
       divider.removeEventListener("pointerup", finish);
       divider.removeEventListener("pointercancel", cancel);
-      // Window-level backstop: capture is lost if the divider unmounts
-      // mid-gesture, and without this the drag would strand.
       window.removeEventListener("pointerup", windowUp, true);
       window.removeEventListener("pointercancel", windowCancel, true);
+      if (divider.hasPointerCapture(capturedPointerId)) {
+        divider.releasePointerCapture(capturedPointerId);
+      }
+      resizePointerId = null;
       tabsStore.updateSplitRatio(tabId, node.id, commit ? liveRatio : node.ratio);
     };
-    const onMove = (moveEvent: PointerEvent) => {
-      const raw =
-        node.dir === "row"
-          ? (moveEvent.clientX - rect.left) / rect.width
-          : (moveEvent.clientY - rect.top) / rect.height;
-      liveRatio = Math.min(0.9, Math.max(0.1, raw));
+    const finish = (finishEvent: PointerEvent) => {
+      if (finishEvent.pointerId === capturedPointerId) teardown(true);
     };
-    const finish = () => teardown(true);
-    const cancel = () => teardown(false);
+    const cancel = (cancelEvent: PointerEvent) => {
+      if (cancelEvent.pointerId === capturedPointerId) teardown(false);
+    };
+    const windowUp = (upEvent: PointerEvent) => finish(upEvent);
+    const windowCancel = (cancelEvent: PointerEvent) => cancel(cancelEvent);
+
     divider.addEventListener("pointermove", onMove);
     divider.addEventListener("pointerup", finish);
     divider.addEventListener("pointercancel", cancel);
     window.addEventListener("pointerup", windowUp, true);
     window.addEventListener("pointercancel", windowCancel, true);
-    divider.setPointerCapture(event.pointerId);
+    divider.setPointerCapture(capturedPointerId);
   }
 
   function startPaneDrag(event: PointerEvent, paneId: string, title: string) {
@@ -158,7 +172,7 @@
     class:col={node.dir === "col"}
     bind:this={splitEl}
   >
-    <div class="split-child" style:flex-basis="{liveRatio * 100}%">
+    <div class="split-child" style:flex-grow={liveRatio}>
       <Self {tabId} node={node.children[0]} {interactive} {activePaneId} />
     </div>
     <div
@@ -169,7 +183,7 @@
       aria-orientation={node.dir === "row" ? "vertical" : "horizontal"}
       onpointerdown={startResize}
     ></div>
-    <div class="split-child" style:flex-basis="{(1 - liveRatio) * 100}%">
+    <div class="split-child" style:flex-grow={1 - liveRatio}>
       <Self {tabId} node={node.children[1]} {interactive} {activePaneId} />
     </div>
   </div>
@@ -246,6 +260,7 @@
             workspace.paneConnected(tabId, node.paneId, sessionId)}
           onDisconnected={() => workspace.paneDisconnected(tabId, node.paneId)}
           bind:this={term}
+          onTitleChange={(title) => tabsStore.setPaneTitle(tabId, node.paneId, title)}
         />
       </div>
       </section>
@@ -271,8 +286,8 @@
   }
 
   .split-child {
-    flex-grow: 0;
-    flex-shrink: 0;
+    flex-basis: 0;
+    flex-shrink: 1;
     min-width: 0;
     min-height: 0;
     overflow: hidden;

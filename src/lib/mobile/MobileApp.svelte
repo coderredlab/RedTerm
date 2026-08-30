@@ -144,6 +144,12 @@
     tabsStore.setDisconnected(tabId);
   }
 
+  function handleTitleChanged(tabId: string, title: string) {
+    const tab = tabsStore.getTab(tabId);
+    const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
+    if (paneId) tabsStore.setPaneTitle(tabId, paneId, title);
+  }
+
   async function handleCloseTab(tabId: string) {
     const terminal = terminalRefs[tabId];
     const tab = tabsStore.getTab(tabId);
@@ -226,6 +232,7 @@
             onConnected={(sessionId) => handleConnected(tab.id, sessionId)}
             onDisconnected={() => handleDisconnected(tab.id)}
             bind:this={terminalRefs[tab.id]}
+            onTitleChange={(title) => handleTitleChanged(tab.id, title)}
           />
         </div>
       {/each}

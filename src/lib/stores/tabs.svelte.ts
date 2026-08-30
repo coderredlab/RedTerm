@@ -125,6 +125,18 @@ function paneTitle(connection: PaneConnection): string {
   return `${connection.auth.username}@${connection.host}`;
 }
 
+function normalizedPaneTitle(title: unknown, connection: PaneConnection): string {
+  if (typeof title !== "string") return paneTitle(connection);
+  const trimmed = title.trim();
+  let end = Math.min(trimmed.length, 128);
+  if (end < trimmed.length && end > 0) {
+    const last = trimmed.charCodeAt(end - 1);
+    if (last >= 0xd800 && last <= 0xdbff) end--;
+  }
+  const bounded = trimmed.slice(0, end);
+  return bounded || paneTitle(connection);
+}
+
 function makePane(
   tabId: string,
   connection: PaneConnection,
@@ -294,7 +306,7 @@ function validatePane(candidate: unknown, tabId: string): Pane | null {
   const pane: Pane = {
     id: raw.id,
     tabId,
-    title: paneTitle(persistedConnection),
+    title: normalizedPaneTitle(raw.title, persistedConnection),
     connection: persistedConnection,
     sessionId: typeof raw.sessionId === "string" ? raw.sessionId : null,
     runtimeInstanceId:
@@ -743,6 +755,14 @@ function createTabsStore() {
       if (!tab.panes.some((pane) => pane.id === paneId)) return;
       mutateTab(tabId, (candidate) => {
         candidate.activePaneId = paneId;
+      });
+    },
+
+    setPaneTitle(tabId: string, paneId: string, title: string) {
+      mutateTab(tabId, (tab) => {
+        const pane = tab.panes.find((candidate) => candidate.id === paneId);
+        if (!pane) return;
+        pane.title = normalizedPaneTitle(title, pane.connection);
       });
     },
 

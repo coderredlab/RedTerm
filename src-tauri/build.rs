@@ -28,6 +28,7 @@ fn main() {
             "local_shell_write",
             "local_shell_resize",
             "local_shell_disconnect",
+            "local_shell_get_output",
             "local_home_dir",
             "local_list_dir",
             "local_read_file",

@@ -1,5 +1,5 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -26,10 +26,72 @@ struct LocalShell {
     /// FIFO to the writer pump — keystrokes must reach the PTY in the order
     /// they were sent, even though each write command is a separate task.
     writer_tx: mpsc::Sender<Vec<u8>>,
+    recent_output: Arc<Mutex<LocalRecentOutput>>,
     child: Mutex<Box<dyn Child + Send + Sync>>,
 }
 
 const MAX_CONCURRENT_LOCAL_SHELLS: usize = 16;
+const MAX_RECENT_LOCAL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RECENT_LOCAL_CHUNK_COUNT: usize = 4096;
+
+#[derive(Clone, serde::Serialize)]
+pub struct LocalShellDataChunk {
+    pub seq: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Default)]
+struct LocalRecentOutput {
+    chunks: VecDeque<LocalShellDataChunk>,
+    total_bytes: usize,
+    last_seq: u64,
+}
+impl LocalRecentOutput {
+    fn push(&mut self, chunk: LocalShellDataChunk) {
+        self.last_seq = self.last_seq.max(chunk.seq);
+        self.total_bytes = self.total_bytes.saturating_add(chunk.data.len());
+        self.chunks.push_back(chunk);
+        while self.chunks.len() > MAX_RECENT_LOCAL_CHUNK_COUNT
+            || self.total_bytes > MAX_RECENT_LOCAL_CHUNK_BYTES
+        {
+            if let Some(removed) = self.chunks.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(removed.data.len());
+            }
+        }
+    }
+
+    fn push_data(&mut self, data: Vec<u8>) -> LocalShellDataChunk {
+        self.last_seq = self.last_seq.saturating_add(1);
+        let chunk = LocalShellDataChunk {
+            seq: self.last_seq,
+            data,
+        };
+        self.push(chunk.clone());
+        chunk
+    }
+    fn chunks_after(
+        &self,
+        after_seq: u64,
+        last_emitted_seq: u64,
+    ) -> Result<Vec<LocalShellDataChunk>, String> {
+        let first_retained_seq = self
+            .chunks
+            .front()
+            .map(|chunk| chunk.seq)
+            .unwrap_or(last_emitted_seq.saturating_add(1));
+        if after_seq < last_emitted_seq && first_retained_seq > after_seq.saturating_add(1) {
+            return Err(
+                "Local shell output history no longer covers the requested sequence".to_string(),
+            );
+        }
+        Ok(self
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.seq > after_seq)
+            .cloned()
+            .collect())
+    }
+}
 
 impl LocalShellManager {
     pub fn new() -> Self {
@@ -96,18 +158,24 @@ pub async fn local_shell_start(
             if data.is_empty() {
                 continue;
             }
-            if writer.write_all(&data).and_then(|_| writer.flush()).is_err() {
+            if writer
+                .write_all(&data)
+                .and_then(|_| writer.flush())
+                .is_err()
+            {
                 break;
             }
         }
     });
 
     let session_id = uuid::Uuid::new_v4().to_string();
+    let recent_output = Arc::new(Mutex::new(LocalRecentOutput::default()));
     manager.shells.write().await.insert(
         session_id.clone(),
         LocalShell {
             master: Mutex::new(pair.master),
             writer_tx,
+            recent_output: recent_output.clone(),
             child: Mutex::new(child),
         },
     );
@@ -121,7 +189,11 @@ pub async fn local_shell_start(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    if emitter.emit(&data_event, &buffer[..read]).is_err() {
+                    let chunk = match recent_output.lock() {
+                        Ok(mut output) => output.push_data(buffer[..read].to_vec()),
+                        Err(_) => break,
+                    };
+                    if emitter.emit(&data_event, &chunk).is_err() {
                         break;
                     }
                 }
@@ -132,6 +204,26 @@ pub async fn local_shell_start(
     });
 
     Ok(session_id)
+}
+
+#[tauri::command]
+pub async fn local_shell_get_output(
+    manager: State<'_, Arc<LocalShellManager>>,
+    session_id: String,
+    after_seq: u64,
+) -> Result<Vec<LocalShellDataChunk>, String> {
+    let recent_output = {
+        let shells = manager.shells.read().await;
+        shells
+            .get(&session_id)
+            .ok_or_else(|| "Local shell not found".to_string())?
+            .recent_output
+            .clone()
+    };
+    let output = recent_output
+        .lock()
+        .map_err(|_| "Local shell output history is unavailable".to_string())?;
+    output.chunks_after(after_seq, output.last_seq)
 }
 
 fn local_home_dir_path() -> Option<std::path::PathBuf> {
@@ -534,11 +626,73 @@ mod tests {
         drop(pair.slave);
 
         let mut output = String::new();
-        reader.read_to_string(&mut output).expect("read test output");
+        reader
+            .read_to_string(&mut output)
+            .expect("read test output");
         child.wait().expect("wait for test command");
 
         assert!(output
             .lines()
             .any(|line| line.trim_end() == "TERM=xterm-256color"));
+    }
+
+    #[test]
+    fn recent_output_enforces_chunk_and_byte_limits() {
+        let mut output = LocalRecentOutput::default();
+        for seq in 1..=(MAX_RECENT_LOCAL_CHUNK_COUNT as u64 + 1) {
+            output.push(LocalShellDataChunk { seq, data: vec![0] });
+        }
+        assert_eq!(output.chunks.len(), MAX_RECENT_LOCAL_CHUNK_COUNT);
+        assert_eq!(output.chunks.front().map(|chunk| chunk.seq), Some(2));
+
+        let mut byte_limited = LocalRecentOutput::default();
+        byte_limited.push(LocalShellDataChunk {
+            seq: 1,
+            data: vec![0; 3 * 1024 * 1024],
+        });
+        byte_limited.push(LocalShellDataChunk {
+            seq: 2,
+            data: vec![1; 3 * 1024 * 1024],
+        });
+        assert_eq!(byte_limited.chunks.len(), 1);
+        assert_eq!(byte_limited.total_bytes, 3 * 1024 * 1024);
+    }
+
+    #[test]
+    fn recent_output_rejects_sequence_gaps_and_returns_newer_chunks() {
+        let mut output = LocalRecentOutput::default();
+        output.push(LocalShellDataChunk {
+            seq: 3,
+            data: vec![3],
+        });
+        output.push(LocalShellDataChunk {
+            seq: 4,
+            data: vec![4],
+        });
+
+        assert!(output.chunks_after(1, 4).is_err());
+        let chunks = output.chunks_after(3, 4).expect("covered replay range");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].seq, 4);
+        assert_eq!(chunks[0].data, vec![4]);
+    }
+
+    #[test]
+    fn recent_output_assigns_monotonic_sequences_with_the_history_update() {
+        let mut output = LocalRecentOutput::default();
+        let first = output.push_data(vec![1]);
+        let second = output.push_data(vec![2]);
+
+        assert_eq!(first.seq, 1);
+        assert_eq!(second.seq, 2);
+        assert_eq!(output.last_seq, 2);
+        let replay = output
+            .chunks_after(0, output.last_seq)
+            .expect("complete replay range");
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].seq, first.seq);
+        assert_eq!(replay[0].data, first.data);
+        assert_eq!(replay[1].seq, second.seq);
+        assert_eq!(replay[1].data, second.data);
     }
 }

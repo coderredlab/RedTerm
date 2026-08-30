@@ -1,7 +1,11 @@
 // @ts-nocheck
 import { describe, expect, test } from "bun:test";
 
+import { encode as encodePng } from "fast-png";
+import { zlibSync } from "fflate";
+
 import { AnsiParser, type Cell } from "./ansi-parser";
+import { CanvasRenderer, compareTerminalImageOrder } from "./CanvasRenderer";
 
 function scrollbackLengthAfter(sequence: string): number {
   const parser = new AnsiParser(20, 3);
@@ -82,6 +86,15 @@ function pngWithDimensionsBase64(width: number, height: number): string {
   return Buffer.from(bytes).toString("base64");
 }
 
+function rgbaPngBase64(width: number, height: number, rgba: number[]): string {
+  return Buffer.from(encodePng({
+    width,
+    height,
+    data: Uint8Array.from(rgba),
+    channels: 4,
+    depth: 8,
+  })).toString("base64");
+}
 function kittyPngApc(options = {}): string {
   const {
     payload = TINY_PNG_BASE64,
@@ -140,17 +153,262 @@ describe("AnsiParser unsupported string controls", () => {
       expect(visibleRowText(parser)).toBe("beforeafter");
     });
 
-    test(`swallows DCS payload terminated by ${name} without dropping surrounding text`, () => {
+    test(`renders Sixel DCS terminated by ${name} without printing payload text`, () => {
       const parser = new AnsiParser(80, 3);
 
       parser.write(`before\x1bPq\"1;1;5;5#0!9~sixel-bytes${terminator}after`);
 
-      expect(visibleRowText(parser)).toBe("beforeafter");
+      expect(visibleRowText(parser, 0)).toBe("before");
+      expect(visibleRowText(parser, 1)).toBe("after");
+      expect(parser.getImages()).toHaveLength(1);
     });
   }
 });
 
+describe("AnsiParser terminal capabilities and SGR", () => {
+  test("advertises Sixel support in primary device attributes only", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+
+    parser.write("\x1b[c\x1b[>c");
+
+    expect(responses).toEqual(["\x1b[?64;4c"]);
+  });
+
+  test("preserves colon SGR subparameters without treating underline style as italic", () => {
+    const parser = new AnsiParser(20, 3);
+
+    parser.write("\x1b[4:3mX");
+
+    expect(parser.getFullBuffer()[0][0].style).toMatchObject({ underline: true, italic: false });
+  });
+});
+describe("AnsiParser OSC compatibility", () => {
+  test("emits bounded title and file URI events across BEL and ST boundaries", () => {
+    const parser = new AnsiParser(20, 3);
+    const events: string[] = [];
+    parser.setOscEventHandler((event) => {
+      if (event.type === "title") events.push(`title:${event.value}`);
+      if (event.type === "current-directory") events.push(`cwd:${event.uri}`);
+    });
+
+    parser.write("\x1b]2;dep");
+    parser.write("loy\u202e\x1b\\");
+    parser.write("\x1b]7;file://server/home/redterm\x07");
+    parser.write("\x1b]7;https://example.com/not-a-directory\x07");
+
+    expect(events).toEqual([
+      "title:deploy",
+      "cwd:file://server/home/redterm",
+    ]);
+    expect(parser.getOscTitle()).toBe("deploy");
+    expect(parser.getCurrentDirectoryUri()).toBe("file://server/home/redterm");
+  });
+
+  test("continues a split OSC sequence after a JSON snapshot round trip", () => {
+    const source = new AnsiParser(20, 3);
+    source.write("\x1b]2;dep");
+
+    const restored = new AnsiParser(20, 3);
+    const titles: string[] = [];
+    restored.setOscEventHandler((event) => {
+      if (event.type === "title") titles.push(event.value);
+    });
+    restored.restoreSnapshot(JSON.parse(JSON.stringify(source.createSnapshot())));
+    titles.length = 0;
+    restored.write("loy\x1b\\");
+
+    expect(titles).toEqual(["deploy"]);
+    expect(restored.getOscTitle()).toBe("deploy");
+    expect(visibleRowText(restored).trimEnd()).toBe("");
+  });
+  test("restores REP, saved cursor, and SGR meaning across snapshots", () => {
+    const repSource = new AnsiParser(20, 3);
+    repSource.write("A\x1b[3");
+    const repRestored = new AnsiParser(20, 3);
+    repRestored.restoreSnapshot(repSource.createSnapshot());
+    repRestored.write("b");
+    expect(visibleRowText(repRestored).trimEnd()).toBe("AAAA");
+
+    const cursorSource = new AnsiParser(20, 3);
+    cursorSource.write("abc\x1b7\r\x1b");
+    const cursorRestored = new AnsiParser(20, 3);
+    cursorRestored.restoreSnapshot(cursorSource.createSnapshot());
+    cursorRestored.write("8X");
+    expect(visibleRowText(cursorRestored).trimEnd()).toBe("abcX");
+
+    const styleSource = new AnsiParser(20, 3);
+    styleSource.write("\x1b[31mA");
+    const styleRestored = new AnsiParser(20, 3);
+    styleRestored.restoreSnapshot(styleSource.createSnapshot());
+    styleRestored.write("B");
+    expect(styleRestored.getBuffer()[0][1].style).toMatchObject({ ansiFgIndex: 1 });
+  });
+
+
+  test("stores OSC 8 hyperlinks on only the enclosed cells and snapshots them", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write("\x1b]8;id=docs;https://example.com/docs\x1b\\link\x1b]8;;\x1b\\ plain");
+
+    expect(parser.getBuffer()[0].slice(0, 4).map((cell) => cell.hyperlink)).toEqual([
+      { uri: "https://example.com/docs", id: "docs" },
+      { uri: "https://example.com/docs", id: "docs" },
+      { uri: "https://example.com/docs", id: "docs" },
+      { uri: "https://example.com/docs", id: "docs" },
+    ]);
+    expect(parser.getBuffer()[0][4].hyperlink).toBeUndefined();
+
+    const restored = new AnsiParser(20, 3);
+    restored.restoreSnapshot(parser.createSnapshot());
+    expect(restored.getBuffer()[0][2].hyperlink).toEqual({
+      uri: "https://example.com/docs",
+      id: "docs",
+    });
+  });
+
+  test("sets queries and resets palette and dynamic colors", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    const foregrounds: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    parser.setOscColorDefaults({ foreground: "#112233", background: "#223344", cursor: "#334455" });
+    parser.setOscEventHandler((event) => {
+      if (event.type === "colors") foregrounds.push(event.colors.foreground);
+    });
+
+    parser.write("\x1b[31mA");
+    parser.write("\x1b]4;1;rgb:00/ff/00\x1b\\B");
+    expect(parser.getBuffer()[0][0].style.fg).toBe("#00ff00");
+    expect(parser.getBuffer()[0][1].style.fg).toBe("#00ff00");
+    parser.write("\x1b]4;1;?\x1b\\");
+    expect(responses.at(-1)).toBe("\x1b]4;1;rgb:0000/ffff/0000\x1b\\");
+
+    parser.write("\x1b]104;1\x1b\\");
+    expect(parser.getBuffer()[0][0].style.fg).toBe("#ff6b6b");
+    parser.write("\x1b]10;#abcdef\x07\x1b]10;?\x1b\\");
+    expect(foregrounds.at(-1)).toBe("#abcdef");
+    expect(responses.at(-1)).toBe("\x1b]10;rgb:abab/cdcd/efef\x1b\\");
+    parser.write("\x1b]110\x07");
+    expect(foregrounds.at(-1)).toBe("#112233");
+  });
+
+  test("tracks OSC 133 shell phases and exit status", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write("prompt");
+    parser.write("\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]133;C\x1b\\\x1b]133;D;7\x1b\\");
+
+    expect(parser.getShellIntegrationState()).toEqual({
+      phase: "finished",
+      row: 0,
+      col: 6,
+      exitStatus: 7,
+    });
+    const restored = new AnsiParser(20, 3);
+    restored.restoreSnapshot(parser.createSnapshot());
+    expect(restored.getShellIntegrationState()).toEqual(parser.getShellIntegrationState());
+  });
+  test("decodes OSC 52 clipboard writes across chunks and both terminators", () => {
+    const parser = new AnsiParser(20, 3);
+    const writes: string[] = [];
+    parser.setOscEventHandler((event) => {
+      if (event.type === "clipboard") writes.push(event.text);
+    });
+    const encoded = Buffer.from("hello 안녕").toString("base64");
+
+    parser.write(`\x1b]52;c;${encoded.slice(0, 5)}`);
+    parser.write(`${encoded.slice(5)}\x1b\\`);
+    parser.write("\x1b]52;c;\x07");
+
+    expect(writes).toEqual(["hello 안녕", ""]);
+  });
+
+  test("rejects OSC 52 reads unsafe targets malformed text and oversized payloads", () => {
+    const parser = new AnsiParser(20, 3);
+    const writes: string[] = [];
+    parser.setOscEventHandler((event) => {
+      if (event.type === "clipboard") writes.push(event.text);
+    });
+
+    parser.write("\x1b]52;c;?\x07");
+    parser.write("\x1b]52;p;dGVzdA==\x07");
+    parser.write("\x1b]52;c;%%%%\x07");
+    parser.write("\x1b]52;c;/w==\x07");
+    parser.write("\x1b]52;c;AA==\x07");
+    const overDecodedLimit = Buffer.alloc(64 * 1024 + 1).toString("base64");
+    parser.write(`\x1b]52;c;${overDecodedLimit}\x07`);
+    parser.write(`\x1b]52;c;${"A".repeat(overDecodedLimit.length + 128)}\x07ok`);
+
+    expect(writes).toEqual([]);
+    expect(visibleRowText(parser).trimEnd()).toBe("ok");
+  });
+  test("terminates normal and discarded OSC after consecutive escape bytes", () => {
+    const parser = new AnsiParser(40, 2);
+    const titles: string[] = [];
+    parser.setOscEventHandler((event) => {
+      if (event.type === "title") titles.push(event.value);
+    });
+
+    parser.write("\x1b]2;bad\x1b\x1b\\after");
+    expect(titles).toEqual(["bad"]);
+    expect(visibleRowText(parser).trimEnd()).toBe("after");
+
+    parser.write(`\x1b]2;${"x".repeat(5000)}\x1b\x1b\\tail`);
+    expect(visibleRowText(parser).trimEnd()).toBe("aftertail");
+  });
+
+  test("never leaves an unmatched surrogate at the OSC title limit", () => {
+    const parser = new AnsiParser(20, 2);
+    parser.write(`\x1b]2;${"a".repeat(1023)}😀\x1b\\`);
+
+    const title = parser.getOscTitle();
+    expect(title).toBe("a".repeat(1023));
+    expect(title?.isWellFormed()).toBe(true);
+  });
+
+
+});
+
+describe("CanvasRenderer image ordering", () => {
+  test("orders same-z Kitty images by protocol image id", () => {
+    const images = [
+      { protocol: "kitty", id: 1, imageId: 20, zIndex: 0 },
+      { protocol: "kitty", id: 3, imageId: 10, zIndex: 0 },
+      { protocol: "iterm2", id: 2, zIndex: -1 },
+    ] as unknown as Array<Parameters<typeof compareTerminalImageOrder>[0]>;
+
+    images.sort(compareTerminalImageOrder);
+
+    expect(images.map((image) => image.imageId ?? image.id)).toEqual([2, 10, 20]);
+  });
+});
+
 describe("AnsiParser Kitty images", () => {
+  test("prunes unretained image cache entries and revokes object URLs", () => {
+    const renderer = Object.create(CanvasRenderer.prototype) as CanvasRenderer;
+    const internals = renderer as unknown as {
+      imageCache: Map<number, unknown>;
+      imageCachePixels: number;
+    };
+    internals.imageCache = new Map([
+      [1, { kind: "loading", url: "blob:stale", pixelCount: 4 }],
+      [2, { kind: "ready", source: {}, pixelCount: 6, animated: false }],
+    ]);
+    internals.imageCachePixels = 10;
+    const revoked: string[] = [];
+    const revokeObjectUrl = URL.revokeObjectURL;
+    URL.revokeObjectURL = (url) => revoked.push(url);
+    try {
+      renderer.pruneImageCache(new Set([2]));
+    } finally {
+      URL.revokeObjectURL = revokeObjectUrl;
+    }
+
+    expect([...internals.imageCache.keys()]).toEqual([2]);
+    expect(internals.imageCachePixels).toBe(6);
+    expect(revoked).toEqual(["blob:stale"]);
+  });
+
   test("captures one chafa-style multi-chunk RGBA APC image without printing payload bytes", () => {
     const parser = new AnsiParser(80, 3);
     const rgbaBytes = new Uint8Array([
@@ -179,10 +437,9 @@ describe("AnsiParser Kitty images", () => {
     expect(image.pixelWidth).toBe(2);
     expect(image.pixelHeight).toBe(2);
     expect(Array.from(image.data)).toEqual(Array.from(rgbaBytes));
-    expect(visibleRowText(parser, 1)).toBe("abc");
-    const rowBelowImage = parser.getBuffer()[2].map((cell) => cell.char).join("");
-    expect(rowBelowImage.trim()).toBe("tail");
-    expect(parser.getFullCursor().y).toBe(cursorBeforeImage.y + image.heightCells);
+    expect(visibleRowText(parser, cursorBeforeImage.y)).toBe("abc");
+    expect(visibleRowText(parser, cursorBeforeImage.y + image.heightCells)).toBe("     tail");
+    expect(parser.getFullCursor()).toEqual({ x: 9, y: cursorBeforeImage.y + image.heightCells });
     const visibleText = parser
       .getBuffer()
       .map((row) => row.map((cell) => cell.char).join(""))
@@ -190,6 +447,62 @@ describe("AnsiParser Kitty images", () => {
     expect(visibleText).not.toContain("AAECAwQFBgcI");
     expect(visibleText).not.toContain("CQoLDA0ODw==");
   });
+
+  test("continues a multi-chunk Kitty image after a JSON snapshot round trip", () => {
+    const source = new AnsiParser(80, 3);
+    source.write("\x1b_Ga=T,f=32,s=2,v=2,c=2,r=1,m=1\x1b\\");
+    source.write("\x1b_Gm=1;AAECAwQFBgcI\x1b\\");
+
+    const restored = new AnsiParser(80, 3);
+    restored.restoreSnapshot(JSON.parse(JSON.stringify(source.createSnapshot())));
+    restored.write("\x1b_Gm=1;CQoLDA0ODw==\x1b\\");
+    restored.write("\x1b_Gm=0\x1b\\");
+
+    expect(Array.from(restored.getImages()[0].data)).toEqual([
+      0, 1, 2, 3,
+      4, 5, 6, 7,
+      8, 9, 10, 11,
+      12, 13, 14, 15,
+    ]);
+  });
+  test("keeps a pending Kitty anchor in full-buffer coordinates across snapshots", () => {
+    const source = new AnsiParser(80, 3);
+    source.write("1\r\n2\r\n3\r\n4\r\n5");
+    const anchor = source.getFullCursor();
+    source.write("\x1b_Ga=T,f=32,s=2,v=2,c=2,r=1,m=1;AAECAwQFBgcI\x1b\\");
+
+    const restored = new AnsiParser(80, 3);
+    restored.restoreSnapshot(JSON.parse(JSON.stringify(source.createSnapshot())));
+    restored.write("\x1b_Gm=0;CQoLDA0ODw==\x1b\\");
+
+    expect(restored.getImages()[0]).toMatchObject({ row: anchor.y, col: anchor.x });
+  });
+
+  test("discards a pending Kitty transfer when its anchor scrolls out of a restored snapshot", () => {
+    const source = new AnsiParser(80, 3);
+    source.write("\x1b_Ga=T,f=32,s=2,v=2,m=1;AAAA\x1b\\");
+    const snapshot = source.createSnapshot();
+    snapshot.scrollbackRows = Array.from({ length: 1001 }, () => snapshot.bufferRows[0]);
+    snapshot.pendingKittyImage!.row = 0;
+
+    const restored = new AnsiParser(80, 3);
+    restored.restoreSnapshot(snapshot);
+
+    expect((restored as unknown as { pendingKittyImage: unknown }).pendingKittyImage).toBeNull();
+  });
+
+  test("rejects pending image snapshots above the chunk count limit", () => {
+    const source = new AnsiParser(80, 3);
+    source.write("\x1b_Ga=T,f=32,s=2,v=2,m=1;AAAA\x1b\\");
+    const snapshot = source.createSnapshot();
+    snapshot.pendingKittyImage!.chunks = Array.from({ length: 4097 }, () => "");
+
+    const restored = new AnsiParser(80, 3);
+    restored.restoreSnapshot(snapshot);
+
+    expect((restored as unknown as { pendingKittyImage: unknown }).pendingKittyImage).toBeNull();
+  });
+
 
   test("captures explicit direct RGB APC image as RGBA without printing payload bytes", () => {
     const parser = new AnsiParser(80, 3);
@@ -213,9 +526,9 @@ describe("AnsiParser Kitty images", () => {
     expect(image.kind ?? image.format).toBe("rgba");
     expect(Array.from(image.data)).toEqual([...rgbBytes, 255]);
     expect(visibleRowText(parser, cursorBeforeImage.y)).toBe("abc");
-    expect(visibleRowText(parser, cursorBeforeImage.y + 1)).toBe("tail");
+    expect(visibleRowText(parser, cursorBeforeImage.y + image.heightCells)).toBe("    tail");
     expect(parser.getFullCursor()).toEqual({
-      x: "tail".length,
+      x: 8,
       y: cursorBeforeImage.y + image.heightCells,
     });
     const visibleText = parser
@@ -268,9 +581,9 @@ describe("AnsiParser Kitty images", () => {
     expect(image.pixelHeight).toBe(1);
     expect(image.kind ?? image.format).toBe("png");
     expect(Array.from(image.data)).toEqual(Array.from(TINY_PNG_BYTES));
-    expect(visibleRowText(parser, 1)).toBe("xy");
-    expect(visibleRowText(parser, 3)).toBe("tail");
-    expect(parser.getFullCursor().y).toBe(cursorBeforeImage.y + image.heightCells);
+    expect(visibleRowText(parser, cursorBeforeImage.y)).toBe("xy");
+    expect(visibleRowText(parser, cursorBeforeImage.y + image.heightCells)).toBe("     tail");
+    expect(parser.getFullCursor()).toEqual({ x: 9, y: cursorBeforeImage.y + image.heightCells });
     const visibleText = parser
       .getBuffer()
       .map((row) => row.map((cell) => cell.char).join(""))
@@ -301,9 +614,9 @@ describe("AnsiParser Kitty images", () => {
     expect(image.pixelWidth).toBe(2);
     expect(image.pixelHeight).toBe(1);
     expect(image.widthCells).toBe(4);
-    expect(image.heightCells).toBe(2);
-    expect(visibleRowText(parser, 3)).toBe("tail");
-    expect(parser.getFullCursor().y).toBe(cursorBeforeImage.y + image.heightCells);
+    expect(image.heightCells).toBe(1);
+    expect(visibleRowText(parser, cursorBeforeImage.y + image.heightCells)).toBe("      tail");
+    expect(parser.getFullCursor()).toEqual({ x: 10, y: cursorBeforeImage.y + image.heightCells });
   });
 
   test("computes PNG placement columns from rows", () => {
@@ -323,7 +636,7 @@ describe("AnsiParser Kitty images", () => {
     const [image] = images;
     expect(image.pixelWidth).toBe(2);
     expect(image.pixelHeight).toBe(1);
-    expect(image.widthCells).toBe(6);
+    expect(image.widthCells).toBe(12);
     expect(image.heightCells).toBe(3);
   });
 
@@ -426,6 +739,20 @@ describe("AnsiParser Kitty images", () => {
     expect(Array.from(images[0].data)).toEqual([5, 6, 7, 8]);
   });
 
+  test("retransmitting an image id removes virtual placements and relative children", () => {
+    const parser = new AnsiParser(20, 4);
+    parser.write(kittyRgbaTransmit({ imageId: 13 }));
+    parser.write(kittyRgbaTransmit({ imageId: 14 }));
+    parser.write("\x1b_Ga=p,i=13,p=11,U=1,c=1,r=1\x1b\\");
+    parser.write("\x1b_Ga=p,i=14,p=22,P=13,Q=11,c=1,r=1,C=1\x1b\\");
+    parser.write("\x1b[38:5:13;58:5:11m\u{10eeee}\x1b[0m");
+    expect(parser.getImages().map((image) => image.placementId)).toEqual([11, 22]);
+
+    parser.write(kittyRgbaTransmit({ imageId: 13, pixel: [5, 6, 7, 8] }));
+
+    expect(parser.getImages()).toHaveLength(0);
+  });
+
   test("deletes placements for an image id without printing Kitty payload or control text", () => {
     const parser = new AnsiParser(80, 5);
 
@@ -447,6 +774,33 @@ describe("AnsiParser Kitty images", () => {
     expect(visibleText).not.toContain("a=d");
     expect(visibleText).not.toContain("i=10");
     expect(visibleText).not.toContain("delete-payload");
+  });
+
+  test("drops renderer cache ids when Kitty image data is freed", () => {
+    const parser = new AnsiParser(80, 5);
+    parser.write(kittyRgbaTransmit({ imageId: 12, pixel: [2, 4, 6, 8] }));
+    parser.write(kittyPlace({ imageId: 12 }));
+
+    const cacheId = parser.getImages()[0].dataId;
+    expect(cacheId).toBeDefined();
+    expect(parser.consumeImageCachePruneRequest()).toContain(cacheId!);
+
+    parser.write("\x1b_Ga=d,d=I,i=12\x1b\\");
+
+    expect(parser.consumeImageCachePruneRequest()).not.toContain(cacheId!);
+  });
+
+  test("requests cache pruning when display erase removes the last placement", () => {
+    const parser = new AnsiParser(80, 5);
+    parser.write(kittyRgbaTransmit({ imageId: 15 }));
+    parser.write(kittyPlace({ imageId: 15 }));
+    const cacheId = parser.getImages()[0].dataId;
+    expect(parser.consumeImageCachePruneRequest()).toContain(cacheId!);
+
+    parser.write("\x1b[2J");
+
+    expect(parser.getImages()).toHaveLength(0);
+    expect(parser.consumeImageCachePruneRequest()).not.toContain(cacheId!);
   });
 
   test("swallows corrupt PNG APC payload without storing an image or printing payload text", () => {
@@ -492,6 +846,152 @@ describe("AnsiParser Kitty images", () => {
     expect(parser.getImages()[0].data[0]).toBe(1);
   });
 
+  test("keeps saved main-screen placements when alternate-screen visible placements are deleted", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write(kittyRgbaTransmit({ imageId: 90 }));
+    parser.write(kittyPlace({ imageId: 90, placementId: 1 }));
+    expect(parser.getImages()).toHaveLength(1);
+
+    parser.write("\x1b[?1049h\x1b_Ga=d\x1b\\\x1b[?1049l");
+
+    expect(parser.getImages()).toHaveLength(1);
+    expect(parser.getImages()[0].imageId).toBe(90);
+  });
+
+  test("deletes saved main-screen virtual placements by image id from the alternate screen", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write(kittyRgbaTransmit({ imageId: 91 }));
+    parser.write("\x1b_Ga=p,i=91,p=1,U=1,c=1,r=1\x1b\\");
+    parser.write("\x1b[38;5;91m\u{10eeee}\x1b[0m");
+    expect(parser.getImages()).toHaveLength(1);
+
+    parser.write("\x1b[?1049h\x1b_Ga=d,d=i,i=91\x1b\\\x1b[?1049l");
+
+    expect(parser.getImages()).toHaveLength(0);
+  });
+
+  test("deletes visible virtual placements with every screen selector", () => {
+    const selectors = [
+      "a",
+      "c",
+      "p,x=1,y=1",
+      "q,x=1,y=1,z=5",
+      "x,x=1",
+      "y,y=1",
+      "z,z=5",
+    ];
+
+    for (const selector of selectors) {
+      const parser = new AnsiParser(20, 3);
+      parser.write(kittyRgbaTransmit({ imageId: 92 }));
+      parser.write("\x1b_Ga=p,i=92,p=1,U=1,c=1,r=1,z=5\x1b\\");
+      parser.write("\x1b[38;5;92m\u{10eeee}\x1b[0m");
+      expect(parser.getImages()).toHaveLength(1);
+
+      parser.write(`\x1b[1;1H\x1b_Ga=d,d=${selector}\x1b\\`);
+
+      expect(parser.getImages()).toHaveLength(0);
+    }
+  });
+
+  test("clears nonpersistent image state and placeholders when restoring a snapshot", () => {
+    const source = new AnsiParser(20, 3);
+    source.write(kittyRgbaTransmit({ imageId: 93 }));
+    source.write("\x1b_Ga=p,i=93,p=1,U=1,c=1,r=1\x1b\\");
+    source.write("\x1b[38;5;93m\u{10eeee}\x1b[0m");
+    expect(source.getImages()).toHaveLength(1);
+
+    const restored = new AnsiParser(20, 3);
+    restored.write(kittyRgbaApc());
+    expect(restored.getImages()).toHaveLength(1);
+
+    restored.restoreSnapshot(source.createSnapshot());
+
+    expect(restored.getImages()).toHaveLength(0);
+    expect(restored.getFullBuffer().flat().every((cell) => cell.imagePlaceholder === undefined)).toBe(true);
+  });
+
+  test("preserves completed and virtual images in a runtime snapshot", () => {
+    const source = new AnsiParser(20, 3);
+    source.write(kittyRgbaTransmit({ imageId: 94 }));
+    source.write("\x1b_Ga=p,i=94,p=1,U=1,c=1,r=1\x1b\\");
+    source.write("\x1b[38;5;94m\u{10eeee}\x1b[0m");
+    const expectedData = Array.from(source.getImages()[0].data);
+
+    const restored = new AnsiParser(20, 3);
+    restored.restoreSnapshot(source.createRuntimeSnapshot());
+
+    expect(restored.getImages()).toHaveLength(1);
+    expect(Array.from(restored.getImages()[0].data)).toEqual(expectedData);
+    expect(restored.getFullBuffer().flat().some((cell) => cell.imagePlaceholder)).toBe(true);
+    restored.write("\x1b_Ga=d,d=i,i=94\x1b\\");
+    expect(restored.getImages()).toHaveLength(0);
+  });
+
+  test("preserves partially clipped signed rows and discards fully clipped runtime images", () => {
+    const source = new AnsiParser(20, 3);
+    source.write(kittyRgbaApc());
+    const partialSnapshot = source.createRuntimeSnapshot();
+    partialSnapshot.runtimeImageState!.images[0].row = -1;
+    partialSnapshot.runtimeImageState!.images[0].heightCells = 2;
+
+    const partial = new AnsiParser(20, 3);
+    partial.restoreSnapshot(partialSnapshot);
+    expect(partial.getImages()).toHaveLength(1);
+    expect(partial.getImages()[0].row).toBe(-1);
+
+    const discardedSnapshot = source.createRuntimeSnapshot();
+    discardedSnapshot.runtimeImageState!.images[0].row = -2;
+    discardedSnapshot.runtimeImageState!.images[0].heightCells = 2;
+    const discarded = new AnsiParser(20, 3);
+    discarded.restoreSnapshot(discardedSnapshot);
+    expect(discarded.getImages()).toHaveLength(0);
+  });
+
+  test("discards runtime images below a restored alternate-screen viewport", () => {
+    const source = new AnsiParser(20, 4);
+    source.write("\x1b[?1049h\x1b[4;1H");
+    source.write(kittyRgbaApc());
+    expect(source.getImages()[0].row).toBe(2);
+
+    const restored = new AnsiParser(20, 2);
+    restored.restoreSnapshot(source.createRuntimeSnapshot());
+
+    expect(restored.getImages()).toHaveLength(0);
+  });
+
+  test("refreshes dirty virtual origins before creating a runtime snapshot", () => {
+    const source = new AnsiParser(20, 4);
+    source.write("\x1b[?1049h");
+    source.write(kittyRgbaTransmit({ imageId: 95 }));
+    source.write("\x1b[3;1H\x1b_Ga=p,i=95,p=1,U=1,c=1,r=1\x1b\\");
+    source.write("\x1b[38;5;95m\u{10eeee}\x1b[0m");
+    expect(source.getImages()[0].row).toBe(2);
+
+    source.write("\x1b[1;4r\x1b[4;1H\n");
+    const snapshot = source.createRuntimeSnapshot();
+
+    expect(snapshot.runtimeImageState!.kittyVirtualPlacements[0][1].originRow).toBe(1);
+  });
+
+  test("discards relative placements whose restored parent is outside the viewport", () => {
+    const source = new AnsiParser(20, 4);
+    source.write("\x1b[?1049h");
+    source.write(kittyRgbaTransmit({ imageId: 96 }));
+    source.write(kittyRgbaTransmit({ imageId: 97 }));
+    source.write("\x1b[4;1H\x1b_Ga=p,i=96,p=11,c=1,r=1,C=1\x1b\\");
+    source.write("\x1b_Ga=p,i=97,p=22,P=96,Q=11,c=1,r=1,C=1\x1b\\");
+
+    const restored = new AnsiParser(20, 2);
+    restored.restoreSnapshot(source.createRuntimeSnapshot());
+
+    expect(restored.getImages()).toHaveLength(0);
+    expect(
+      (restored as unknown as { kittyRelativePlacements: Map<string, unknown> })
+        .kittyRelativePlacements.size
+    ).toBe(0);
+  });
+
   test("rebases image rows when scrollback drops older rows and removes images that fall past the cap", () => {
     const parser = new AnsiParser(20, 3);
 
@@ -519,6 +1019,649 @@ describe("AnsiParser Kitty images", () => {
     }
 
     expect(parser.getImages().length).toBeLessThan(attemptedImages);
+  });
+
+  test("removes relative placement groups when the image cap evicts their parent", () => {
+    const parser = new AnsiParser(20, 5);
+    const internals = parser as unknown as { kittyRelativePlacements: Map<string, unknown> };
+    parser.write(kittyRgbaTransmit({ imageId: 1 }));
+    parser.write(kittyRgbaTransmit({ imageId: 2 }));
+    parser.write("\x1b_Ga=p,i=1,p=11,c=1,r=1,C=1\x1b\\");
+    parser.write("\x1b_Ga=p,i=2,p=22,P=1,Q=11,c=1,r=1,C=1\x1b\\");
+
+    for (let index = 0; index < 128; index++) {
+      parser.write("\x1b_Ga=p,i=1,p=" + (100 + index) + ",c=1,r=1,C=1\x1b\\");
+    }
+
+    expect(parser.getImages()).toHaveLength(128);
+    expect(parser.getImages().some((image) => image.imageId === 2)).toBe(false);
+    expect(internals.kittyRelativePlacements.size).toBe(0);
+  });
+  test("decompresses zlib image data and reports the resolved image id", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    const rgba = Uint8Array.from([9, 8, 7, 6]);
+    const payload = Buffer.from(zlibSync(rgba)).toString("base64");
+
+    parser.write(`\x1b_Ga=T,f=32,s=1,v=1,i=41,o=z,C=1;${payload}\x1b\\`);
+
+    expect(Array.from(parser.getImages()[0].data)).toEqual(Array.from(rgba));
+    expect(responses).toEqual(["\x1b_Gi=41;OK\x1b\\"]);
+  });
+
+  test("rejects zlib image data as soon as decoded output exceeds the limit", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    const payload = Buffer.from(zlibSync(new Uint8Array(4 * 1024 * 1024 + 1))).toString("base64");
+
+    parser.write(`\x1b_Ga=t,f=32,s=1,v=1,i=42,o=z;${payload}\x1b\\`);
+
+    expect(parser.getImages()).toHaveLength(0);
+    expect(responses.at(-1)).toContain("ENOSPC:decompressed image too large");
+  });
+
+  test("suppresses successful responses with q=1 but still reports failures", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+
+    parser.write("\x1b_Ga=t,f=32,s=1,v=1,i=42,q=1;AQIDBA==\x1b\\");
+    parser.write("\x1b_Ga=t,f=32,s=2,v=1,i=43,q=1;AQIDBA==\x1b\\");
+
+    expect(responses).toHaveLength(1);
+    expect(responses[0]).toContain("i=43");
+    expect(responses[0]).toContain("EINVAL");
+  });
+
+  test("renders Unicode placeholders using image and placement color ids", () => {
+    const parser = new AnsiParser(20, 3);
+    const rgba = Buffer.from([255, 0, 0, 255, 0, 255, 0, 255]).toString("base64");
+    parser.write(`\x1b_Ga=t,f=32,s=2,v=1,i=7;${rgba}\x1b\\`);
+    parser.write("\x1b_Ga=p,i=7,p=9,U=1,c=2,r=1\x1b\\");
+    parser.write("\x1b[38:5:7;58:5:9m\u{10eeee}\u{10eeee}\x1b[0m");
+
+    const placeholders = parser.getImages();
+    expect(placeholders).toHaveLength(2);
+    expect(placeholders.map((image) => [image.col, image.sourceX, image.sourceWidth])).toEqual([
+      [0, 0, 1],
+      [1, 1, 1],
+    ]);
+    expect(parser.getBuffer()[0][0].imagePlaceholder?.imageId).toBe(7);
+  });
+
+  test("preserves aspect ratio across Unicode placeholder cells", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.setCellSize(8, 16);
+    const rgba = Buffer.from(new Uint8Array(4 * 4).fill(255)).toString("base64");
+    parser.write(`\x1b_Ga=t,f=32,s=4,v=1,i=17;${rgba}\x1b\\`);
+    parser.write("\x1b_Ga=p,i=17,U=1,c=2,r=2\x1b\\");
+    parser.write("\x1b[38;5;17m\u{10eeee}\u0305\u{10eeee}\r\n\u{10eeee}\u030d\u{10eeee}\x1b[0m");
+
+    const placeholders = parser.getImages();
+    expect(placeholders).toHaveLength(4);
+    expect(placeholders.map((image) => [image.sourceX, image.sourceWidth])).toEqual([
+      [0, 2],
+      [2, 2],
+      [0, 2],
+      [2, 2],
+    ]);
+    expect(placeholders[0].sourceY).toBeCloseTo(0);
+    expect(placeholders[0].sourceHeight).toBeCloseTo(0.5);
+    expect(placeholders[0].offsetY).toBeCloseTo(14);
+    expect(placeholders[0].heightCells).toBeCloseTo(0.125);
+    expect(placeholders[2].sourceY).toBeCloseTo(0.5);
+    expect(placeholders[2].sourceHeight).toBeCloseTo(0.5);
+    expect(placeholders[2].offsetY).toBeCloseTo(0);
+    expect(placeholders[2].heightCells).toBeCloseTo(0.125);
+  });
+
+  test("inherits omitted placeholder columns and resets them when the row changes", () => {
+    const parser = new AnsiParser(20, 3);
+    const rgba = Buffer.from(new Uint8Array(3 * 2 * 4).fill(255)).toString("base64");
+    parser.write(`\x1b_Ga=t,f=32,s=3,v=2,i=8;${rgba}\x1b\\`);
+    parser.write("\x1b_Ga=p,i=8,U=1,c=3,r=2\x1b\\");
+    parser.write("\x1b[38;5;8m\u{10eeee}\u0305\u{10eeee}\u{10eeee}\r\n\u{10eeee}\u030d\u{10eeee}\x1b[0m");
+
+    const cells = parser.getFullBuffer().flatMap((row) => row.filter((cell) => cell.imagePlaceholder));
+    expect(cells.map((cell) => [cell.imagePlaceholder?.row, cell.imagePlaceholder?.col])).toEqual([
+      [0, 0], [0, 1], [0, 2], [1, 0], [1, 1],
+    ]);
+  });
+
+  test("keeps virtual and relative placement sizes independent of the cursor column", () => {
+    const parser = new AnsiParser(5, 3);
+    const internals = parser as unknown as {
+      kittyVirtualPlacements: Map<string, { columns: number }>;
+    };
+    parser.write(kittyRgbaTransmit({ imageId: 71 }));
+    parser.write(kittyRgbaTransmit({ imageId: 72 }));
+    parser.write("\x1b[1;5H");
+    parser.write("\x1b_Ga=p,i=71,p=11,c=1,r=1,C=1\x1b\\");
+    parser.write("\x1b_Ga=p,i=72,p=22,P=71,Q=11,c=10,r=1,C=1\x1b\\");
+    parser.write("\x1b_Ga=p,i=72,p=33,U=1,c=10,r=1,C=1\x1b\\");
+
+    expect(parser.getImages().find((image) => image.placementId === 22)?.widthCells).toBe(10);
+    expect([...internals.kittyVirtualPlacements.values()][0]?.columns).toBe(10);
+  });
+  test("anchors relative placements to independent sparse placeholder minima", () => {
+    const parser = new AnsiParser(20, 4);
+    parser.write(kittyRgbaTransmit({ imageId: 21 }));
+    parser.write(kittyRgbaTransmit({ imageId: 22 }));
+    parser.write("\x1b_Ga=p,i=21,p=11,U=1,c=2,r=2\x1b\\");
+    parser.write("\x1b_Ga=p,i=22,p=22,P=21,Q=11,c=1,r=1,C=1\x1b\\");
+    parser.write("\x1b[1;6H\x1b[38:5:21;58:5:11m\u{10eeee}\u0305\u0305");
+    parser.write("\x1b[2;2H\u{10eeee}\u030d\u030d\x1b[0m");
+
+    const relative = parser.getImages().find((image) => image.placementId === 22);
+    expect(relative).toMatchObject({ row: 0, col: 1 });
+  });
+
+  test("records a virtual origin before it leaves the requested render range", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write(kittyRgbaTransmit({ imageId: 23 }));
+    parser.write(kittyRgbaTransmit({ imageId: 24 }));
+    parser.write("\x1b_Ga=p,i=23,p=11,U=1,c=1,r=1\x1b\\");
+    parser.write("\x1b_Ga=p,i=24,p=22,P=23,Q=11,V=3,c=1,r=1,C=1\x1b\\");
+    parser.write("\x1b[38:5:23;58:5:11m\u{10eeee}\x1b[0m");
+    parser.write("\x1b[3;1H\r\n");
+
+    const relative = parser
+      .getImages(1, 4)
+      .find((image) => image.placementId === 22);
+    expect(relative).toMatchObject({ row: 3, col: 0 });
+  });
+
+  test("consumes every official Kitty row-column diacritic", () => {
+    const parser = new AnsiParser(5, 3);
+    parser.write(kittyRgbaTransmit({ imageId: 25 }));
+    parser.write("\x1b_Ga=p,i=25,p=11,U=1,c=1,r=297\x1b\\");
+    parser.write("\x1b[38:5:25;58:5:11m\u{10eeee}\u{a8e6}\x1b[0m");
+
+    expect(parser.getBuffer()[0][0].imagePlaceholder?.row).toBe(256);
+    expect(parser.getFullCursor()).toEqual({ x: 1, y: 0 });
+  });
+
+  test("removes relative images after their virtual parent cells are erased", () => {
+    const parser = new AnsiParser(20, 4);
+    parser.write(kittyRgbaTransmit({ imageId: 26 }));
+    parser.write(kittyRgbaTransmit({ imageId: 27 }));
+    parser.write("\x1b_Ga=p,i=26,p=11,U=1,c=1,r=1\x1b\\");
+    parser.write("\x1b_Ga=p,i=27,p=22,P=26,Q=11,c=1,r=1,C=1\x1b\\");
+    parser.write("\x1b[38:5:26;58:5:11m\u{10eeee}\x1b[0m");
+    expect(parser.getImages().find((image) => image.placementId === 22)?.row).toBe(0);
+
+    parser.write("\x1b[1;1H\x1b[2K");
+
+    expect(parser.getImages().find((image) => image.placementId === 22)).toBeUndefined();
+  });
+
+  test("moves relative images when line insertion moves their virtual parent", () => {
+    const parser = new AnsiParser(20, 4);
+    parser.write(kittyRgbaTransmit({ imageId: 28 }));
+    parser.write(kittyRgbaTransmit({ imageId: 29 }));
+    parser.write("\x1b_Ga=p,i=28,p=11,U=1,c=1,r=1\x1b\\");
+    parser.write("\x1b_Ga=p,i=29,p=22,P=28,Q=11,c=1,r=1,C=1\x1b\\");
+    parser.write("\x1b[2;1H\x1b[38:5:28;58:5:11m\u{10eeee}\x1b[0m");
+    expect(parser.getImages().find((image) => image.placementId === 22)?.row).toBe(1);
+
+    parser.write("\x1b[1;1H\x1b[1L");
+
+    expect(parser.getImages().find((image) => image.placementId === 22)?.row).toBe(2);
+  });
+
+  test("positions relative placements and rejects cycles", () => {
+    const parser = new AnsiParser(20, 5);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    parser.write(kittyRgbaTransmit({ imageId: 1, pixel: [1, 0, 0, 255] }));
+    parser.write(kittyRgbaTransmit({ imageId: 2, pixel: [2, 0, 0, 255] }));
+    parser.write("\x1b_Ga=p,i=1,p=11,c=1,r=1,C=1\x1b\\");
+    parser.write("\x1b_Ga=p,i=2,p=22,P=1,Q=11,H=3,V=1,c=1,r=1\x1b\\");
+
+    const relative = parser.getImages().find((image) => image.imageId === 2);
+    expect(relative).toMatchObject({ row: 1, col: 3, placementId: 22 });
+    expect(parser.getFullCursor()).toEqual({ x: 0, y: 0 });
+
+    parser.write("\x1b_Ga=p,i=1,p=11,P=2,Q=22,c=1,r=1\x1b\\");
+    expect(responses.at(-1)).toContain("ECYCLE");
+  });
+
+  test("switches and advances RGBA animation frames", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write(kittyRgbaTransmit({ imageId: 60, pixel: [255, 0, 0, 255] }));
+    parser.write("\x1b_Ga=p,i=60,p=1,c=1,r=1,C=1\x1b\\");
+    const green = Buffer.from([0, 255, 0, 255]).toString("base64");
+    parser.write(`\x1b_Ga=f,f=32,s=1,v=1,i=60,z=40;${green}\x1b\\`);
+    parser.write("\x1b_Ga=a,i=60,c=2,s=3\x1b\\");
+
+    expect(Array.from(parser.getImages()[0].data)).toEqual([0, 255, 0, 255]);
+    expect(parser.getKittyAnimationDelay(new Set([60]))).not.toBeNull();
+  });
+  test("does not schedule or advance animations without visible placements", () => {
+    const parser = new AnsiParser(20, 3);
+    const internals = parser as unknown as {
+      kittyImageData: Map<
+        number,
+        { animation?: { currentFrame: number; lastFrameAt: number } }
+      >;
+    };
+    parser.write(kittyRgbaTransmit({ imageId: 62, pixel: [255, 0, 0, 255] }));
+    const green = Buffer.from([0, 255, 0, 255]).toString("base64");
+    parser.write(
+      "\x1b_Ga=f,f=32,s=1,v=1,i=62,z=40;" + green + "\x1b\\",
+    );
+    parser.write("\x1b_Ga=a,i=62,c=1,s=3\x1b\\");
+
+    const animation = internals.kittyImageData.get(62)?.animation;
+    expect(animation).toBeDefined();
+    const currentFrame = animation!.currentFrame;
+    expect(parser.getKittyAnimationDelay(new Set(), animation!.lastFrameAt)).toBeNull();
+    expect(
+      parser.advanceKittyAnimations(new Set(), animation!.lastFrameAt + 100),
+    ).toBe(false);
+    expect(animation!.currentFrame).toBe(currentFrame);
+  });
+
+  test("keeps placement render ids stable while advancing animation frames", () => {
+    const parser = new AnsiParser(20, 3);
+    const internals = parser as unknown as {
+      kittyImageData: Map<number, { animation?: { lastFrameAt: number } }>;
+    };
+    parser.write(kittyRgbaTransmit({ imageId: 61, pixel: [255, 0, 0, 255] }));
+    parser.write("\x1b_Ga=p,i=61,p=1,c=1,r=1,C=1\x1b\\");
+    parser.write("\x1b_Ga=p,i=61,p=2,U=1,c=1,r=1\x1b\\");
+    parser.write("\x1b[38:5:61;58:5:2m\u{10eeee}\u0305\u0305\x1b[0m");
+    const green = Buffer.from([0, 255, 0, 255]).toString("base64");
+    parser.write(`\x1b_Ga=f,f=32,s=1,v=1,i=61,z=40;${green}\x1b\\`);
+    parser.write("\x1b_Ga=a,i=61,c=1,s=3\x1b\\");
+
+    const before = parser.getImages();
+    const physicalId = before.find((image) => image.placementId === 1)?.id;
+    const virtualId = before.find((image) => image.placementId === 2)?.id;
+    const placeholderRenderId = parser.getBuffer()[0][0].imagePlaceholder?.renderId;
+    const animation = internals.kittyImageData.get(61)?.animation;
+    expect(animation).toBeDefined();
+
+    parser.advanceKittyAnimations(new Set([61]), animation!.lastFrameAt);
+
+    const after = parser.getImages();
+    expect(after.find((image) => image.placementId === 1)?.id).toBe(physicalId);
+    expect(after.find((image) => image.placementId === 2)?.id).toBe(virtualId);
+    expect(parser.getBuffer()[0][0].imagePlaceholder?.renderId).toBe(placeholderRenderId);
+    expect(Array.from(after.find((image) => image.placementId === 2)?.data ?? [])).toEqual([0, 255, 0, 255]);
+  });
+
+  test("composites partial PNG animation frames into the root image", () => {
+    const parser = new AnsiParser(20, 3);
+    const root = rgbaPngBase64(2, 1, [255, 0, 0, 255, 0, 0, 255, 255]);
+    const green = rgbaPngBase64(1, 1, [0, 255, 0, 255]);
+    parser.write("\x1b_Ga=t,f=100,i=70;" + root + "\x1b\\");
+    parser.write("\x1b_Ga=p,i=70,p=1,c=2,r=1,C=1\x1b\\");
+    parser.write("\x1b_Ga=f,f=100,i=70,x=1,y=0,c=1;" + green + "\x1b\\");
+    parser.write("\x1b_Ga=a,i=70,c=2,s=1\x1b\\");
+
+    expect(Array.from(parser.getImages()[0].data)).toEqual([
+      255, 0, 0, 255,
+      0, 255, 0, 255,
+    ]);
+  });
+
+  test("caps detached placements and animation frames", () => {
+    const placementParser = new AnsiParser(20, 3);
+    const placementResponses: string[] = [];
+    const placementInternals = placementParser as unknown as {
+      kittyVirtualPlacements: Map<string, unknown>;
+      kittyRelativePlacements: Map<string, unknown>;
+    };
+    placementParser.setResponseHandler((response) => placementResponses.push(response));
+    placementParser.write(kittyRgbaTransmit({ imageId: 80 }));
+    placementResponses.length = 0;
+
+    for (let placementId = 1; placementId <= 129; placementId++) {
+      placementParser.write(
+        `\x1b_Ga=p,i=80,p=${placementId},U=1,c=1,r=1,q=1\x1b\\`,
+      );
+    }
+
+    expect(
+      placementInternals.kittyVirtualPlacements.size +
+        placementInternals.kittyRelativePlacements.size,
+    ).toBe(128);
+    expect(placementResponses.at(-1)).toContain("ENOSPC:image placement limit exceeded");
+
+    const frameParser = new AnsiParser(20, 3);
+    const frameResponses: string[] = [];
+    const frameInternals = frameParser as unknown as {
+      kittyImageData: Map<number, { animation?: { frames: unknown[] } }>;
+    };
+    frameParser.setResponseHandler((response) => frameResponses.push(response));
+    frameParser.write(kittyRgbaTransmit({ imageId: 81 }));
+    const framePayload = Buffer.from([5, 6, 7, 8]).toString("base64");
+    for (let frame = 0; frame < 255; frame++) {
+      frameParser.write(
+        `\x1b_Ga=f,f=32,s=1,v=1,i=81,z=1,q=1;${framePayload}\x1b\\`,
+      );
+    }
+    expect(frameInternals.kittyImageData.get(81)?.animation?.frames).toHaveLength(256);
+
+    frameResponses.length = 0;
+    frameParser.write(`\x1b_Ga=f,f=32,s=1,v=1,i=81,z=1,q=1;${framePayload}\x1b\\`);
+
+    expect(frameInternals.kittyImageData.get(81)?.animation?.frames).toHaveLength(256);
+    expect(frameResponses.at(-1)).toContain("ENOSPC:animation frame limit exceeded");
+  });
+
+  test("uses Kitty source and destination frame coordinates when composing", () => {
+    const parser = new AnsiParser(20, 3);
+    const root = Buffer.from([10, 0, 0, 255, 20, 0, 0, 255]).toString("base64");
+    const source = Buffer.from([30, 0, 0, 255, 40, 0, 0, 255]).toString("base64");
+    const internals = parser as unknown as {
+      kittyImageData: Map<number, {
+        animation?: { frames: Array<{ data: { data: Uint8Array | Uint8ClampedArray } }> };
+      }>;
+    };
+    parser.write(`\x1b_Ga=t,f=32,s=2,v=1,i=82;${root}\x1b\\`);
+    parser.write(`\x1b_Ga=f,f=32,s=2,v=1,i=82,z=40;${source}\x1b\\`);
+
+    parser.write("\x1b_Ga=c,i=82,r=2,c=1,x=1,y=0,X=0,Y=0,w=1,h=1,C=1\x1b\\");
+
+    const frames = internals.kittyImageData.get(82)?.animation?.frames;
+    expect(Array.from(frames?.[0].data.data ?? [])).toEqual([
+      40, 0, 0, 255,
+      20, 0, 0, 255,
+    ]);
+    expect(Array.from(frames?.[1].data.data ?? [])).toEqual([
+      30, 0, 0, 255,
+      40, 0, 0, 255,
+    ]);
+  });
+
+  test("allows replacing the displayed frame at the exact image byte limit", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    const dimension = 1024;
+    const buffers = Array.from(
+      { length: 8 },
+      () => new Uint8ClampedArray(dimension * dimension * 4),
+    );
+    const root = { kind: "rgba" as const, pixelWidth: dimension, pixelHeight: dimension, data: buffers[0] };
+    const frames = buffers.map((data) => ({ data: { ...root, data }, gap: 40 }));
+    const imageData = {
+      ...root,
+      animation: {
+        frames,
+        currentFrame: 1,
+        running: false,
+        waitForFrames: false,
+        configuredLoops: 0,
+        remainingLoops: 0,
+        lastFrameAt: 0,
+      },
+    };
+    const placement = {
+      ...root,
+      id: 1,
+      protocol: "kitty" as const,
+      imageId: 85,
+      row: 0,
+      col: 0,
+      widthCells: 1,
+      heightCells: 1,
+      sourceX: 0,
+      sourceY: 0,
+      sourceWidth: dimension,
+      sourceHeight: dimension,
+      offsetX: 0,
+      offsetY: 0,
+      zIndex: 0,
+      data: buffers[1],
+    };
+    const internals = parser as unknown as {
+      kittyImageData: Map<number, typeof imageData>;
+      images: Array<typeof placement>;
+    };
+    internals.kittyImageData.set(85, imageData);
+    internals.images = [placement];
+
+    parser.write("\x1b_Ga=c,i=85,r=1,c=2,w=" + dimension + ",h=" + dimension + ",C=1\x1b\\");
+
+    expect(responses.at(-1)).toContain(";OK");
+    expect(frames[1].data.data).not.toBe(buffers[1]);
+    expect(internals.images[0].data).toBe(frames[1].data.data);
+  });
+
+  test("counts a shared root buffer that remains after frame replacement", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    const dimension = 1024;
+    const buffers = Array.from(
+      { length: 8 },
+      () => new Uint8ClampedArray(dimension * dimension * 4),
+    );
+    const root = {
+      kind: "rgba" as const,
+      pixelWidth: dimension,
+      pixelHeight: dimension,
+      data: buffers[0],
+    };
+    const frames = buffers.map((data) => ({
+      data: { ...root, data },
+      gap: 40,
+    }));
+    const image = {
+      ...root,
+      animation: {
+        frames,
+        currentFrame: 0,
+        running: false,
+        waitForFrames: false,
+        configuredLoops: 0,
+        remainingLoops: 0,
+        lastFrameAt: 0,
+      },
+    };
+    const internals = parser as unknown as {
+      kittyImageData: Map<number, typeof image>;
+    };
+    internals.kittyImageData.set(84, image);
+
+    parser.write(
+      `\x1b_Ga=c,i=84,r=2,c=1,w=${dimension},h=${dimension},C=1\x1b\\`,
+    );
+
+    expect(responses.at(-1)).toContain("ENOSPC:image storage limit exceeded");
+    expect(frames[0].data.data).toBe(buffers[0]);
+  });
+
+  test("keeps PNG frame composition within the total image byte budget", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    const dimension = 1024;
+    const png = Buffer.from(encodePng({
+      width: dimension,
+      height: dimension,
+      data: new Uint8Array(dimension * dimension * 4),
+      channels: 4,
+      depth: 8,
+    })).toString("base64");
+    const internals = parser as unknown as {
+      kittyImageData: Map<number, {
+        data: Uint8Array | Uint8ClampedArray;
+        animation?: {
+          frames: Array<{ data: { data: Uint8Array | Uint8ClampedArray } }>;
+        };
+      }>;
+    };
+
+    parser.write(`\x1b_Ga=t,f=100,i=83;${png}\x1b\\`);
+    for (let frame = 2; frame <= 10; frame++) {
+      parser.write(`\x1b_Ga=f,f=100,i=83,z=40;${png}\x1b\\`);
+    }
+    responses.length = 0;
+
+    for (let destination = 2; destination <= 10; destination++) {
+      parser.write(
+        `\x1b_Ga=c,i=83,r=1,c=${destination},w=${dimension},h=${dimension},C=1\x1b\\`,
+      );
+    }
+
+    const image = internals.kittyImageData.get(83)!;
+    const retained = new Set<Uint8Array | Uint8ClampedArray>([
+      image.data,
+      ...(image.animation?.frames.map((frame) => frame.data.data) ?? []),
+    ]);
+    const retainedBytes = [...retained].reduce((total, data) => total + data.byteLength, 0);
+    expect(retainedBytes).toBeLessThanOrEqual(32 * 1024 * 1024);
+    expect(responses.at(-1)).toContain("ENOSPC:image storage limit exceeded");
+  });
+
+  test("rejects out-of-bounds and overlapping Kitty frame composition", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    const root = Buffer.from([10, 0, 0, 255, 20, 0, 0, 255]).toString("base64");
+    const source = Buffer.from([30, 0, 0, 255, 40, 0, 0, 255]).toString("base64");
+    parser.write(`\x1b_Ga=t,f=32,s=2,v=1,i=83;${root}\x1b\\`);
+    parser.write(`\x1b_Ga=f,f=32,s=2,v=1,i=83,z=40;${source}\x1b\\`);
+
+    responses.length = 0;
+    parser.write("\x1b_Ga=c,i=83,r=2,c=1,X=0,Y=0,x=0,y=0,w=3,h=1,C=1\x1b\\");
+    expect(responses.at(-1)).toContain("EINVAL:invalid composition rectangle");
+
+    responses.length = 0;
+    parser.write("\x1b_Ga=c,i=83,r=1,c=1,X=0,Y=0,x=0,y=0,w=1,h=1,C=1\x1b\\");
+    expect(responses.at(-1)).toContain("EINVAL:overlapping composition rectangles");
+  });
+
+  test("applies low-bit grayscale PNG transparency after sample expansion", () => {
+    const parser = new AnsiParser(20, 3);
+    const internals = parser as unknown as {
+      decodedPngToRgba(decoded: {
+        width: number;
+        height: number;
+        channels: number;
+        depth: number;
+        data: Uint8Array;
+        transparency: Uint16Array;
+      }): Uint8ClampedArray | null;
+    };
+
+    const rgba = internals.decodedPngToRgba({
+      width: 1,
+      height: 1,
+      channels: 1,
+      depth: 1,
+      data: Uint8Array.of(0b1000_0000),
+      transparency: Uint16Array.of(1),
+    });
+
+    expect(Array.from(rgba ?? [])).toEqual([255, 255, 255, 0]);
+  });
+
+  test("preserves the root animation frame zero-millisecond gap", () => {
+    const parser = new AnsiParser(20, 3);
+    const internals = parser as unknown as {
+      kittyImageData: Map<number, { animation?: { lastFrameAt: number } }>;
+    };
+    parser.write(kittyRgbaTransmit({ imageId: 83 }));
+    const frame = Buffer.from([5, 6, 7, 8]).toString("base64");
+    parser.write(`\x1b_Ga=f,f=32,s=1,v=1,i=83,z=40;${frame}\x1b\\`);
+    parser.write("\x1b_Ga=a,i=83,c=1,s=3\x1b\\");
+
+    const animation = internals.kittyImageData.get(83)?.animation;
+    expect(animation).toBeDefined();
+    expect(parser.getKittyAnimationDelay(new Set([83]), animation!.lastFrameAt)).toBe(0);
+  });
+
+  test("resets finite animation loops when stopped and restarted", () => {
+    const parser = new AnsiParser(20, 3);
+    const internals = parser as unknown as {
+      kittyImageData: Map<number, {
+        animation?: { configuredLoops: number; remainingLoops: number };
+      }>;
+    };
+    parser.write(kittyRgbaTransmit({ imageId: 84 }));
+    const frame = Buffer.from([5, 6, 7, 8]).toString("base64");
+    parser.write(`\x1b_Ga=f,f=32,s=1,v=1,i=84,z=40;${frame}\x1b\\`);
+    parser.write("\x1b_Ga=a,i=84,c=1,v=3,s=3\x1b\\");
+    const animation = internals.kittyImageData.get(84)?.animation;
+    expect(animation).toBeDefined();
+    animation!.remainingLoops = 0;
+
+    parser.write("\x1b_Ga=a,i=84,s=1\x1b\\");
+    expect(animation!.remainingLoops).toBe(2);
+    parser.write("\x1b_Ga=a,i=84,s=3\x1b\\");
+    expect(animation!.remainingLoops).toBe(2);
+  });
+
+  test("restores main-screen virtual placements after alternate-screen erase", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write(kittyRgbaTransmit({ imageId: 85 }));
+    parser.write("\x1b_Ga=p,i=85,p=1,U=1,c=1,r=1\x1b\\");
+    parser.write("\x1b[38;5;85m\u{10eeee}\x1b[0m");
+    expect(parser.getImages()).toHaveLength(1);
+
+    parser.write("\x1b[?1049h\x1b[2J\x1b[?1049l");
+
+    expect(parser.getImages()).toHaveLength(1);
+    expect(parser.getBuffer()[0][0].imagePlaceholder?.imageId).toBe(85);
+  });
+
+  test("allows replacing an image that already occupies the byte budget", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    const internals = parser as unknown as {
+      kittyImageData: Map<number, {
+        kind: "rgba";
+        pixelWidth: number;
+        pixelHeight: number;
+        data: Uint8ClampedArray;
+      }>;
+    };
+    parser.setResponseHandler((response) => responses.push(response));
+    internals.kittyImageData.set(86, {
+      kind: "rgba",
+      pixelWidth: 1,
+      pixelHeight: 1,
+      data: new Uint8ClampedArray(32 * 1024 * 1024),
+    });
+
+    parser.write(kittyRgbaTransmit({ imageId: 86, pixel: [9, 8, 7, 6] }));
+
+    expect(responses.at(-1)).toContain(";OK");
+    expect(Array.from(internals.kittyImageData.get(86)?.data ?? [])).toEqual([9, 8, 7, 6]);
+  });
+
+  test("omits physical images outside the requested row range", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write(kittyRgbaApc({ widthCells: 1, heightCells: 1 }));
+
+    expect(parser.getImages()).toHaveLength(1);
+    expect(parser.getImages(2, 3)).toHaveLength(0);
+  });
+  test("skips negative-gap frames without displaying them", () => {
+    const parser = new AnsiParser(20, 3);
+    const internals = parser as unknown as {
+      kittyImageData: Map<number, { animation?: { lastFrameAt: number } }>;
+    };
+    parser.write(kittyRgbaTransmit({ imageId: 73, pixel: [255, 0, 0, 255] }));
+    parser.write("\x1b_Ga=p,i=73,p=1,c=1,r=1,C=1\x1b\\");
+    const green = Buffer.from([0, 255, 0, 255]).toString("base64");
+    const blue = Buffer.from([0, 0, 255, 255]).toString("base64");
+    parser.write("\x1b_Ga=f,f=32,s=1,v=1,i=73,z=-10;" + green + "\x1b\\");
+    parser.write("\x1b_Ga=f,f=32,s=1,v=1,i=73,z=40;" + blue + "\x1b\\");
+    parser.write("\x1b_Ga=a,i=73,c=1,s=3\x1b\\");
+
+    const animation = internals.kittyImageData.get(73)?.animation;
+    expect(animation).toBeDefined();
+    parser.advanceKittyAnimations(new Set([73]), animation!.lastFrameAt);
+
+    expect(Array.from(parser.getImages()[0].data)).toEqual([0, 0, 255, 255]);
   });
 });
 
@@ -590,7 +1733,10 @@ describe("AnsiParser iTerm2 OSC 1337 images", () => {
   test("converts iTerm2 pixel size units to terminal cells", () => {
     const parser = new AnsiParser(80, 5);
 
-    parser.write(iterm2FileOsc(["inline=1", "width=16px", "height=32px"], TINY_PNG_BASE64));
+    parser.write(iterm2FileOsc(
+      ["inline=1", "width=16px", "height=32px", "preserveAspectRatio=0"],
+      TINY_PNG_BASE64,
+    ));
 
     const images = parser.getImages();
 
@@ -602,10 +1748,29 @@ describe("AnsiParser iTerm2 OSC 1337 images", () => {
     expect(Array.from(image.data)).toEqual(Array.from(TINY_PNG_BYTES));
   });
 
+  test("preserves non-cell-aligned iTerm2 pixel dimensions", () => {
+    const parser = new AnsiParser(80, 5);
+    parser.setCellSize(8, 16);
+    parser.write(iterm2FileOsc(
+      ["inline=1", "width=9px", "height=9px", "preserveAspectRatio=0"],
+      TINY_PNG_BASE64,
+    ));
+
+    expect(parser.getImages()[0]).toMatchObject({
+      widthCells: 2,
+      heightCells: 1,
+      destinationPixelWidth: 9,
+      destinationPixelHeight: 9,
+    });
+  });
+
   test("converts iTerm2 percent size units against parser dimensions", () => {
     const parser = new AnsiParser(80, 20);
 
-    parser.write(iterm2FileOsc(["inline=1", "width=25%", "height=10%"], TINY_PNG_BASE64));
+    parser.write(iterm2FileOsc(
+      ["inline=1", "width=25%", "height=10%", "preserveAspectRatio=0"],
+      TINY_PNG_BASE64,
+    ));
 
     const images = parser.getImages();
 
@@ -623,7 +1788,7 @@ describe("AnsiParser iTerm2 OSC 1337 images", () => {
     parser.write("top\r\nxy");
     const cursorBeforeImage = parser.getFullCursor();
 
-    parser.write(`${iterm2FileOsc(["inline=1", "width=4", "height=2"], TWO_BY_ONE_JPEG_BASE64)}tail`);
+    parser.write(`${iterm2FileOsc(["inline=1", "width=4", "height=2", "preserveAspectRatio=0"], TWO_BY_ONE_JPEG_BASE64)}tail`);
 
     const images = parser.getImages();
 
@@ -685,7 +1850,7 @@ describe("AnsiParser iTerm2 OSC 1337 images", () => {
     expect(image.row).toBe(cursorBeforeImage.y);
     expect(image.col).toBe(cursorBeforeImage.x);
     expect(image.widthCells).toBe(4);
-    expect(image.heightCells).toBe(2);
+    expect(image.heightCells).toBe(1);
     expect(image.pixelWidth).toBe(2);
     expect(image.pixelHeight).toBe(1);
     expect(image.mimeType).toBe("image/jpeg");
@@ -721,6 +1886,31 @@ describe("AnsiParser iTerm2 OSC 1337 images", () => {
     expect(visibleText).not.toContain(TINY_PNG_BASE64);
   });
 
+  test("preserves aspect ratio inside a two-axis iTerm2 size box by default", () => {
+    const parser = new AnsiParser(80, 5);
+    parser.setCellSize(8, 16);
+
+    parser.write(iterm2FileOsc(
+      ["inline=1", "width=4", "height=4", "doNotMoveCursor=1"],
+      TWO_BY_ONE_JPEG_BASE64,
+    ));
+
+    expect(parser.getImages()[0]).toMatchObject({ widthCells: 4, heightCells: 1 });
+  });
+
+  test("stretches one unspecified axis when preserveAspectRatio=0", () => {
+    const parser = new AnsiParser(80, 5);
+    parser.setCellSize(8, 16);
+
+    parser.write(iterm2FileOsc(
+      ["inline=1", "height=3", "preserveAspectRatio=0", "doNotMoveCursor=1"],
+      TWO_BY_ONE_JPEG_BASE64,
+    ));
+
+    expect(parser.getImages()[0]).toMatchObject({ widthCells: 1, heightCells: 3 });
+    expect(parser.getFullCursor()).toEqual({ x: 0, y: 0 });
+  });
+
   test("ignores non-inline file transfers without printing payload bytes", () => {
     const parser = new AnsiParser(80, 3);
     const encodedName = Buffer.from("tiny.jpg").toString("base64");
@@ -741,6 +1931,114 @@ describe("AnsiParser iTerm2 OSC 1337 images", () => {
     expect(parser.getFullCursor()).toEqual(cursorBeforeTransfer);
     expect(visibleRowText(parser, cursorBeforeTransfer.y)).toBe("abc");
     expect(visibleText).not.toContain(TINY_JPEG_BASE64);
+  });
+});
+
+describe("AnsiParser image lifecycle", () => {
+  test("moves image placements with partial scroll regions", () => {
+    const parser = new AnsiParser(20, 4);
+    parser.write(kittyRgbaTransmit({ imageId: 70 }));
+    parser.write("\x1b[3;1H\x1b_Ga=p,i=70,p=1,c=1,r=1,C=1\x1b\\");
+
+    parser.write("\x1b[2;4r\x1b[4;1H\n");
+
+    expect(parser.getImages()[0].row).toBe(1);
+  });
+
+  test("keeps an image crossing a scroll boundary intact", () => {
+    const parser = new AnsiParser(20, 4);
+    const payload = Buffer.from(new Uint8Array(1 * 32 * 4).fill(255)).toString("base64");
+    parser.write(`\x1b[1;1H\x1b_Ga=T,f=32,s=1,v=32,i=71,p=1,c=1,r=2,C=1;${payload}\x1b\\`);
+
+    parser.write("\x1b[2;4r\x1b[4;1H\n");
+
+    const [image] = parser.getImages();
+    expect(image).toMatchObject({ row: 0, heightCells: 2, sourceY: 0, sourceHeight: 32 });
+  });
+
+  test("adjusts destination pixels when clipping a non-cell-aligned image", () => {
+    const parser = new AnsiParser(20, 4);
+    parser.setCellSize(8, 16);
+    parser.write("\x1bPq\"3;1;8;8#0!8~\x1b\\");
+    const original = parser.getImages()[0];
+    const internals = parser as unknown as {
+      sliceImageRows: (image: typeof original, start: number, end: number, destinationRow: number) => typeof original;
+    };
+
+    const clipped = internals.sliceImageRows(original, 1, 2, 0);
+
+    expect(clipped.destinationPixelHeight).toBe(8);
+    expect(clipped.heightCells).toBe(1);
+    expect(clipped.sourceY).toBeCloseTo(16 / 3);
+    expect(clipped.sourceHeight).toBeCloseTo(8 / 3);
+  });
+});
+
+describe("AnsiParser Sixel images", () => {
+  test("applies Pan/Pad as vertical-to-horizontal pixel aspect ratio", () => {
+    const parser = new AnsiParser(20, 4);
+    parser.setCellSize(8, 16);
+
+    parser.write("\x1bPq\"2;1;8;8#0!8~\x1b\\");
+
+    expect(parser.getImages()[0]).toMatchObject({
+      pixelWidth: 8,
+      pixelHeight: 8,
+      widthCells: 1,
+      heightCells: 1,
+    });
+  });
+
+  test("preserves non-cell-aligned Sixel Pan/Pad dimensions", () => {
+    const parser = new AnsiParser(20, 4);
+    parser.setCellSize(8, 16);
+    parser.write("\x1bPq\"3;1;8;8#0!8~\x1b\\");
+
+    expect(parser.getImages()[0]).toMatchObject({
+      widthCells: 1,
+      heightCells: 2,
+      destinationPixelWidth: 8,
+      destinationPixelHeight: 24,
+    });
+  });
+
+  test("keeps the full six-pixel height of a data band", () => {
+    const setPixel = new AnsiParser(20, 4);
+    setPixel.write("\x1bPq@\x1b\\");
+    expect(setPixel.getImages()[0]).toMatchObject({ pixelWidth: 1, pixelHeight: 6 });
+
+    const emptyBand = new AnsiParser(20, 4);
+    emptyBand.write("\x1bPq?\x1b\\");
+    expect(emptyBand.getImages()[0]).toMatchObject({ pixelWidth: 1, pixelHeight: 6 });
+  });
+
+  for (const terminator of ["\x07", "\x1b\\"]) {
+    test(`decodes palette, repeat, raster size, and ${JSON.stringify(terminator)} termination`, () => {
+      const parser = new AnsiParser(20, 4);
+      parser.setCellSize(8, 16);
+
+      parser.write(`\x1bP0;1q"1;1;2;6#1;2;100;0;0!2~${terminator}`);
+
+      const [image] = parser.getImages();
+      expect(image).toMatchObject({
+        protocol: "sixel",
+        kind: "rgba",
+        pixelWidth: 2,
+        pixelHeight: 6,
+        widthCells: 1,
+        heightCells: 1,
+      });
+      expect(Array.from(image.data.slice(0, 8))).toEqual([255, 0, 0, 255, 255, 0, 0, 255]);
+    });
+  }
+
+  test("keeps untouched pixels transparent in transparent background mode", () => {
+    const parser = new AnsiParser(20, 4);
+    parser.write(`\x1bP0;1q"1;1;2;6#1;2;100;0;0@\x1b\\`);
+
+    const [image] = parser.getImages();
+    expect(image.data[3]).toBe(255);
+    expect(image.data[7]).toBe(0);
   });
 });
 
@@ -932,6 +2230,17 @@ describe("AnsiParser CSI work limits", () => {
     expect(restored.isBracketedPasteMode()).toBe(false);
   });
 
+  test("preserves cursor visibility and synchronized output across snapshots", () => {
+    const parser = new AnsiParser(40, 2);
+    parser.write("\x1b[?25l\x1b[?2026h");
+
+    const restored = new AnsiParser(40, 2);
+    restored.restoreSnapshot(parser.createSnapshot());
+
+    expect(restored.isCursorVisible()).toBe(false);
+    expect(restored.isSynchronizedOutput()).toBe(true);
+  });
+
   test("tracks mouse motion modes and preserves them across snapshots", () => {
     const parser = new AnsiParser(40, 2);
     parser.write("\x1b[?1002h\x1b[?1006h");
@@ -973,6 +2282,19 @@ describe("AnsiParser CSI work limits", () => {
     expect(restored.isMouseEnabled()).toBe(false);
   });
 
+  test("keeps the active mouse mode when an inactive mode is reset", () => {
+    const parser = new AnsiParser(40, 2);
+    parser.write("\x1b[?1002h");
+
+    parser.write("\x1b[?1003l\x1b[?1000l");
+    expect(parser.isMouseEnabled()).toBe(true);
+    expect(parser.shouldReportMouseMotion(false)).toBe(false);
+    expect(parser.shouldReportMouseMotion(true)).toBe(true);
+
+    parser.write("\x1b[?1002l");
+    expect(parser.isMouseEnabled()).toBe(false);
+  });
+
 });
 
 describe("AnsiParser image resource limits", () => {
@@ -999,6 +2321,26 @@ describe("AnsiParser image resource limits", () => {
       expect(parserInternals.escapeBuffer).toBe("");
       expect(parserInternals.pendingITerm2File).toBeNull();
       expect(parserInternals.pendingKittyImage).toBeNull();
+    }
+  });
+
+  test("cancels oversized APC and DCS controls with CAN or SUB", () => {
+    const oversizedControl = "x".repeat(6 * 1024 * 1024);
+
+    for (const [state, cancel] of [["apc", "\x18"], ["dcs", "\x1a"]] as const) {
+      const parser = new AnsiParser(40, 2);
+      const parserInternals = parser as AnsiParser & {
+        parseState: "apc" | "dcs";
+        escapeBuffer: string;
+      };
+      parser.write("before");
+      parserInternals.parseState = state;
+      parserInternals.escapeBuffer = oversizedControl;
+
+      parser.write(`x${cancel}after`);
+
+      expect(visibleRowText(parser)).toBe("beforeafter");
+      expect(parserInternals.escapeBuffer).toBe("");
     }
   });
 
@@ -1049,17 +2391,20 @@ describe("AnsiParser image resource limits", () => {
     expect(visibleRowText(parser)).toBe("beforeafter");
   });
 
-  test("caps image placement cells to the current terminal geometry", () => {
-    const parser = new AnsiParser(10, 3);
-    parser.write("x");
+  test("preserves Kitty placement geometry past the right viewport edge", () => {
+    const parser = new AnsiParser(5, 3);
+    const payload = Buffer.alloc(10 * 4, 255).toString("base64");
+    parser.write("abcd");
+    const cursorBeforeImage = parser.getFullCursor();
 
-    parser.write(`${kittyPngApc({ widthCells: 999999, heightCells: 999999 })}tail`);
+    parser.write(`\x1b_Ga=T,f=32,s=10,v=1,c=10,r=1,C=1;${payload}\x1b\\`);
 
-    const [image] = parser.getImages();
-    expect(image.widthCells).toBe(9);
-    expect(image.heightCells).toBe(3);
-    expect(parser.getCursor()).toEqual({ x: 4, y: 2 });
-    expect(parser.getScrollbackLength()).toBe(1);
+    expect(parser.getImages()[0]).toMatchObject({
+      col: 4,
+      widthCells: 10,
+      sourceWidth: 10,
+    });
+    expect(parser.getFullCursor()).toEqual(cursorBeforeImage);
   });
 
   test("rejects new image data after the session byte budget is full", () => {
@@ -1096,18 +2441,48 @@ describe("AnsiParser image resource limits", () => {
     expect(parser.getImages()).toHaveLength(2);
   });
 
-  test("rejects animated GIFs from the encoded image path", () => {
+  test("accepts animated GIFs through the encoded image path", () => {
     const parser = new AnsiParser(40, 3);
     const gifHeader = [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 1, 0, 1, 0, 0, 0, 0];
     const gifFrame = [0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0];
     const animatedGif = Buffer.from([...gifHeader, ...gifFrame, ...gifFrame, 0x3b]).toString("base64");
 
-    parser.write(`before${iterm2FileOsc(["inline=1", "width=1", "height=1"], animatedGif)}after`);
+    parser.write(iterm2FileOsc(["inline=1", "width=1", "height=1"], animatedGif));
 
-    expect(parser.getImages()).toHaveLength(0);
-    expect(visibleRowText(parser)).toBe("beforeafter");
+    expect(parser.getImages()).toHaveLength(1);
+    expect(parser.getImages()[0]).toMatchObject({
+      kind: "encoded",
+      mimeType: "image/gif",
+      animated: true,
+    });
   });
 
+  test("accepts animated WebP metadata through the encoded image path", () => {
+    const parser = new AnsiParser(40, 3);
+    const webp = new Uint8Array(54);
+    webp.set(Buffer.from("RIFF"), 0);
+    new DataView(webp.buffer).setUint32(4, webp.length - 8, true);
+    webp.set(Buffer.from("WEBPVP8X"), 8);
+    new DataView(webp.buffer).setUint32(16, 10, true);
+    webp[20] = 0x02;
+    webp[24] = 1;
+    webp.set(Buffer.from("ANMF"), 30);
+    new DataView(webp.buffer).setUint32(34, 16, true);
+    webp[44] = 1;
+
+    parser.write(
+      iterm2FileOsc(["inline=1", "width=1", "height=1"], Buffer.from(webp).toString("base64")),
+    );
+
+    expect(parser.getImages()).toHaveLength(1);
+    expect(parser.getImages()[0]).toMatchObject({
+      kind: "encoded",
+      mimeType: "image/webp",
+      pixelWidth: 2,
+      pixelHeight: 1,
+      animated: true,
+    });
+  });
   test("rejects separator-heavy iTerm2 and Kitty metadata", () => {
     const parser = new AnsiParser(40, 3);
     const itermParams = [
@@ -1133,6 +2508,19 @@ describe("AnsiParser image resource limits", () => {
 
 });
 
+describe("AnsiParser image reflow", () => {
+  test("moves a physical image anchor with its wrapped text row", () => {
+    const parser = new AnsiParser(4, 4);
+    parser.write("abc");
+    parser.write("\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,C=1;AQIDBA==\x1b\\");
+
+    expect(parser.getImages()[0]).toMatchObject({ row: 0, col: 3 });
+
+    parser.resize(2, 4);
+
+    expect(parser.getImages()[0]).toMatchObject({ row: 1, col: 1 });
+  });
+});
 describe("AnsiParser reflow wide-char boundaries", () => {
   test("narrowing keeps wide-char pairs together at chunk boundaries", () => {
     const parser = new AnsiParser(20, 3);

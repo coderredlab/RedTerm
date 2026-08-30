@@ -89,14 +89,46 @@ export function validateTerminalUrl(candidate: string): SafeTerminalUrl | null {
   };
 }
 
+function mapRowTextToColumns(row: Cell[]): { text: string; columns: number[] } {
+  let text = "";
+  const columns: number[] = [];
+  for (let col = 0; col < row.length; col++) {
+    const value = row[col].char;
+    if (value === "") continue;
+    for (let offset = 0; offset < value.length; offset++) columns.push(col);
+    text += value;
+  }
+  return { text, columns };
+}
+function includeWideContinuation(row: Cell[], col: number): number {
+  while (col + 1 < row.length && row[col + 1].char === "") col++;
+  return col;
+}
+
+
 export function findUrlAtCell(
   buffer: Cell[][],
   point: { row: number; col: number },
 ): TerminalUrlMatch | null {
   const row = buffer[point.row];
   if (!row || point.col < 0) return null;
+  const explicit = row[point.col]?.hyperlink;
+  if (explicit) {
+    const sameLink = (col: number) => {
+      const hyperlink = row[col]?.hyperlink;
+      return hyperlink?.uri === explicit.uri && hyperlink.id === explicit.id;
+    };
+    let startCol = point.col;
+    let endCol = point.col;
+    while (startCol > 0 && sameLink(startCol - 1)) startCol--;
+    while (endCol + 1 < row.length && sameLink(endCol + 1)) endCol++;
+    if (row.slice(startCol, endCol + 1).some((cell) => cell.style.hidden)) return null;
+    const safeUrl = validateTerminalUrl(explicit.uri);
+    return safeUrl ? { url: safeUrl.url, startCol, endCol } : null;
+  }
 
-  const text = row.map((cell) => cell.char || " ").join("");
+
+  const { text, columns } = mapRowTextToColumns(row);
   URL_PATTERN.lastIndex = 0;
 
   for (const match of text.matchAll(URL_PATTERN)) {
@@ -105,19 +137,21 @@ export function findUrlAtCell(
     const url = trimUrlCandidate(match[0]);
     if (!url) continue;
 
-    const startCol = match.index;
-    const candidateEndCol = startCol + match[0].length - 1;
-    const endCol = startCol + url.length - 1;
+    const startCol = columns[match.index];
+    const candidateEndOffset = columns[match.index + match[0].length - 1];
+    const endOffset = columns[match.index + url.length - 1];
+    if (startCol === undefined || candidateEndOffset === undefined || endOffset === undefined) continue;
+    const candidateEndCol = includeWideContinuation(row, candidateEndOffset);
+    const endCol = includeWideContinuation(row, endOffset);
+
     const nextRow = buffer[point.row + 1];
     if (candidateEndCol >= row.length - 1 && nextRow) {
-      const nextText = nextRow.map((cell) => cell.char || " ").join("");
+      const { text: nextText } = mapRowTextToColumns(nextRow);
       if (URL_CONTINUATION_PATTERN.test(nextText[0] ?? "")) continue;
     }
 
     if (point.col >= startCol && point.col <= endCol) {
-      if (row.slice(startCol, endCol + 1).some((cell) => cell.style.hidden)) {
-        return null;
-      }
+      if (row.slice(startCol, endCol + 1).some((cell) => cell.style.hidden)) return null;
       const safeUrl = validateTerminalUrl(url);
       return safeUrl ? { url: safeUrl.url, startCol, endCol } : null;
     }

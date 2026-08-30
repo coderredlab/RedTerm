@@ -250,4 +250,70 @@ describe("tabs store persistence", () => {
       tabsStore.removeTab(tabId);
     }
   });
+  test("persists an OSC title on the pane and active tab", async () => {
+    const storage = new MemoryStorage();
+    installBrowserStorage(storage);
+    const { tabsStore } = await import("./tabs.svelte");
+    const auth = {
+      username: "deploy",
+      method: { type: "key", key_id: "key-1" },
+    } satisfies AuthConfig;
+    const tabId = tabsStore.addTab("prod.example.com", 22, auth);
+
+    try {
+      const tab = tabsStore.tabs.find((candidate) => candidate.id === tabId)!;
+      tabsStore.setPaneTitle(tabId, tab.activePaneId, "  remote shell  ");
+
+      expect(tab.panes[0].title).toBe("remote shell");
+      expect(tab.title).toBe("remote shell");
+      const persisted = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null");
+      expect(persisted.tabs[0].title).toBe("remote shell");
+      expect(persisted.tabs[0].panes[0].title).toBe("remote shell");
+      tabsStore.setPaneTitle(tabId, tab.activePaneId, `${"a".repeat(127)}😀`);
+      expect(tab.panes[0].title).toBe("a".repeat(127));
+      expect(tab.panes[0].title.isWellFormed()).toBe(true);
+
+    } finally {
+      tabsStore.removeTab(tabId);
+    }
+  });
+
+  test("restores a persisted OSC pane title on module reload", async () => {
+    const storage = new MemoryStorage();
+    installBrowserStorage(storage);
+    storage.setItem(STORAGE_KEY, JSON.stringify({
+      version: 2,
+      activeTabId: "tab-osc-title",
+      tabs: [{
+        id: "tab-osc-title",
+        title: "remote shell",
+        activePaneId: "pane-osc-title",
+        panes: [{
+          id: "pane-osc-title",
+          title: "remote shell",
+          sessionId: null,
+          connected: false,
+          connection: {
+            host: "prod.example.com",
+            port: 22,
+            auth: {
+              username: "deploy",
+              method: { type: "key", key_id: "key-1" },
+            },
+          },
+        }],
+        layout: { type: "leaf", paneId: "pane-osc-title" },
+      }],
+    }));
+
+    const { tabsStore } = await import("./tabs.svelte.ts?osc-title-restore");
+
+    try {
+      expect(tabsStore.tabs[0].panes[0].title).toBe("remote shell");
+      expect(tabsStore.tabs[0].title).toBe("remote shell");
+    } finally {
+      tabsStore.removeTab("tab-osc-title");
+    }
+  });
+
 });
