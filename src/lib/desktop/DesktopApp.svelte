@@ -148,7 +148,7 @@
       pane = tabsStore.getPane(tabId, paneId);
       if (!pane || pane.kind === "local") return;
     }
-    editingConnection = pane.connection.connectionId
+    editingConnection = pane.connection.connectionId && connectionsStore.loaded
       ? connectionsStore.connections.find(
           (connection) => connection.id === pane.connection.connectionId
         )

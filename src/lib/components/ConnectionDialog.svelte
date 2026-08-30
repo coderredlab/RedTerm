@@ -54,27 +54,33 @@
     const paneMethod = paneConnection?.auth.method;
 
     if (editConnection || paneConnection) {
+      const paneKeyId = paneMethod?.type === "key" ? paneMethod.key_id : undefined;
       name = editConnection?.name ?? paneConnection?.host ?? "";
-      host = editConnection?.host ?? paneConnection?.host ?? "";
-      port = editConnection?.port ?? paneConnection?.port ?? 22;
-      username = editConnection?.username ?? paneConnection?.auth.username ?? "";
-      keyId = editConnection?.key_id ?? (paneMethod?.type === "key" ? paneMethod.key_id : "");
-      selectedKeyName = editConnection?.key_name ?? "";
+      host = paneConnection?.host ?? editConnection?.host ?? "";
+      port = paneConnection?.port ?? editConnection?.port ?? 22;
+      username = paneConnection?.auth.username ?? editConnection?.username ?? "";
+      keyId = paneConnection ? paneKeyId ?? "" : editConnection?.key_id ?? "";
+      selectedKeyName =
+        !paneConnection || paneKeyId === editConnection?.key_id
+          ? editConnection?.key_name ?? ""
+          : "";
       keyPassphrase = paneMethod?.type === "key" ? paneMethod.passphrase ?? "" : "";
       authType = keyId ? "key" : "password";
       saveConnectionChecked = Boolean(editConnection);
       savePasswordChecked = editConnection?.has_saved_password ?? false;
-      startupScript = editConnection?.startup_script ?? paneConnection?.startupScript ?? "";
+      startupScript = paneConnection?.startupScript ?? editConnection?.startup_script ?? "";
       startupScriptReadyText =
-        editConnection?.startup_script_ready_text ??
         paneConnection?.startupScriptReadyText ??
+        editConnection?.startup_script_ready_text ??
         "";
       password =
-        editConnection?.has_saved_password || paneMethod?.type === "stored_password"
+        paneMethod?.type === "stored_password"
           ? STORED_PASSWORD_PLACEHOLDER
           : paneMethod?.type === "password"
             ? paneMethod.password
-            : "";
+            : !paneConnection && editConnection?.has_saved_password
+              ? STORED_PASSWORD_PLACEHOLDER
+              : "";
     } else {
       resetForm();
     }

@@ -28,14 +28,17 @@ function createConnectionsStore() {
       return loaded;
     },
 
-    async load() {
+    async load(): Promise<boolean> {
       loading = true;
       error = null;
+      loaded = false;
       try {
         connections = await loadConnections();
         loaded = true;
+        return true;
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
+        return false;
       } finally {
         loading = false;
       }
