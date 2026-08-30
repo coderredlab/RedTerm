@@ -847,9 +847,7 @@ function createTabsStore() {
     },
     replaceManagedKeyReferences(
       keyId: string,
-      method: AuthConfig["method"],
-      keyName: string | undefined,
-      canRestorePassword: boolean
+      replacement: PaneConnection
     ) {
       for (const tab of [...tabs]) {
         if (
@@ -867,14 +865,22 @@ function createTabsStore() {
             if (currentMethod.type !== "key" || currentMethod.key_id !== keyId) {
               continue;
             }
-            pane.connection.auth = {
-              username: pane.connection.auth.username,
-              method: { ...method },
-            };
-            pane.connection.keyName = keyName;
-            pane.connection.canRestorePassword = canRestorePassword;
-            pane.connection.saveConnection = true;
-            pane.connection.savePassword = canRestorePassword;
+            Object.assign(pane.connection, {
+              host: replacement.host,
+              port: replacement.port,
+              auth: {
+                username: replacement.auth.username,
+                method: { ...replacement.auth.method },
+              },
+              connectionId: replacement.connectionId,
+              canRestorePassword: replacement.canRestorePassword,
+              startupScript: replacement.startupScript,
+              startupScriptReadyText: replacement.startupScriptReadyText,
+              keyName: replacement.keyName,
+              saveConnection: replacement.saveConnection,
+              savePassword: replacement.savePassword,
+            });
+            pane.title = paneTitle(pane.connection);
           }
         });
       }

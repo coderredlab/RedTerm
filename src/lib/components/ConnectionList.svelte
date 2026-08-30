@@ -3,6 +3,11 @@
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import type { AuthConfig, SavedConnection } from "$lib/tauri/commands";
+  import {
+    cleanupUnreferencedManagedKeys,
+    retryPendingManagedKeyCleanup,
+    stageManagedKeyCleanup,
+  } from "$lib/managed-key-lifecycle";
 
   interface Props {
     onEdit?: (connection: SavedConnection) => void;
@@ -66,26 +71,23 @@
 
     onEdit?.(connection);
   }
-  function paneUsesManagedKey(keyId: string): boolean {
-    return tabsStore.tabs.some((tab) =>
-      tab.panes.some((pane) => {
-        const method = pane.connection.auth.method;
-        return method.type === "key" && method.key_id === keyId;
-      })
-    );
-  }
+
 
   async function handleDelete(connection: SavedConnection) {
     if (!confirm(`Delete "${connection.name}"?`)) return;
 
     deletingId = connection.id;
+    if (connection.key_id) {
+      stageManagedKeyCleanup([connection.key_id]);
+    }
     try {
-      const preserveManagedKey = Boolean(
-        connection.key_id && paneUsesManagedKey(connection.key_id)
-      );
-      await connectionsStore.delete(connection.id, preserveManagedKey);
+      await connectionsStore.delete(connection.id);
       tabsStore.detachSavedConnection(connection.id);
+      if (connection.key_id) {
+        await cleanupUnreferencedManagedKeys([connection.key_id]);
+      }
     } catch {
+      await retryPendingManagedKeyCleanup();
       // The store exposes the backend error for the inline alert below.
     } finally {
       deletingId = null;

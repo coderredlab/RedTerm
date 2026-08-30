@@ -53,29 +53,32 @@ async function currentSavedConnections(): Promise<SavedConnection[] | null> {
 }
 
 async function flushPendingCleanup(): Promise<void> {
-  const pending = readPendingCleanup();
-  if (pending.size === 0) return;
+  const candidates = readPendingCleanup();
+  if (candidates.size === 0) return;
 
   const savedConnections = await currentSavedConnections();
   if (!savedConnections) return;
 
-  for (const keyId of pending) {
+  const completed = new Set<string>();
+  for (const keyId of candidates) {
     const usedBySavedConnection = savedConnections.some(
       (connection) => connection.key_id === keyId
     );
     if (paneUsesManagedKey(keyId) || usedBySavedConnection) {
-      pending.delete(keyId);
+      completed.add(keyId);
       continue;
     }
 
     try {
       await deleteUploadedSshKey(keyId);
-      pending.delete(keyId);
+      completed.add(keyId);
     } catch (error) {
       console.error("Failed to delete unreferenced SSH key:", error);
     }
   }
 
+  const pending = readPendingCleanup();
+  for (const keyId of completed) pending.delete(keyId);
   writePendingCleanup(pending);
 }
 
@@ -100,15 +103,17 @@ export function transientManagedKeyIds(panes: readonly Pane[]): string[] {
   return [...keyIds];
 }
 
+export function stageManagedKeyCleanup(keyIds: readonly string[]): void {
+  const pending = readPendingCleanup();
+  for (const keyId of keyIds) pending.add(keyId);
+  writePendingCleanup(pending);
+}
+
 export function cleanupUnreferencedManagedKeys(
   keyIds: readonly string[]
 ): Promise<void> {
-  return enqueueCleanup(async () => {
-    const pending = readPendingCleanup();
-    for (const keyId of keyIds) pending.add(keyId);
-    writePendingCleanup(pending);
-    await flushPendingCleanup();
-  });
+  stageManagedKeyCleanup(keyIds);
+  return enqueueCleanup(flushPendingCleanup);
 }
 
 export function retryPendingManagedKeyCleanup(): Promise<void> {

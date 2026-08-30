@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
-  import { tabsStore } from "$lib/stores/tabs.svelte";
+  import { tabsStore, type PaneConnection } from "$lib/stores/tabs.svelte";
   import {
     MAX_SSH_KEY_BYTES,
     uploadSshKey,
@@ -13,7 +13,10 @@
     buildConnectionDialogSavePlan,
   } from "./connection-dialog-save-plan";
   import { modalFocus } from "$lib/desktop/workspace/modal-focus";
-  import { cleanupUnreferencedManagedKeys } from "$lib/managed-key-lifecycle";
+  import {
+    cleanupUnreferencedManagedKeys,
+    stageManagedKeyCleanup,
+  } from "$lib/managed-key-lifecycle";
   import { buildConnectionAuthPlan } from "./connection-auth-plan";
 
   interface Props {
@@ -308,14 +311,15 @@
         });
         connectionId = savePlan.connection.id;
         canRestorePassword = savePlan.canRestorePassword;
-        await connectionsStore.save(savePlan.connection, savePlan.passwordToSave);
         const previousSavedKeyId = submission.editConnection?.key_id;
         if (
           previousSavedKeyId &&
           previousSavedKeyId !== savePlan.connection.key_id
         ) {
           replacedSavedKeyId = previousSavedKeyId;
+          stageManagedKeyCleanup([previousSavedKeyId]);
         }
+        await connectionsStore.save(savePlan.connection, savePlan.passwordToSave);
       }
 
       const authPlan = buildConnectionAuthPlan(
@@ -343,14 +347,24 @@
           canRestorePassword && connectionId
             ? { type: "stored_password" as const, connection_id: connectionId }
             : authPlan.auth.method;
-        tabsStore.replaceManagedKeyReferences(
-          replacedSavedKeyId,
-          replacementMethod,
-          submission.authType === "key"
-            ? submission.keyName || undefined
-            : undefined,
-          canRestorePassword
-        );
+        tabsStore.replaceManagedKeyReferences(replacedSavedKeyId, {
+          host: submission.host,
+          port: submission.port,
+          auth: {
+            username: submission.username,
+            method: { ...replacementMethod },
+          },
+          connectionId,
+          canRestorePassword,
+          startupScript: submission.startupScript,
+          startupScriptReadyText: submission.startupScriptReadyText,
+          keyName:
+            submission.authType === "key"
+              ? submission.keyName || undefined
+              : undefined,
+          saveConnection: true,
+          savePassword: canRestorePassword,
+        } satisfies PaneConnection);
       }
 
       if (submission.editPane) {
@@ -390,6 +404,9 @@
 
       const activeKeyId =
         submission.authType === "key" ? submission.keyId : undefined;
+      if (replacedSavedKeyId) {
+        await cleanupUnreferencedManagedKeys([replacedSavedKeyId]);
+      }
       if (previousPaneKeyId && previousPaneKeyId !== activeKeyId) {
         await cleanupTransientKey(previousPaneKeyId);
       }

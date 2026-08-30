@@ -163,6 +163,7 @@
   let keyPassphraseInput = $state("");
   let keyPassphrasePromptResolver: ((passphrase: string | null) => void) | null = null;
   let keyPassphraseRetryCache = createKeyPassphraseRetryCache();
+  let keyPassphraseRetryKeyId: string | null = null;
   const TERMINAL_SNAPSHOT_STORAGE_KEY = "redterm.sessionSnapshots.v1";
   const MAX_SESSION_SNAPSHOTS = 20;
   const SESSION_SNAPSHOT_MAX_AGE_MS = 1000 * 60 * 60 * 24 * 3;
@@ -1615,6 +1616,12 @@
   }
 
   async function resolveAuthForConnect(): Promise<AuthConfig> {
+    const currentKeyId = auth.method.type === "key" ? auth.method.key_id : null;
+    if (currentKeyId !== keyPassphraseRetryKeyId) {
+      keyPassphraseRetryKeyId = currentKeyId;
+      keyPassphraseRetryCache = createKeyPassphraseRetryCache();
+    }
+
     if (auth.method.type === "key") {
       if (getResolvedKeyPassphrase(keyPassphraseRetryCache) === undefined && auth.method.passphrase !== undefined) {
         keyPassphraseRetryCache = commitKeyPassphraseRetry(

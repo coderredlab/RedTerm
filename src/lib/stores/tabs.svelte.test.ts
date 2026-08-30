@@ -404,12 +404,19 @@ describe("tabs store persistence", () => {
         .getTab(tabId)!
         .panes.map((pane) => pane.connection);
 
-      tabsStore.replaceManagedKeyReferences(
-        "key-old",
-        { type: "key", key_id: "key-new", passphrase: "runtime-only" },
-        "id_new",
-        false
-      );
+      tabsStore.replaceManagedKeyReferences("key-old", {
+        host: "new.example.com",
+        port: 2222,
+        auth: {
+          username: "operator",
+          method: { type: "key", key_id: "key-new", passphrase: "runtime-only" },
+        },
+        connectionId: "connection-shared",
+        keyName: "id_new",
+        canRestorePassword: false,
+        saveConnection: true,
+        savePassword: false,
+      });
 
       const panes = tabsStore.getTab(tabId)!.panes;
       expect(panes[0]!.connection).toBe(connectionRefs[0]);
@@ -423,6 +430,15 @@ describe("tabs store persistence", () => {
         "session-two",
       ]);
       expect(panes.every((pane) => pane.connection.keyName === "id_new")).toBe(true);
+      expect(panes.map((pane) => pane.connection.host)).toEqual([
+        "new.example.com",
+        "new.example.com",
+      ]);
+      expect(panes.map((pane) => pane.connection.port)).toEqual([2222, 2222]);
+      expect(panes.map((pane) => pane.connection.auth.username)).toEqual([
+        "operator",
+        "operator",
+      ]);
 
       const persisted = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null");
       expect(JSON.stringify(persisted)).not.toContain("runtime-only");
