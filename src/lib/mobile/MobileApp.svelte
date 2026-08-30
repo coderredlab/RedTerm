@@ -104,6 +104,11 @@
     // Show connection list instead of dialog
     showConnectionListManual = true;
   }
+  function handleOpenSettings() {
+    editPaneRequestGeneration += 1;
+    showSettings = true;
+  }
+
 
   function handleCloseDialog() {
     editPaneRequestGeneration += 1;
@@ -241,7 +246,7 @@
     <TabBar
       onAddTab={handleAddTab}
       onCloseTab={handleCloseTab}
-      onOpenSettings={() => showSettings = true}
+      onOpenSettings={handleOpenSettings}
     />
   </div>
 

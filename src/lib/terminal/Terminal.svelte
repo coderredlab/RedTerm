@@ -3577,18 +3577,25 @@
 
   function isErrorStatus(message: string): boolean {
     const lower = message.toLowerCase();
-    return (
-      lower.includes("connection lost") ||
-      isConnectionFailureStatus(message)
-    );
+    return lower.includes("connection lost") || lower.includes("failed");
   }
 
   function getStatusTitle(message: string): string {
     const lower = message.toLowerCase();
     if (lower.includes("failed to start local shell")) return "Local Shell Failed";
+    if (lower.includes("failed to restore local shell")) return "Local Shell Failed";
+    if (lower.startsWith("image upload failed")) return "Image Upload Failed";
+    if (lower.startsWith("paste failed")) return "Paste Failed";
     if (lower.includes("connection failed")) return "Connection Failed";
     if (lower.includes("connection lost")) return "Connection Lost";
-    return "Connecting";
+    if (lower.includes("connection cancelled")) return "Connection Cancelled";
+    if (lower.includes("local shell exited")) return "Local Shell Exited";
+    if (lower.includes("session ended")) return "Session Ended";
+    if (lower.startsWith("reconnecting")) return "Reconnecting";
+    if (lower.startsWith("starting local shell")) return "Starting Local Shell";
+    if (lower.startsWith("uploading pasted image")) return "Uploading Image";
+    if (lower.startsWith("connecting to")) return "Connecting";
+    return "Status";
   }
 </script>
 

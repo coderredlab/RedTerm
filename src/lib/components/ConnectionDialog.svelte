@@ -43,6 +43,7 @@
   let error = $state<string | null>(null);
   let startupScript = $state("");
   let startupScriptReadyText = $state("");
+  let keyUploadGeneration = 0;
 
   $effect(() => {
     activeDialogTab = "general";
@@ -94,6 +95,7 @@
   });
 
   function resetForm() {
+    keyUploadGeneration += 1;
     name = "";
     host = "";
     port = 22;
@@ -114,12 +116,17 @@
 
 
   function isPersistedKeyId(id: string): boolean {
-    const pane = editPane
-      ? tabsStore.getPane(editPane.tabId, editPane.paneId)
-      : undefined;
-    const paneMethod = pane?.connection.auth.method;
-    const paneKeyId = paneMethod?.type === "key" ? paneMethod.key_id : undefined;
-    return id === editConnection?.key_id || id === paneKeyId;
+    if (id === editConnection?.key_id) return true;
+    if (connectionsStore.connections.some((connection) => connection.key_id === id)) {
+      return true;
+    }
+
+    return tabsStore.tabs.some((tab) =>
+      tab.panes.some((pane) => {
+        const method = pane.connection.auth.method;
+        return method.type === "key" && method.key_id === id;
+      })
+    );
   }
 
   async function cleanupTransientKey(id: string) {
@@ -135,8 +142,13 @@
   }
 
   async function handleKeyFileChange(event: Event) {
-    error = null;
     const input = event.currentTarget as HTMLInputElement;
+    if (connecting || keyUploading) {
+      input.value = "";
+      return;
+    }
+
+    error = null;
     const file = input.files?.[0];
     const previousKeyId = keyId;
     const previousKeyName = selectedKeyName;
@@ -163,6 +175,7 @@
       return;
     }
 
+    const uploadGeneration = ++keyUploadGeneration;
     keyUploading = true;
 
     try {
@@ -174,6 +187,11 @@
         port,
         keyUsername
       );
+      if (uploadGeneration !== keyUploadGeneration) {
+        await cleanupTransientKey(result.key_id);
+        return;
+      }
+
       keyId = result.key_id;
       selectedKeyName = result.file_name;
 
@@ -181,11 +199,14 @@
         await cleanupTransientKey(previousKeyId);
       }
     } catch (e) {
+      if (uploadGeneration !== keyUploadGeneration) return;
       keyId = previousKeyId;
       selectedKeyName = previousKeyName;
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      keyUploading = false;
+      if (uploadGeneration === keyUploadGeneration) {
+        keyUploading = false;
+      }
       input.value = "";
     }
   }
@@ -536,6 +557,7 @@
             <div class="auth-tabs" role="group" aria-label="Authentication method">
               <button
                 type="button"
+                disabled={connecting || keyUploading}
                 class="auth-tab"
                 class:active={authType === "password"}
                 aria-pressed={authType === "password"}
@@ -545,6 +567,7 @@
               </button>
               <button
                 type="button"
+                disabled={connecting || keyUploading}
                 class="auth-tab"
                 class:active={authType === "key"}
                 onclick={() => (authType = "key")}
@@ -568,8 +591,19 @@
           {:else}
             <div class="form-group">
               <label for="keyFile">SSH Key File</label>
-              <input type="file" id="keyFile" class="sr-only-file-input" onchange={handleKeyFileChange} />
-              <label for="keyFile" class="file-picker-button" aria-busy={keyUploading}>
+              <input
+                type="file"
+                id="keyFile"
+                class="sr-only-file-input"
+                disabled={connecting || keyUploading}
+                onchange={handleKeyFileChange}
+              />
+              <label
+                for="keyFile"
+                class="file-picker-button"
+                aria-busy={keyUploading}
+                aria-disabled={connecting || keyUploading}
+              >
                 {keyUploading ? "Uploading key…" : selectedKeyName ? "Choose another key" : "Choose private key"}
               </label>
               <div class="key-help">

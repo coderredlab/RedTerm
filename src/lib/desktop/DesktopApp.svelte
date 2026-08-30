@@ -180,6 +180,11 @@
     editingPane = undefined;
   }
 
+
+  function handleOpenSettings() {
+    editPaneRequestGeneration += 1;
+    settingsOpen = true;
+  }
   async function closeTabById(tabId: string) {
     const tab = tabsStore.getTab(tabId);
     if (!tab) return;
@@ -449,9 +454,7 @@
         moveFocus,
         copySelection: copyActiveSelection,
         pasteFromClipboard: () => void pasteFromClipboardToActivePane(),
-        openSettings: () => {
-          settingsOpen = true;
-        },
+        openSettings: handleOpenSettings,
       },
       () => !showDialog && !settingsOpen && !previewEntry && sessionsReconciled,
       terminalTarget
@@ -486,15 +489,16 @@
     onEdit={handleEdit}
     onNewConnection={handleNewConnection}
     onOpenLocal={() => void tabsStore.addLocalTab()}
-    onPreview={(entry) => (previewEntry = entry)}
+    onPreview={(entry) => {
+      editPaneRequestGeneration += 1;
+      previewEntry = entry;
+    }}
   />
 
   <section class="workspace">
     <TabStrip
       onCloseTab={(tabId) => void closeTabById(tabId)}
-      onOpenSettings={() => {
-        settingsOpen = true;
-      }}
+      onOpenSettings={handleOpenSettings}
       onToggleSidebar={() => desktopPrefsStore.toggleSidebar()}
       sidebarCollapsed={desktopPrefsStore.prefs.sidebarCollapsed}
       onDropToWorkspace={(sourceTabId, zone) =>
