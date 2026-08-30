@@ -93,6 +93,7 @@
     onConnected?: (sessionId: string) => void;
     onDisconnected?: () => void;
     onError?: (error: string) => void;
+    onRetryConnection?: () => void;
     onEditConnection?: () => void;
     onCloseTab?: () => void;
     onTitleChange?: (title: string) => void;
@@ -117,6 +118,7 @@
     onConnected,
     onDisconnected,
     onError,
+    onRetryConnection,
     onEditConnection,
     onCloseTab,
     onTitleChange
@@ -3577,7 +3579,13 @@
 
   function isErrorStatus(message: string): boolean {
     const lower = message.toLowerCase();
-    return lower.includes("connection lost") || lower.includes("failed");
+    return (
+      lower.startsWith("connection lost") ||
+      lower.startsWith("connection failed") ||
+      lower.startsWith("failed to ") ||
+      lower.startsWith("image upload failed") ||
+      lower.startsWith("paste failed")
+    );
   }
 
   function getStatusTitle(message: string): string {
@@ -3634,6 +3642,7 @@
               class="status-action primary"
               onclick={(event) => {
                 event.stopPropagation();
+                onRetryConnection?.();
                 void retryFailedConnection();
               }}
             >Retry</button>

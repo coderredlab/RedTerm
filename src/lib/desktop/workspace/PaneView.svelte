@@ -259,6 +259,7 @@
           kind={pane.kind ?? "ssh"}
           onConnected={(sessionId) =>
             workspace.paneConnected(tabId, node.paneId, sessionId)}
+          onRetryConnection={() => workspace.paneRetrying(tabId, node.paneId)}
           onEditConnection={pane.kind === "local"
             ? undefined
             : () => workspace.editPaneConnection(tabId, node.paneId)}

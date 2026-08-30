@@ -8,6 +8,10 @@
     loadRuntimeInstanceId,
     resolveRecovery,
   } from "$lib/session/reconcile";
+  import {
+    cleanupUnreferencedManagedKeys,
+    transientManagedKeyIds,
+  } from "$lib/managed-key-lifecycle";
   import Terminal from "$lib/terminal/Terminal.svelte";
   import { handleDesktopShortcuts } from "./shortcuts";
   import { readClipboardText } from "$lib/tauri/commands";
@@ -120,7 +124,9 @@
         );
         if (verdict === "keep") continue;
         if (verdict === "remove") {
-          tabsStore.closePane(tab.id, pane.id);
+          const keyIds = transientManagedKeyIds([pane]);
+          await tabsStore.closePane(tab.id, pane.id);
+          await cleanupUnreferencedManagedKeys(keyIds);
           continue;
         }
         tabsStore.setPaneDisconnected(tab.id, pane.id);
@@ -154,7 +160,8 @@
 
       pane = tabsStore.getPane(tabId, paneId);
       if (!pane || pane.kind === "local") return;
-      if (!loaded) {
+      if (pane.connected || pane.sessionId) return;
+      if (!loaded && !connectionsStore.loaded) {
         connectionsViewRequest += 1;
         if (desktopPrefsStore.prefs.sidebarCollapsed) {
           desktopPrefsStore.toggleSidebar();
@@ -188,10 +195,12 @@
   async function closeTabById(tabId: string) {
     const tab = tabsStore.getTab(tabId);
     if (!tab) return;
+    const keyIds = transientManagedKeyIds(tab.panes);
     for (const pane of tab.panes) {
       await disconnectTerminal(pane.id);
     }
     tabsStore.removeTab(tabId);
+    await cleanupUnreferencedManagedKeys(keyIds);
   }
 
   function closeActivePane() {
@@ -379,10 +388,14 @@
       terminals.delete(paneId);
     },
     paneConnected(tabId, paneId, sessionId) {
+      editPaneRequestGeneration += 1;
       tabsStore.setPaneConnected(tabId, paneId, sessionId, runtimeInstanceId);
     },
     paneDisconnected(tabId, paneId) {
       tabsStore.setPaneDisconnected(tabId, paneId);
+    },
+    paneRetrying() {
+      editPaneRequestGeneration += 1;
     },
     editPaneConnection(tabId, paneId) {
       void handleEditPaneConnection(tabId, paneId);
@@ -392,9 +405,12 @@
     },
     closePane(tabId, paneId) {
       void serializeLayoutSnapshotOperation(async () => {
+        const pane = tabsStore.getPane(tabId, paneId);
+        const keyIds = transientManagedKeyIds(pane ? [pane] : []);
         await storeTabSnapshots([tabId]);
         await disconnectTerminal(paneId);
         await tabsStore.closePane(tabId, paneId);
+        await cleanupUnreferencedManagedKeys(keyIds);
         await tick();
         for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {
           terminals.get(pane.id)?.syncSize();

@@ -291,6 +291,7 @@
         isUsingStoredPassword && !submission.editConnection
           ? Boolean(targetPane?.connection.canRestorePassword)
           : false;
+      let replacedSavedKeyId: string | undefined;
       if (submission.saveConnection) {
         const id = submission.editConnection?.id || crypto.randomUUID();
         const savePlan = buildConnectionDialogSavePlan({
@@ -312,6 +313,13 @@
         connectionId = savePlan.connection.id;
         canRestorePassword = savePlan.canRestorePassword;
         await connectionsStore.save(savePlan.connection, savePlan.passwordToSave);
+        const previousSavedKeyId = submission.editConnection?.key_id;
+        if (
+          previousSavedKeyId &&
+          previousSavedKeyId !== savePlan.connection.key_id
+        ) {
+          replacedSavedKeyId = previousSavedKeyId;
+        }
       }
 
       const authPlan = buildConnectionAuthPlan(
@@ -334,6 +342,20 @@
                 password: submission.password,
               }
       );
+      if (replacedSavedKeyId) {
+        const replacementMethod =
+          canRestorePassword && connectionId
+            ? { type: "stored_password" as const, connection_id: connectionId }
+            : authPlan.auth.method;
+        tabsStore.replaceManagedKeyReferences(
+          replacedSavedKeyId,
+          replacementMethod,
+          submission.authType === "key"
+            ? submission.keyName || undefined
+            : undefined,
+          canRestorePassword
+        );
+      }
 
       if (submission.editPane) {
         tabsStore.updatePaneConnection(
@@ -393,7 +415,7 @@
   }
 
   async function handleCancel() {
-    if (connecting || keyUploading) return;
+    if (connecting) return;
 
     const transientKeyId = keyId;
     const transientKeyIsPersisted = isPersistedKeyId(transientKeyId);
@@ -458,6 +480,7 @@
       <div class="dialog-tabs" role="tablist" aria-label="Connection settings">
         <button
           type="button"
+          disabled={connecting || keyUploading}
           id="connection-tab-general"
           data-dialog-tab="general"
           class="dialog-tab"
@@ -473,6 +496,7 @@
         </button>
         <button
           type="button"
+          disabled={connecting || keyUploading}
           id="connection-tab-login-script"
           data-dialog-tab="loginScript"
           class="dialog-tab"
@@ -489,6 +513,7 @@
       </div>
 
       <form onsubmit={(e) => { e.preventDefault(); handleConnect(); }}>
+        <fieldset class="dialog-fields" disabled={connecting || keyUploading}>
         <div
           class="dialog-body"
           id="connection-dialog-panel"
@@ -680,11 +705,12 @@
         {/if}
 
         </div>
+        </fieldset>
         <div class="dialog-actions">
           <button
             type="button"
             class="btn-cancel"
-            disabled={connecting || keyUploading}
+            disabled={connecting}
             onclick={() => void handleCancel()}
           >
             Cancel
@@ -776,8 +802,20 @@
     overflow: hidden;
   }
 
+  .dialog-fields {
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex: 1 1 auto;
+    border: 0;
+    overflow: hidden;
+  }
+
   .dialog-body {
     min-height: 0;
+    flex: 1 1 auto;
     padding: 20px 24px 0;
     overflow-y: auto;
   }

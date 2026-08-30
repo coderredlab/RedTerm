@@ -824,6 +824,47 @@ function createTabsStore() {
         pane.connected = false;
       });
     },
+    replaceManagedKeyReferences(
+      keyId: string,
+      method: AuthConfig["method"],
+      keyName: string | undefined,
+      canRestorePassword: boolean
+    ) {
+      for (const tab of [...tabs]) {
+        if (
+          !tab.panes.some((pane) => {
+            const currentMethod = pane.connection.auth.method;
+            return currentMethod.type === "key" && currentMethod.key_id === keyId;
+          })
+        ) {
+          continue;
+        }
+
+        mutateTab(tab.id, (candidate) => {
+          candidate.panes = candidate.panes.map((pane) => {
+            const currentMethod = pane.connection.auth.method;
+            if (currentMethod.type !== "key" || currentMethod.key_id !== keyId) {
+              return pane;
+            }
+            return {
+              ...pane,
+              connection: {
+                ...pane.connection,
+                auth: {
+                  username: pane.connection.auth.username,
+                  method: { ...method },
+                },
+                keyName,
+                canRestorePassword,
+                saveConnection: true,
+                savePassword: canRestorePassword,
+              },
+            };
+          });
+        });
+      }
+    },
+
     /** Split a pane in the given direction, cloning its connection target. */
     async splitPane(
       tabId: string,

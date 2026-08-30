@@ -3,7 +3,7 @@
 
   interface Props {
     onAddTab?: () => void;
-    onCloseTab?: (id: string) => void | Promise<void>;
+    onCloseTab: (id: string) => void | Promise<void>;
     onOpenSettings?: () => void;
   }
 
@@ -12,14 +12,9 @@
   function handleTabClick(id: string) {
     tabsStore.setActiveTab(id);
   }
-
   function handleCloseTab(e: MouseEvent, id: string) {
     e.stopPropagation();
-    if (onCloseTab) {
-      void onCloseTab(id);
-      return;
-    }
-    tabsStore.removeTab(id);
+    void onCloseTab(id);
   }
 </script>
 

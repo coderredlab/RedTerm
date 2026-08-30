@@ -377,4 +377,59 @@ describe("tabs store persistence", () => {
     }
   });
 
+  test("replaces shared managed key references without dropping sessions", async () => {
+    const storage = new MemoryStorage();
+    installBrowserStorage(storage);
+    const { tabsStore } = await import("./tabs.svelte");
+    const tabId = tabsStore.addTab(
+      "shared.example.com",
+      22,
+      { username: "deploy", method: { type: "key", key_id: "key-old" } },
+      "connection-shared",
+      false,
+      undefined,
+      undefined,
+      "id_old",
+      true,
+      false
+    );
+
+    try {
+      const firstPaneId = tabsStore.getTab(tabId)!.activePaneId!;
+      const secondPaneId = await tabsStore.splitPane(tabId, firstPaneId, "row");
+      expect(secondPaneId).not.toBeNull();
+      tabsStore.setPaneConnected(tabId, firstPaneId, "session-one");
+      tabsStore.setPaneConnected(tabId, secondPaneId!, "session-two");
+
+      tabsStore.replaceManagedKeyReferences(
+        "key-old",
+        { type: "key", key_id: "key-new", passphrase: "runtime-only" },
+        "id_new",
+        false
+      );
+
+      const panes = tabsStore.getTab(tabId)!.panes;
+      expect(panes.map((pane) => pane.connection.auth.method)).toEqual([
+        { type: "key", key_id: "key-new", passphrase: "runtime-only" },
+        { type: "key", key_id: "key-new", passphrase: "runtime-only" },
+      ]);
+      expect(panes.map((pane) => pane.sessionId)).toEqual([
+        "session-one",
+        "session-two",
+      ]);
+      expect(panes.every((pane) => pane.connection.keyName === "id_new")).toBe(true);
+
+      const persisted = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null");
+      expect(JSON.stringify(persisted)).not.toContain("runtime-only");
+      expect(
+        persisted.tabs[0].panes.every(
+          (pane: { connection: { auth: { method: { key_id?: string } } } }) =>
+            pane.connection.auth.method.key_id === "key-new"
+        )
+      ).toBe(true);
+    } finally {
+      tabsStore.removeTab(tabId);
+    }
+  });
+
 });

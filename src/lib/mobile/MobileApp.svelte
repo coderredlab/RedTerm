@@ -10,6 +10,10 @@
   import ConnectionList from "$lib/components/ConnectionList.svelte";
   import SettingsScreen from "$lib/components/SettingsScreen.svelte";
   import { cancelVoiceInput, checkVoiceInputPermissions, listenVoiceInput, listVoiceInputLanguages, requestVoiceInputPermissions, setKeyboardVisible, sshDisconnect, sshWrite, startVoiceInput, stopVoiceInput } from "$lib/tauri/commands";
+  import {
+    cleanupUnreferencedManagedKeys,
+    transientManagedKeyIds,
+  } from "$lib/managed-key-lifecycle";
   import { loadRuntimeInstanceId, resolveRecovery } from "$lib/session/reconcile";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
@@ -144,7 +148,8 @@
 
       pane = tabsStore.getPane(tabId, paneId);
       if (!pane || pane.kind === "local") return;
-      if (!loaded) {
+      if (pane.connected || pane.sessionId) return;
+      if (!loaded && !connectionsStore.loaded) {
         showConnectionListManual = true;
         return;
       }
@@ -171,7 +176,9 @@
       const verdict = await resolveRecovery(tab, runtimeInstanceId);
       if (verdict === "keep") continue;
       if (verdict === "remove") {
+        const keyIds = transientManagedKeyIds(tab.panes);
         tabsStore.removeTab(tab.id);
+        await cleanupUnreferencedManagedKeys(keyIds);
         continue;
       }
       tabsStore.setDisconnected(tab.id);
@@ -181,11 +188,16 @@
   }
 
   function handleConnected(tabId: string, sessionId: string) {
+    editPaneRequestGeneration += 1;
     tabsStore.setConnected(tabId, sessionId, runtimeInstanceId);
   }
 
   function handleDisconnected(tabId: string) {
     tabsStore.setDisconnected(tabId);
+  }
+
+  function handleRetryConnection() {
+    editPaneRequestGeneration += 1;
   }
 
   function handleTitleChanged(tabId: string, title: string) {
@@ -197,6 +209,7 @@
   async function handleCloseTab(tabId: string) {
     const terminal = terminalRefs[tabId];
     const tab = tabsStore.getTab(tabId);
+    const keyIds = transientManagedKeyIds(tab?.panes ?? []);
     if (terminal?.disconnect) {
       try {
         await terminal.disconnect();
@@ -212,6 +225,7 @@
       }
     }
     tabsStore.removeTab(tabId);
+    await cleanupUnreferencedManagedKeys(keyIds);
     delete terminalRefs[tabId];
   }
 
@@ -276,6 +290,7 @@
             interactive={!showConnectionList && !showDialog && !showSettings && tab.id === tabsStore.activeTabId}
             onConnected={(sessionId) => handleConnected(tab.id, sessionId)}
             onDisconnected={() => handleDisconnected(tab.id)}
+            onRetryConnection={handleRetryConnection}
             onEditConnection={tab.panes[0]?.kind === "local"
               ? undefined
               : () => void handleEditFailedConnection(tab.id)}
@@ -289,6 +304,11 @@
 
       {#if showConnectionList}
         <div class="connection-list-overlay">
+          <button
+            type="button"
+            class="connection-list-back"
+            onclick={() => (showConnectionListManual = false)}
+          >Back to terminal</button>
           <ConnectionList
             onEdit={handleEdit}
             onNewConnection={handleNewConnection}
@@ -381,6 +401,26 @@
     position: absolute;
     inset: 0;
     z-index: 5;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-primary);
+  }
+
+  .connection-list-back {
+    align-self: flex-start;
+    margin: 12px 16px 0;
+    padding: 8px 12px;
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font: inherit;
+  }
+
+  .connection-list-overlay :global(.connection-list) {
+    min-height: 0;
+    flex: 1 1 auto;
+    overflow-y: auto;
     background: var(--bg-primary);
   }
 
