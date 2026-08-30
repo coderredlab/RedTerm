@@ -9,6 +9,7 @@ import {
 const PENDING_CLEANUP_STORAGE_KEY = "redterm.pending-key-cleanup.v1";
 let cleanupQueue: Promise<void> = Promise.resolve();
 let cleanupTokenCounter = 0;
+const retainedCleanupKeys = new Map<string, number>();
 
 function nextCleanupToken(): string {
   cleanupTokenCounter += 1;
@@ -106,6 +107,8 @@ async function flushPendingCleanup(): Promise<void> {
 
   const completed = new Set<string>();
   for (const keyId of candidates.keys()) {
+    if (retainedCleanupKeys.has(keyId)) continue;
+
     detachStaleManagedKeyReferences(keyId, savedConnections);
     const usedBySavedConnection = savedConnections.some(
       (connection) => connection.key_id === keyId
@@ -155,6 +158,20 @@ export function stageManagedKeyCleanup(keyIds: readonly string[]): void {
   const pending = readPendingCleanup();
   for (const keyId of keyIds) pending.set(keyId, nextCleanupToken());
   writePendingCleanup(pending);
+}
+
+export function retainPendingManagedKey(keyId: string): () => void {
+  stageManagedKeyCleanup([keyId]);
+  retainedCleanupKeys.set(keyId, (retainedCleanupKeys.get(keyId) ?? 0) + 1);
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const remaining = (retainedCleanupKeys.get(keyId) ?? 1) - 1;
+    if (remaining > 0) retainedCleanupKeys.set(keyId, remaining);
+    else retainedCleanupKeys.delete(keyId);
+  };
 }
 
 export function cleanupUnreferencedManagedKeys(

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { untrack } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import { tabsStore, type PaneConnection } from "$lib/stores/tabs.svelte";
   import {
@@ -16,6 +16,7 @@
   import {
     cleanupUnreferencedManagedKeys,
     stageManagedKeyCleanup,
+    retainPendingManagedKey,
   } from "$lib/managed-key-lifecycle";
   import { buildConnectionAuthPlan } from "./connection-auth-plan";
 
@@ -47,6 +48,14 @@
   let startupScript = $state("");
   let startupScriptReadyText = $state("");
   let keyUploadGeneration = 0;
+  let selectedKeyLease:
+    | { keyId: string; release: () => void }
+    | undefined;
+
+  onDestroy(() => {
+    selectedKeyLease?.release();
+    selectedKeyLease = undefined;
+  });
 
   $effect(() => {
     activeDialogTab = "general";
@@ -186,13 +195,21 @@
         port,
         keyUsername
       );
+      const uploadedKeyLease = {
+        keyId: result.key_id,
+        release: retainPendingManagedKey(result.key_id),
+      };
       if (uploadGeneration !== keyUploadGeneration) {
-        await cleanupTransientKey(result.key_id);
+        uploadedKeyLease.release();
+        await cleanupUnreferencedManagedKeys([result.key_id]);
         return;
       }
 
+      const previousKeyLease = selectedKeyLease;
       keyId = result.key_id;
       selectedKeyName = result.file_name;
+      selectedKeyLease = uploadedKeyLease;
+      previousKeyLease?.release();
 
       if (previousKeyId && previousKeyId !== result.key_id) {
         await cleanupTransientKey(previousKeyId);
@@ -230,6 +247,7 @@
       editConnection,
       editPane: editPane ? { ...editPane } : undefined,
     };
+    const submissionKeyLease = selectedKeyLease;
 
     error = null;
     connecting = true;
@@ -402,6 +420,14 @@
         );
       }
 
+      if (submissionKeyLease) {
+        submissionKeyLease.release();
+        if (selectedKeyLease === submissionKeyLease) {
+          selectedKeyLease = undefined;
+        }
+        await cleanupUnreferencedManagedKeys([submissionKeyLease.keyId]);
+      }
+
       const activeKeyId =
         submission.authType === "key" ? submission.keyId : undefined;
       if (replacedSavedKeyId) {
@@ -411,6 +437,7 @@
         await cleanupTransientKey(previousPaneKeyId);
       }
       if (
+        !submissionKeyLease &&
         submission.authType !== "key" &&
         submission.keyId &&
         submission.keyId !== previousPaneKeyId
@@ -432,14 +459,18 @@
 
     const transientKeyId = keyId;
     const transientKeyIsPersisted = isPersistedKeyId(transientKeyId);
+    const transientKeyLease = selectedKeyLease;
+    transientKeyLease?.release();
+    selectedKeyLease = undefined;
     resetForm();
     onClose();
 
-    if (!transientKeyIsPersisted) {
+    if (transientKeyLease) {
+      await cleanupUnreferencedManagedKeys([transientKeyLease.keyId]);
+    } else if (!transientKeyIsPersisted) {
       await cleanupTransientKey(transientKeyId);
     }
   }
-
   function handleOverlayClick() {
     void handleCancel();
   }

@@ -1,9 +1,14 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
   import ConnectionDialog from "$lib/components/ConnectionDialog.svelte";
-  import { tabsStore } from "$lib/stores/tabs.svelte";
+  import { tabsStore, type Pane } from "$lib/stores/tabs.svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
-  import type { SavedConnection } from "$lib/tauri/commands";
+  import {
+    localShellDisconnect,
+    readClipboardText,
+    sshDisconnect,
+    type SavedConnection,
+  } from "$lib/tauri/commands";
   import {
     loadRuntimeInstanceId,
     resolveRecovery,
@@ -15,7 +20,6 @@
   } from "$lib/managed-key-lifecycle";
   import Terminal from "$lib/terminal/Terminal.svelte";
   import { handleDesktopShortcuts } from "./shortcuts";
-  import { readClipboardText } from "$lib/tauri/commands";
   import Sidebar from "./workspace/Sidebar.svelte";
   import PaneView from "./workspace/PaneView.svelte";
   import TabStrip from "./workspace/TabStrip.svelte";
@@ -98,12 +102,29 @@
 
   async function disconnectTerminal(paneId: string) {
     const terminal = terminals.get(paneId);
-    if (!terminal?.disconnect) return;
+    const pane = tabsStore.tabs
+      .flatMap((tab) => tab.panes)
+      .find((candidate) => candidate.id === paneId);
     try {
-      await terminal.disconnect();
+      if (terminal?.disconnect) {
+        await terminal.disconnect();
+      } else if (pane?.sessionId) {
+        if (pane.kind === "local") await localShellDisconnect(pane.sessionId);
+        else await sshDisconnect(pane.sessionId);
+      }
     } catch (error) {
       console.error("Pane disconnect error:", error);
     }
+  }
+
+  function findPaneLocation(
+    paneId: string
+  ): { tabId: string; pane: Pane } | undefined {
+    for (const tab of tabsStore.tabs) {
+      const pane = tab.panes.find((candidate) => candidate.id === paneId);
+      if (pane) return { tabId: tab.id, pane };
+    }
+    return undefined;
   }
 
   async function reconcilePersistedSessions() {
@@ -126,18 +147,26 @@
         );
         if (verdict === "keep") continue;
         if (verdict === "remove") {
-          const removedPane = await tabsStore.closePane(tab.id, pane.id);
+          let removedPane: Pane | null = null;
+          await serializeLayoutSnapshotOperation(async () => {
+            const current = findPaneLocation(pane.id);
+            if (!current || current.pane.sessionId !== pane.sessionId) return;
+            removedPane = await tabsStore.closePane(current.tabId, pane.id);
+          });
           const keyIds = transientManagedKeyIds(removedPane ? [removedPane] : []);
           await cleanupUnreferencedManagedKeys(keyIds);
           continue;
         }
-        tabsStore.setPaneDisconnected(tab.id, pane.id);
+        await serializeLayoutSnapshotOperation(async () => {
+          const current = findPaneLocation(pane.id);
+          if (!current || current.pane.sessionId !== pane.sessionId) return;
+          tabsStore.setPaneDisconnected(current.tabId, pane.id);
+        });
       }
     }
 
     sessionsReconciled = true;
   }
-
   function handleNewConnection() {
     editPaneRequestGeneration += 1;
     editingConnection = undefined;
@@ -198,15 +227,22 @@
     settingsOpen = true;
   }
   async function closeTabById(tabId: string) {
-    const tab = tabsStore.getTab(tabId);
-    if (!tab) return;
-    for (const pane of tab.panes) {
-      await disconnectTerminal(pane.id);
-    }
-    const closingTab = tabsStore.getTab(tabId);
-    const keyIds = transientManagedKeyIds(closingTab?.panes ?? []);
-    tabsStore.removeTab(tabId);
-    await cleanupUnreferencedManagedKeys(keyIds);
+    const paneIds = tabsStore.getTab(tabId)?.panes.map((pane) => pane.id);
+    if (!paneIds) return;
+
+    const removedPanes: Pane[] = [];
+    await serializeLayoutSnapshotOperation(async () => {
+      for (const paneId of paneIds) {
+        await disconnectTerminal(paneId);
+        const current = findPaneLocation(paneId);
+        if (!current) continue;
+        const removedPane = await tabsStore.closePane(current.tabId, paneId);
+        if (removedPane) removedPanes.push(removedPane);
+      }
+    });
+    await cleanupUnreferencedManagedKeys(
+      transientManagedKeyIds(removedPanes)
+    );
   }
 
   function closeActivePane() {
@@ -414,15 +450,19 @@
     closeTab(tabId) {
       void closeTabById(tabId);
     },
-    closePane(tabId, paneId) {
+    closePane(_tabId, paneId) {
       void serializeLayoutSnapshotOperation(async () => {
-        await storeTabSnapshots([tabId]);
+        const initial = findPaneLocation(paneId);
+        if (!initial) return;
+        await storeTabSnapshots([initial.tabId]);
         await disconnectTerminal(paneId);
-        const removedPane = await tabsStore.closePane(tabId, paneId);
+        const current = findPaneLocation(paneId);
+        if (!current) return;
+        const removedPane = await tabsStore.closePane(current.tabId, paneId);
         const keyIds = transientManagedKeyIds(removedPane ? [removedPane] : []);
         await cleanupUnreferencedManagedKeys(keyIds);
         await tick();
-        for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {
+        for (const pane of tabsStore.getTab(current.tabId)?.panes ?? []) {
           terminals.get(pane.id)?.syncSize();
         }
       });
