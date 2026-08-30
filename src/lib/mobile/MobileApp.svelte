@@ -30,6 +30,7 @@
   let runtimeInstanceId = $state<string | null>(null);
   let sessionsReconciled = $state(false);
   let keyboardVisible = $state(false);
+  let editPaneRequestGeneration = 0;
 
   const voiceInputController = createVoiceInputController({
     getActiveSessionId: () => tabsStore.activeTab?.sessionId,
@@ -99,39 +100,52 @@
   });
 
   function handleAddTab() {
+    editPaneRequestGeneration += 1;
     // Show connection list instead of dialog
     showConnectionListManual = true;
   }
 
   function handleCloseDialog() {
+    editPaneRequestGeneration += 1;
     showDialog = false;
     editingConnection = undefined;
     editingPane = undefined;
   }
 
   function handleEdit(connection: SavedConnection) {
+    editPaneRequestGeneration += 1;
     editingConnection = connection;
     editingPane = undefined;
     showDialog = true;
   }
 
   function handleNewConnection() {
+    editPaneRequestGeneration += 1;
     editingConnection = undefined;
     editingPane = undefined;
     showDialog = true;
   }
 
   async function handleEditFailedConnection(tabId: string) {
+    const requestGeneration = ++editPaneRequestGeneration;
     const tab = tabsStore.getTab(tabId);
     const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
     if (!paneId) return;
     let pane = tabsStore.getPane(tabId, paneId);
     if (!pane || pane.kind === "local") return;
     if (pane.connection.connectionId && !connectionsStore.loaded) {
-      await connectionsStore.load();
+      const loaded = await connectionsStore.load();
+      if (requestGeneration !== editPaneRequestGeneration) return;
+
       pane = tabsStore.getPane(tabId, paneId);
       if (!pane || pane.kind === "local") return;
+      if (!loaded) {
+        showConnectionListManual = true;
+        return;
+      }
     }
+    if (requestGeneration !== editPaneRequestGeneration) return;
+
     editingConnection = pane.connection.connectionId && connectionsStore.loaded
       ? connectionsStore.connections.find(
           (connection) => connection.id === pane.connection.connectionId

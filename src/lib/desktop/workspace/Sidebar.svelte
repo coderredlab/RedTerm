@@ -13,6 +13,7 @@
     collapsed: boolean;
     activeSessionId: string | null;
     explorerKind: "ssh" | "local" | null;
+    connectionsViewRequest: number;
     onWidthChange: (width: number) => void;
     onEdit: (connection: SavedConnection) => void;
     onNewConnection: () => void;
@@ -25,6 +26,7 @@
     collapsed,
     activeSessionId,
     explorerKind,
+    connectionsViewRequest,
     onWidthChange,
     onEdit,
     onNewConnection,
@@ -33,6 +35,12 @@
   }: Props = $props();
 
   let view = $state<"connections" | "files">("connections");
+
+  $effect(() => {
+    if (connectionsViewRequest > 0) {
+      view = "connections";
+    }
+  });
 
   let panelEl: HTMLElement | null = $state(null);
 

@@ -13,11 +13,9 @@
 
   let { onEdit, onNewConnection, onOpenLocal, showNewActions = true }: Props = $props();
 
-  let errorContext = $state<"load" | "delete">("load");
   let deletingId = $state<string | null>(null);
 
   async function loadConnectionList() {
-    errorContext = "load";
     await connectionsStore.load();
   }
 
@@ -72,11 +70,9 @@
   async function handleDelete(connection: SavedConnection) {
     if (!confirm(`Delete "${connection.name}"?`)) return;
 
-    errorContext = "delete";
     deletingId = connection.id;
     try {
-      const refreshed = await connectionsStore.delete(connection.id);
-      if (!refreshed) errorContext = "load";
+      await connectionsStore.delete(connection.id);
     } catch {
       // The store exposes the backend error for the inline alert below.
     } finally {
@@ -105,9 +101,11 @@
   {/if}
   {#if connectionsStore.error}
     <div class="connection-error" role="alert">
-      <strong>{errorContext === "delete"
+      <strong>{connectionsStore.errorContext === "delete"
         ? "Couldn’t delete connection."
-        : "Couldn’t load saved connections."}</strong>
+        : connectionsStore.errorContext === "save"
+          ? "Couldn’t save connection."
+          : "Couldn’t load saved connections."}</strong>
       <span>{connectionsStore.error}</span>
       <button type="button" onclick={() => void loadConnectionList()}>Reload</button>
     </div>

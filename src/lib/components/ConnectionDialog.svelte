@@ -191,69 +191,102 @@
   }
 
   async function handleConnect() {
+    if (connecting || keyUploading) return;
+
+    const submission = {
+      name,
+      host: host.trim(),
+      port,
+      username: username.trim(),
+      password,
+      keyId,
+      keyPassphrase,
+      keyName: selectedKeyName,
+      authType,
+      saveConnection: saveConnectionChecked,
+      savePassword: savePasswordChecked,
+      startupScript: startupScript.trim().length > 0 ? startupScript : undefined,
+      startupScriptReadyText: startupScriptReadyText.trim() || undefined,
+      editConnection,
+      editPane: editPane ? { ...editPane } : undefined,
+    };
+
     error = null;
     connecting = true;
 
     try {
-      const trimmedHost = host.trim();
-      const trimmedUsername = username.trim();
-      const startupScriptToUse = startupScript.trim().length > 0 ? startupScript : undefined;
-      const startupScriptReadyTextToUse = startupScriptReadyText.trim() || undefined;
-
-      if (!trimmedHost) {
+      if (!submission.host) {
         throw new Error("Host is required");
       }
-      if (!trimmedUsername) {
+      if (!submission.username) {
         throw new Error("Username is required");
       }
-      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      if (
+        !Number.isInteger(submission.port) ||
+        submission.port < 1 ||
+        submission.port > 65535
+      ) {
         throw new Error("Port must be between 1 and 65535");
       }
-
-      if (authType === "key" && !keyId) {
+      if (submission.authType === "key" && !submission.keyId) {
         throw new Error("Select an SSH private key file first");
       }
 
-      const targetPane = editPane
-        ? tabsStore.getPane(editPane.tabId, editPane.paneId)
+      const targetPane = submission.editPane
+        ? tabsStore.getPane(submission.editPane.tabId, submission.editPane.paneId)
         : undefined;
+      const previousPaneMethod = targetPane?.connection.auth.method;
+      const previousPaneKeyId =
+        previousPaneMethod?.type === "key" ? previousPaneMethod.key_id : undefined;
       let connectionId: string | undefined =
-        editConnection?.id ?? targetPane?.connection.connectionId;
+        submission.editConnection?.id ?? targetPane?.connection.connectionId;
       const isUsingStoredPassword =
-        authType === "password" &&
-        password === STORED_PASSWORD_PLACEHOLDER &&
+        submission.authType === "password" &&
+        submission.password === STORED_PASSWORD_PLACEHOLDER &&
         Boolean(connectionId);
-      if (authType === "password" && !isUsingStoredPassword && password.length === 0) {
+      if (
+        submission.authType === "password" &&
+        !isUsingStoredPassword &&
+        submission.password.length === 0
+      ) {
         throw new Error("Password is required");
       }
-      if (isUsingStoredPassword && saveConnectionChecked && !editConnection) {
+      if (
+        isUsingStoredPassword &&
+        submission.saveConnection &&
+        !submission.editConnection
+      ) {
         throw new Error("Enter the password before saving this connection");
       }
-      if (isUsingStoredPassword && saveConnectionChecked && !savePasswordChecked) {
+      if (
+        isUsingStoredPassword &&
+        submission.saveConnection &&
+        !submission.savePassword
+      ) {
         throw new Error("Enter the password before removing secure password storage");
       }
 
       let canRestorePassword =
-        isUsingStoredPassword && !editConnection
+        isUsingStoredPassword && !submission.editConnection
           ? Boolean(targetPane?.connection.canRestorePassword)
           : false;
-      if (saveConnectionChecked) {
-        const id = editConnection?.id || crypto.randomUUID();
+      if (submission.saveConnection) {
+        const id = submission.editConnection?.id || crypto.randomUUID();
         const savePlan = buildConnectionDialogSavePlan({
-          editConnection,
+          editConnection: submission.editConnection,
           connectionId: id,
-          name,
-          host: trimmedHost,
-          port,
-          username: trimmedUsername,
-          authType,
-          password,
-          keyId,
-          keyName: selectedKeyName,
-          saveConnectionChecked,
-          savePasswordChecked,
-          startupScript: startupScriptToUse,
-          startupScriptReadyText: startupScriptReadyTextToUse,
+          name: submission.name,
+          host: submission.host,
+          port: submission.port,
+          username: submission.username,
+          authType: submission.authType,
+          password: submission.password,
+          keyId: submission.keyId,
+          keyName: submission.keyName,
+          saveConnectionChecked: submission.saveConnection,
+          savePasswordChecked: submission.savePassword,
+          startupScript: submission.startupScript,
+          startupScriptReadyText: submission.startupScriptReadyText,
         });
         connectionId = savePlan.connection.id;
         canRestorePassword = savePlan.canRestorePassword;
@@ -261,52 +294,72 @@
       }
 
       const authPlan = buildConnectionAuthPlan(
-        authType === "key"
+        submission.authType === "key"
           ? {
-              authType,
-              username: trimmedUsername,
-              keyId,
-              passphrase: keyPassphrase,
+              authType: submission.authType,
+              username: submission.username,
+              keyId: submission.keyId,
+              passphrase: submission.keyPassphrase,
             }
           : isUsingStoredPassword
             ? {
                 authType: "storedPassword",
-                username: trimmedUsername,
+                username: submission.username,
                 connectionId: connectionId!,
               }
             : {
-                authType,
-                username: trimmedUsername,
-                password,
+                authType: submission.authType,
+                username: submission.username,
+                password: submission.password,
               }
       );
 
-      if (editPane) {
-        tabsStore.updatePaneConnection(editPane.tabId, editPane.paneId, {
-          host: trimmedHost,
-          port,
-          auth: authPlan.auth,
-          connectionId,
-          canRestorePassword,
-          startupScript: startupScriptToUse,
-          keyName: authType === "key" ? selectedKeyName || undefined : undefined,
-          saveConnection: saveConnectionChecked,
-          savePassword: saveConnectionChecked && savePasswordChecked,
-          startupScriptReadyText: startupScriptReadyTextToUse,
-        });
+      if (submission.editPane) {
+        tabsStore.updatePaneConnection(
+          submission.editPane.tabId,
+          submission.editPane.paneId,
+          {
+            host: submission.host,
+            port: submission.port,
+            auth: authPlan.auth,
+            connectionId,
+            canRestorePassword,
+            startupScript: submission.startupScript,
+            keyName:
+              submission.authType === "key"
+                ? submission.keyName || undefined
+                : undefined,
+            saveConnection: submission.saveConnection,
+            savePassword: submission.saveConnection && submission.savePassword,
+            startupScriptReadyText: submission.startupScriptReadyText,
+          }
+        );
       } else {
         tabsStore.addTab(
-          trimmedHost,
-          port,
+          submission.host,
+          submission.port,
           authPlan.auth,
           connectionId,
           canRestorePassword,
-          startupScriptToUse,
-          startupScriptReadyTextToUse,
-          authType === "key" ? selectedKeyName || undefined : undefined,
-          saveConnectionChecked,
-          saveConnectionChecked && savePasswordChecked
+          submission.startupScript,
+          submission.startupScriptReadyText,
+          submission.authType === "key" ? submission.keyName || undefined : undefined,
+          submission.saveConnection,
+          submission.saveConnection && submission.savePassword
         );
+      }
+
+      const activeKeyId =
+        submission.authType === "key" ? submission.keyId : undefined;
+      if (previousPaneKeyId && previousPaneKeyId !== activeKeyId) {
+        await cleanupTransientKey(previousPaneKeyId);
+      }
+      if (
+        submission.authType !== "key" &&
+        submission.keyId &&
+        submission.keyId !== previousPaneKeyId
+      ) {
+        await cleanupTransientKey(submission.keyId);
       }
 
       onClose();
@@ -319,11 +372,16 @@
   }
 
   async function handleCancel() {
-    const transientKeyId = keyId;
-    resetForm();
+    if (connecting || keyUploading) return;
 
-    await cleanupTransientKey(transientKeyId);
+    const transientKeyId = keyId;
+    const transientKeyIsPersisted = isPersistedKeyId(transientKeyId);
+    resetForm();
     onClose();
+
+    if (!transientKeyIsPersisted) {
+      await cleanupTransientKey(transientKeyId);
+    }
   }
 
   function handleOverlayClick() {
@@ -589,7 +647,12 @@
 
         </div>
         <div class="dialog-actions">
-          <button type="button" class="btn-cancel" onclick={() => void handleCancel()}>
+          <button
+            type="button"
+            class="btn-cancel"
+            disabled={connecting || keyUploading}
+            onclick={() => void handleCancel()}
+          >
             Cancel
           </button>
           <button type="submit" class="btn-connect" disabled={connecting || keyUploading}>

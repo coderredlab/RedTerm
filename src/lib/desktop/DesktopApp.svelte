@@ -32,6 +32,8 @@
   let runtimeInstanceId = $state<string | null>(null);
   let sessionsReconciled = $state(false);
   let workspaceEl: HTMLElement | null = $state(null);
+  let editPaneRequestGeneration = 0;
+  let connectionsViewRequest = $state(0);
 
   const terminals = new Map<string, Terminal>();
 
@@ -129,25 +131,39 @@
   }
 
   function handleNewConnection() {
+    editPaneRequestGeneration += 1;
     editingConnection = undefined;
     editingPane = undefined;
     showDialog = true;
   }
 
   function handleEdit(connection: SavedConnection) {
+    editPaneRequestGeneration += 1;
     editingConnection = connection;
     editingPane = undefined;
     showDialog = true;
   }
 
   async function handleEditPaneConnection(tabId: string, paneId: string) {
+    const requestGeneration = ++editPaneRequestGeneration;
     let pane = tabsStore.getPane(tabId, paneId);
     if (!pane || pane.kind === "local") return;
     if (pane.connection.connectionId && !connectionsStore.loaded) {
-      await connectionsStore.load();
+      const loaded = await connectionsStore.load();
+      if (requestGeneration !== editPaneRequestGeneration) return;
+
       pane = tabsStore.getPane(tabId, paneId);
       if (!pane || pane.kind === "local") return;
+      if (!loaded) {
+        connectionsViewRequest += 1;
+        if (desktopPrefsStore.prefs.sidebarCollapsed) {
+          desktopPrefsStore.toggleSidebar();
+        }
+        return;
+      }
     }
+    if (requestGeneration !== editPaneRequestGeneration) return;
+
     editingConnection = pane.connection.connectionId && connectionsStore.loaded
       ? connectionsStore.connections.find(
           (connection) => connection.id === pane.connection.connectionId
@@ -156,7 +172,9 @@
     editingPane = { tabId, paneId };
     showDialog = true;
   }
+
   function handleCloseDialog() {
+    editPaneRequestGeneration += 1;
     showDialog = false;
     editingConnection = undefined;
     editingPane = undefined;
@@ -463,6 +481,7 @@
     collapsed={desktopPrefsStore.prefs.sidebarCollapsed}
     activeSessionId={activeSessionId}
     explorerKind={explorerKind}
+    connectionsViewRequest={connectionsViewRequest}
     onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
     onEdit={handleEdit}
     onNewConnection={handleNewConnection}

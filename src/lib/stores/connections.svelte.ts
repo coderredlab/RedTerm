@@ -5,10 +5,13 @@ import {
   type SavedConnection,
 } from "$lib/tauri/commands";
 
+type ConnectionsErrorContext = "load" | "save" | "delete";
+
 function createConnectionsStore() {
   let connections = $state<SavedConnection[]>([]);
   let loading = $state(false);
   let error = $state<string | null>(null);
+  let errorContext = $state<ConnectionsErrorContext | null>(null);
   let loaded = $state(false);
   let loadGeneration = 0;
 
@@ -25,6 +28,10 @@ function createConnectionsStore() {
       return error;
     },
 
+    get errorContext() {
+      return errorContext;
+    },
+
     get loaded() {
       return loaded;
     },
@@ -33,6 +40,7 @@ function createConnectionsStore() {
       const generation = ++loadGeneration;
       loading = true;
       error = null;
+      errorContext = null;
       loaded = false;
       try {
         const nextConnections = await loadConnections();
@@ -43,6 +51,7 @@ function createConnectionsStore() {
       } catch (e) {
         if (generation === loadGeneration) {
           error = e instanceof Error ? e.message : String(e);
+          errorContext = "load";
         }
         return false;
       } finally {
@@ -52,6 +61,7 @@ function createConnectionsStore() {
 
     async save(connection: SavedConnection, password?: string): Promise<boolean> {
       error = null;
+      errorContext = null;
       try {
         await saveConnection(connection, password);
         const index = connections.findIndex((candidate) => candidate.id === connection.id);
@@ -63,18 +73,21 @@ function createConnectionsStore() {
         return await this.load();
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
+        errorContext = "save";
         throw e;
       }
     },
 
     async delete(id: string): Promise<boolean> {
       error = null;
+      errorContext = null;
       try {
         await deleteConnection(id);
         connections = connections.filter((connection) => connection.id !== id);
         return await this.load();
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
+        errorContext = "delete";
         throw e;
       }
     },
