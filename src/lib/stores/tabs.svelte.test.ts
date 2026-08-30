@@ -377,7 +377,7 @@ describe("tabs store persistence", () => {
     }
   });
 
-  test("replaces shared managed key references without dropping sessions", async () => {
+  test("keeps live shared key sessions bound to their original target", async () => {
     const storage = new MemoryStorage();
     installBrowserStorage(storage);
     const { tabsStore } = await import("./tabs.svelte");
@@ -405,6 +405,20 @@ describe("tabs store persistence", () => {
       true,
       false
     );
+
+    const idleTabId = tabsStore.addTab(
+      "shared.example.com",
+      22,
+      { username: "deploy", method: { type: "key", key_id: "key-old" } },
+      "connection-shared",
+      false,
+      undefined,
+      undefined,
+      "id_old",
+      true,
+      false
+    );
+    const idleConnectionRef = tabsStore.getTab(idleTabId)!.panes[0]!.connection;
 
     try {
       const firstPaneId = tabsStore.getTab(tabId)!.activePaneId!;
@@ -434,23 +448,39 @@ describe("tabs store persistence", () => {
       expect(panes[0]!.connection).toBe(connectionRefs[0]);
       expect(panes[1]!.connection).toBe(connectionRefs[1]);
       expect(panes.map((pane) => pane.connection.auth.method)).toEqual([
-        { type: "key", key_id: "key-new", passphrase: "runtime-only" },
-        { type: "key", key_id: "key-new", passphrase: "runtime-only" },
+        { type: "key", key_id: "key-old" },
+        { type: "key", key_id: "key-old" },
       ]);
       expect(panes.map((pane) => pane.sessionId)).toEqual([
         "session-one",
         "session-two",
       ]);
-      expect(panes.every((pane) => pane.connection.keyName === "id_new")).toBe(true);
+      expect(panes.every((pane) => pane.connection.keyName === "id_old")).toBe(true);
       expect(panes.map((pane) => pane.connection.host)).toEqual([
-        "new.example.com",
-        "new.example.com",
+        "shared.example.com",
+        "shared.example.com",
       ]);
-      expect(panes.map((pane) => pane.connection.port)).toEqual([2222, 2222]);
+      expect(panes.map((pane) => pane.connection.port)).toEqual([22, 22]);
       expect(panes.map((pane) => pane.connection.auth.username)).toEqual([
-        "operator",
-        "operator",
+        "deploy",
+        "deploy",
       ]);
+      expect(panes.every((pane) => pane.connection.connectionId === undefined)).toBe(true);
+      expect(panes.every((pane) => pane.connection.saveConnection === false)).toBe(true);
+      const idlePane = tabsStore.getTab(idleTabId)!.panes[0]!;
+      expect(idlePane.connection).not.toBe(idleConnectionRef);
+      expect(idlePane.sessionId).toBeNull();
+      expect(idlePane.connection).toMatchObject({
+        host: "new.example.com",
+        port: 2222,
+        connectionId: "connection-shared",
+        keyName: "id_new",
+        auth: {
+          username: "operator",
+          method: { type: "key", key_id: "key-new", passphrase: "runtime-only" },
+        },
+      });
+
       const otherPane = tabsStore.getTab(otherTabId)!.panes[0]!;
       expect(otherPane.connection.connectionId).toBe("connection-other");
       expect(otherPane.connection.host).toBe("shared.example.com");
@@ -464,12 +494,20 @@ describe("tabs store persistence", () => {
       expect(
         persisted.tabs[0].panes.every(
           (pane: { connection: { auth: { method: { key_id?: string } } } }) =>
-            pane.connection.auth.method.key_id === "key-new"
+            pane.connection.auth.method.key_id === "key-old"
+        )
+      ).toBe(true);
+      expect(
+        persisted.tabs[0].panes.every(
+          (pane: { connection: { host: string; connectionId?: string } }) =>
+            pane.connection.host === "shared.example.com" &&
+            pane.connection.connectionId === undefined
         )
       ).toBe(true);
     } finally {
       tabsStore.removeTab(tabId);
       tabsStore.removeTab(otherTabId);
+      tabsStore.removeTab(idleTabId);
     }
   });
   test("detaches panes while preserving managed key authentication", async () => {

@@ -907,21 +907,27 @@ function createTabsStore() {
             ) {
               continue;
             }
-            Object.assign(pane.connection, {
-              host: replacement.host,
-              port: replacement.port,
+            if (
+              pane.sessionId !== null ||
+              pane.runtimeInstanceId !== null ||
+              pane.connected
+            ) {
+              pane.connection.connectionId = undefined;
+              pane.connection.saveConnection = false;
+              pane.connection.savePassword = false;
+              pane.connection.canRestorePassword = false;
+              continue;
+            }
+            pane.connection = {
+              ...replacement,
               auth: {
                 username: replacement.auth.username,
                 method: { ...replacement.auth.method },
               },
-              connectionId: replacement.connectionId,
-              canRestorePassword: replacement.canRestorePassword,
-              startupScript: replacement.startupScript,
-              startupScriptReadyText: replacement.startupScriptReadyText,
-              keyName: replacement.keyName,
-              saveConnection: replacement.saveConnection,
-              savePassword: replacement.savePassword,
-            });
+            };
+            pane.sessionId = null;
+            pane.runtimeInstanceId = null;
+            pane.connected = false;
             pane.title = paneTitle(pane.connection);
           }
         });
