@@ -2601,4 +2601,15 @@ describe("AnsiParser reflow wide-char boundaries", () => {
     const flattened = rows.map((r) => r.map((c) => c.char).join("")).join("\n");
     expect(flattened.replace(/\n+$/g, "")).toContain("가가가가x");
   });
+
+  test("Nerd Font PUA glyphs remain one cell", () => {
+    const parser = new AnsiParser(8, 2);
+    parser.write("󰪥X");
+
+    expect(parser.getBuffer()[0].slice(0, 3).map((cell) => cell.char)).toEqual([
+      "",
+      "󰪥",
+      "X",
+    ]);
+  });
 });

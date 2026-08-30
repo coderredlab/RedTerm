@@ -872,10 +872,15 @@
     calculateSize();
 
     if (typeof document !== "undefined" && "fonts" in document) {
-      void (document as Document & { fonts: FontFaceSet }).fonts.ready.then(() => {
+      const fonts = (document as Document & { fonts: FontFaceSet }).fonts;
+      void fonts.load(
+        `${settingsStore.fontSize}px "Sarasa Term K Nerd"`,
+        "\u{F109}\u{F0AA5}\u{F055D}\u{F0068}",
+      ).then(() => {
         if (destroyed) return;
         measureFont();
         calculateSize();
+        requestRedraw();
       });
     }
 
