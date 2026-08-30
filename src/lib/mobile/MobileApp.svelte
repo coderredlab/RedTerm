@@ -12,6 +12,7 @@
   import { cancelVoiceInput, checkVoiceInputPermissions, listenVoiceInput, listVoiceInputLanguages, requestVoiceInputPermissions, setKeyboardVisible, sshDisconnect, sshWrite, startVoiceInput, stopVoiceInput } from "$lib/tauri/commands";
   import { loadRuntimeInstanceId, resolveRecovery } from "$lib/session/reconcile";
   import { tabsStore } from "$lib/stores/tabs.svelte";
+  import { connectionsStore } from "$lib/stores/connections.svelte";
   import { terminalModesStore } from "$lib/stores/terminal-modes.svelte";
   import { settingsStore } from "$lib/stores/settings.svelte";
   import type { SavedConnection } from "$lib/tauri/commands";
@@ -20,6 +21,7 @@
   let showSettings = $state(false);
   let editingConnection = $state<SavedConnection | undefined>(undefined);
   let terminalRefs = $state<Record<string, Terminal | undefined>>({});
+  let editingPane = $state<{ tabId: string; paneId: string } | undefined>(undefined);
   // Show connection list when no tabs or when + button is pressed
   let showConnectionListManual = $state(false);
   let showConnectionList = $derived(tabsStore.tabs.length === 0 || showConnectionListManual);
@@ -104,15 +106,33 @@
   function handleCloseDialog() {
     showDialog = false;
     editingConnection = undefined;
+    editingPane = undefined;
   }
 
   function handleEdit(connection: SavedConnection) {
     editingConnection = connection;
+    editingPane = undefined;
     showDialog = true;
   }
 
   function handleNewConnection() {
     editingConnection = undefined;
+    editingPane = undefined;
+    showDialog = true;
+  }
+
+  function handleEditFailedConnection(tabId: string) {
+    const tab = tabsStore.getTab(tabId);
+    const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
+    if (!paneId) return;
+    const pane = tabsStore.getPane(tabId, paneId);
+    if (!pane || pane.kind === "local") return;
+    editingConnection = pane.connection.connectionId
+      ? connectionsStore.connections.find(
+          (connection) => connection.id === pane.connection.connectionId
+        )
+      : undefined;
+    editingPane = { tabId, paneId };
     showDialog = true;
   }
 
@@ -220,6 +240,7 @@
           class="terminal-container"
           class:active={tab.id === tabsStore.activeTabId}
         >
+          {#key tab.panes[0]?.connection}
           <Terminal
             host={tab.host}
             port={tab.port}
@@ -231,9 +252,14 @@
             interactive={!showConnectionList && !showDialog && !showSettings && tab.id === tabsStore.activeTabId}
             onConnected={(sessionId) => handleConnected(tab.id, sessionId)}
             onDisconnected={() => handleDisconnected(tab.id)}
+            onEditConnection={tab.panes[0]?.kind === "local"
+              ? undefined
+              : () => handleEditFailedConnection(tab.id)}
+            onCloseTab={() => void handleCloseTab(tab.id)}
             bind:this={terminalRefs[tab.id]}
             onTitleChange={(title) => handleTitleChanged(tab.id, title)}
           />
+          {/key}
         </div>
       {/each}
 
@@ -266,6 +292,7 @@
   <ConnectionDialog
     open={showDialog}
     editConnection={editingConnection}
+    editPane={editingPane}
     onClose={handleCloseDialog}
   />
 </div>

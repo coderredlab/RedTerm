@@ -1,6 +1,7 @@
 <script lang="ts">
   import { THEMES } from "$lib/styles/themes";
   import { settingsStore } from "$lib/stores/settings.svelte";
+  import { modalFocus } from "./modal-focus";
 
   interface Props {
     open: boolean;
@@ -29,14 +30,43 @@
     settingsStore.setFontSize(settingsStore.fontSize + delta);
   }
 
-  function handleKeydown(event: KeyboardEvent) {
-    if (event.key === "Escape") {
-      onClose();
-    }
-  }
-</script>
+  type ThemeGroup = "dark" | "light";
 
-<svelte:window onkeydown={open ? handleKeydown : undefined} />
+  function linearChannel(channel: number): number {
+    const normalized = channel / 255;
+    return normalized <= 0.04045
+      ? normalized / 12.92
+      : ((normalized + 0.055) / 1.055) ** 2.4;
+  }
+
+  function isLightTheme(background: string): boolean {
+    const value = Number.parseInt(background.slice(1), 16);
+    const luminance =
+      0.2126 * linearChannel((value >> 16) & 0xff) +
+      0.7152 * linearChannel((value >> 8) & 0xff) +
+      0.0722 * linearChannel(value & 0xff);
+    return luminance > 0.5;
+  }
+
+  const THEME_GROUPS = {
+    dark: THEMES.filter((theme) => !isLightTheme(theme.colors.terminalBg)),
+    light: THEMES.filter((theme) => isLightTheme(theme.colors.terminalBg)),
+  } satisfies Record<ThemeGroup, typeof THEMES>;
+
+  function groupForTheme(themeId: string): ThemeGroup {
+    return THEME_GROUPS.light.some((theme) => theme.id === themeId)
+      ? "light"
+      : "dark";
+  }
+
+  let themeGroup = $state<ThemeGroup>(groupForTheme(settingsStore.theme));
+
+  $effect(() => {
+    if (open) {
+      themeGroup = groupForTheme(settingsStore.theme);
+    }
+  });
+</script>
 
 {#if open}
   <div
@@ -44,6 +74,8 @@
     role="dialog"
     aria-modal="true"
     aria-label="Settings"
+    tabindex="-1"
+    use:modalFocus={{ onClose }}
   >
     <div class="settings-backdrop" onclick={onClose} aria-hidden="true"></div>
     <div class="settings-modal">
@@ -54,6 +86,7 @@
           title="Close settings"
           aria-label="Close settings"
           onclick={onClose}
+          data-modal-initial-focus
         >×</button>
       </header>
 
@@ -76,12 +109,27 @@
         </section>
 
         <section class="settings-section">
-          <div class="section-label">Theme</div>
+          <div class="theme-heading">
+            <div class="section-label">Theme</div>
+            <div class="theme-filter" role="group" aria-label="Theme appearance">
+              <button
+                class:active={themeGroup === "dark"}
+                aria-pressed={themeGroup === "dark"}
+                onclick={() => (themeGroup = "dark")}
+              >Dark</button>
+              <button
+                class:active={themeGroup === "light"}
+                aria-pressed={themeGroup === "light"}
+                onclick={() => (themeGroup = "light")}
+              >Light</button>
+            </div>
+          </div>
           <div class="theme-grid">
-            {#each THEMES as theme (theme.id)}
+            {#each THEME_GROUPS[themeGroup] as theme (theme.id)}
               <button
                 class="theme-card"
                 class:active={settingsStore.theme === theme.id}
+                aria-pressed={settingsStore.theme === theme.id}
                 onclick={() => settingsStore.setTheme(theme.id)}
               >
                 <div class="theme-swatches">
@@ -184,8 +232,8 @@
   }
 
   .settings-close {
-    width: 26px;
-    height: 26px;
+    width: 32px;
+    height: 32px;
     display: grid;
     place-items: center;
     border: 0;
@@ -253,6 +301,48 @@
     text-align: center;
     color: var(--text-primary);
     font-size: 12px;
+  }
+
+  .theme-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 10px;
+  }
+
+  .theme-heading .section-label {
+    margin-bottom: 0;
+  }
+
+  .theme-filter {
+    display: flex;
+    padding: 2px;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--bg-secondary);
+  }
+
+  .theme-filter button {
+    min-width: 58px;
+    height: 26px;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 10px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+
+  .theme-filter button:hover {
+    color: var(--text-primary);
+  }
+
+  .theme-filter button.active {
+    background: var(--bg-tertiary);
+    color: var(--accent-primary);
   }
 
   .theme-grid {

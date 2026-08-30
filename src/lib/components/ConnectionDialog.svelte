@@ -12,15 +12,17 @@
     STORED_PASSWORD_PLACEHOLDER,
     buildConnectionDialogSavePlan,
   } from "./connection-dialog-save-plan";
+  import { modalFocus } from "$lib/desktop/workspace/modal-focus";
   import { buildConnectionAuthPlan } from "./connection-auth-plan";
 
   interface Props {
     open: boolean;
     editConnection?: SavedConnection;
+    editPane?: { tabId: string; paneId: string };
     onClose: () => void;
   }
 
-  let { open, editConnection, onClose }: Props = $props();
+  let { open, editConnection, editPane, onClose }: Props = $props();
 
 
   let name = $state("");
@@ -43,21 +45,37 @@
 
   $effect(() => {
     activeDialogTab = "general";
-    if (editConnection) {
-      name = editConnection.name;
-      host = editConnection.host;
-      port = editConnection.port;
-      username = editConnection.username;
-      keyId = editConnection.key_id || "";
-      selectedKeyName = editConnection.key_name || "";
-      keyPassphrase = "";
-      authType = editConnection.key_id ? "key" : "password";
-      saveConnectionChecked = true;
-      savePasswordChecked = editConnection.has_saved_password;
-      startupScript = editConnection.startup_script || "";
-      startupScriptReadyText = editConnection.startup_script_ready_text || "";
-      // Show placeholder for stored password
-      password = editConnection.has_saved_password ? STORED_PASSWORD_PLACEHOLDER : "";
+    error = null;
+    const pane = editPane
+      ? tabsStore.getPane(editPane.tabId, editPane.paneId)
+      : undefined;
+    const paneConnection = pane?.connection;
+    const paneMethod = paneConnection?.auth.method;
+
+    if (editConnection || paneConnection) {
+      name = editConnection?.name ?? paneConnection?.host ?? "";
+      host = editConnection?.host ?? paneConnection?.host ?? "";
+      port = editConnection?.port ?? paneConnection?.port ?? 22;
+      username = editConnection?.username ?? paneConnection?.auth.username ?? "";
+      keyId = editConnection?.key_id ?? (paneMethod?.type === "key" ? paneMethod.key_id : "");
+      selectedKeyName = editConnection?.key_name ?? "";
+      keyPassphrase = paneMethod?.type === "key" ? paneMethod.passphrase ?? "" : "";
+      authType = keyId ? "key" : "password";
+      saveConnectionChecked = Boolean(editConnection || paneConnection?.connectionId);
+      savePasswordChecked = editConnection?.has_saved_password ?? Boolean(
+        paneConnection?.canRestorePassword && paneMethod?.type === "stored_password"
+      );
+      startupScript = editConnection?.startup_script ?? paneConnection?.startupScript ?? "";
+      startupScriptReadyText =
+        editConnection?.startup_script_ready_text ??
+        paneConnection?.startupScriptReadyText ??
+        "";
+      password =
+        editConnection?.has_saved_password || paneMethod?.type === "stored_password"
+          ? STORED_PASSWORD_PLACEHOLDER
+          : paneMethod?.type === "password"
+            ? paneMethod.password
+            : "";
     } else {
       resetForm();
     }
@@ -84,7 +102,12 @@
 
 
   function isPersistedKeyId(id: string): boolean {
-    return Boolean(editConnection?.key_id && id === editConnection.key_id);
+    const pane = editPane
+      ? tabsStore.getPane(editPane.tabId, editPane.paneId)
+      : undefined;
+    const paneMethod = pane?.connection.auth.method;
+    const paneKeyId = paneMethod?.type === "key" ? paneMethod.key_id : undefined;
+    return id === editConnection?.key_id || id === paneKeyId;
   }
 
   async function cleanupTransientKey(id: string) {
@@ -179,11 +202,15 @@
         throw new Error("Select an SSH private key file first");
       }
 
-      let connectionId: string | undefined = editConnection?.id;
+      const targetPane = editPane
+        ? tabsStore.getPane(editPane.tabId, editPane.paneId)
+        : undefined;
+      let connectionId: string | undefined =
+        editConnection?.id ?? targetPane?.connection.connectionId;
       const isUsingStoredPassword =
         authType === "password" &&
         password === STORED_PASSWORD_PLACEHOLDER &&
-        Boolean(editConnection?.id);
+        Boolean(connectionId);
       if (authType === "password" && !isUsingStoredPassword && password.length === 0) {
         throw new Error("Password is required");
       }
@@ -194,7 +221,7 @@
       let canRestorePassword = false;
 
       if (saveConnectionChecked) {
-        const id = editConnection?.id || crypto.randomUUID();
+        const id = connectionId || crypto.randomUUID();
         const savePlan = buildConnectionDialogSavePlan({
           editConnection,
           connectionId: id,
@@ -237,15 +264,27 @@
               }
       );
 
-      tabsStore.addTab(
-        trimmedHost,
-        port,
-        authPlan.auth,
-        connectionId,
-        canRestorePassword,
-        startupScriptToUse,
-        startupScriptReadyTextToUse
-      );
+      if (editPane) {
+        tabsStore.updatePaneConnection(editPane.tabId, editPane.paneId, {
+          host: trimmedHost,
+          port,
+          auth: authPlan.auth,
+          connectionId,
+          canRestorePassword,
+          startupScript: startupScriptToUse,
+          startupScriptReadyText: startupScriptReadyTextToUse,
+        });
+      } else {
+        tabsStore.addTab(
+          trimmedHost,
+          port,
+          authPlan.auth,
+          connectionId,
+          canRestorePassword,
+          startupScriptToUse,
+          startupScriptReadyTextToUse
+        );
+      }
 
       onClose();
       resetForm();
@@ -268,26 +307,48 @@
     void handleCancel();
   }
 
-  function handleOverlayKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      void handleCancel();
+  function handleDialogTabKeydown(event: KeyboardEvent) {
+    const tabs = ["general", "loginScript"] as const;
+    const currentIndex = tabs.indexOf(activeDialogTab);
+    let nextIndex = currentIndex;
+
+    if (event.key === "ArrowLeft") {
+      nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    } else if (event.key === "ArrowRight") {
+      nextIndex = (currentIndex + 1) % tabs.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = tabs.length - 1;
+    } else {
+      return;
     }
+
+    event.preventDefault();
+    activeDialogTab = tabs[nextIndex];
+    const tabList = event.currentTarget instanceof HTMLElement
+      ? event.currentTarget.parentElement
+      : null;
+    tabList
+      ?.querySelector<HTMLElement>(
+        '[data-dialog-tab="' + activeDialogTab + '"]'
+      )
+      ?.focus();
   }
 </script>
 
 {#if open}
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     class="dialog-overlay"
-    onclick={handleOverlayClick}
-    onkeydown={handleOverlayKeydown}
     role="dialog"
     aria-modal="true"
+    aria-labelledby="connection-dialog-title"
     tabindex="-1"
+    use:modalFocus={{ onClose: () => void handleCancel() }}
   >
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()}>
-      <h2>{editConnection ? "Edit Connection" : "New Connection"}</h2>
+    <div class="dialog-backdrop" onclick={handleOverlayClick} aria-hidden="true"></div>
+    <div class="dialog">
+      <h2 id="connection-dialog-title">{editConnection || editPane ? "Edit Connection" : "New Connection"}</h2>
 
       {#if error}
         <div class="error">{error}</div>
@@ -295,23 +356,45 @@
       <div class="dialog-tabs" role="tablist" aria-label="Connection settings">
         <button
           type="button"
+          id="connection-tab-general"
+          data-dialog-tab="general"
           class="dialog-tab"
           class:active={activeDialogTab === "general"}
+          role="tab"
+          aria-selected={activeDialogTab === "general"}
+          aria-controls="connection-dialog-panel"
+          tabindex={activeDialogTab === "general" ? 0 : -1}
           onclick={() => (activeDialogTab = "general")}
+          onkeydown={handleDialogTabKeydown}
         >
           General
         </button>
         <button
           type="button"
+          id="connection-tab-login-script"
+          data-dialog-tab="loginScript"
           class="dialog-tab"
           class:active={activeDialogTab === "loginScript"}
+          role="tab"
+          aria-selected={activeDialogTab === "loginScript"}
+          aria-controls="connection-dialog-panel"
+          tabindex={activeDialogTab === "loginScript" ? 0 : -1}
           onclick={() => (activeDialogTab = "loginScript")}
+          onkeydown={handleDialogTabKeydown}
         >
           Startup Script
         </button>
       </div>
 
       <form onsubmit={(e) => { e.preventDefault(); handleConnect(); }}>
+        <div
+          class="dialog-body"
+          id="connection-dialog-panel"
+          role="tabpanel"
+          aria-labelledby={activeDialogTab === "general"
+            ? "connection-tab-general"
+            : "connection-tab-login-script"}
+        >
         {#if activeDialogTab === "general"}
           <div class="form-group">
             <label for="name">Name (optional)</label>
@@ -369,11 +452,12 @@
 
           <div class="form-group">
             <span class="label-text">Authentication</span>
-            <div class="auth-tabs">
+            <div class="auth-tabs" role="group" aria-label="Authentication method">
               <button
                 type="button"
                 class="auth-tab"
                 class:active={authType === "password"}
+                aria-pressed={authType === "password"}
                 onclick={() => (authType = "password")}
               >
                 Password
@@ -383,6 +467,7 @@
                 class="auth-tab"
                 class:active={authType === "key"}
                 onclick={() => (authType = "key")}
+                aria-pressed={authType === "key"}
               >
                 SSH Key
               </button>
@@ -479,6 +564,7 @@
           </div>
         {/if}
 
+        </div>
         <div class="dialog-actions">
           <button type="button" class="btn-cancel" onclick={() => void handleCancel()}>
             Cancel
@@ -496,7 +582,6 @@
   .dialog-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -504,19 +589,28 @@
     padding: 16px;
   }
 
+  .dialog-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+  }
+
   .dialog {
+    position: relative;
     background: var(--bg-primary);
     border-radius: 12px;
-    padding: 24px;
     width: 100%;
     /* Shells can widen for desktop via --dialog-max-width. */
     max-width: var(--dialog-max-width, 400px);
     max-height: 90vh;
-    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
 
   h2 {
     margin: 0 0 16px;
+    padding: 24px 24px 0;
     color: var(--text-primary);
     font-size: 18px;
   }
@@ -527,13 +621,13 @@
     color: var(--status-error);
     padding: 10px;
     border-radius: 6px;
-    margin-bottom: 16px;
+    margin: 0 24px 16px;
     font-size: 13px;
   }
   .dialog-tabs {
     display: flex;
     gap: 8px;
-    margin-bottom: 20px;
+    margin: 0 24px;
     border-bottom: 1px solid var(--border-secondary);
   }
 
@@ -552,6 +646,20 @@
   .dialog-tab.active {
     border-bottom-color: var(--accent-primary);
     color: var(--text-primary);
+  }
+
+  form {
+    min-height: 0;
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .dialog-body {
+    min-height: 0;
+    padding: 20px 24px 0;
+    overflow-y: auto;
   }
 
 
@@ -725,8 +833,12 @@
 
   .dialog-actions {
     display: flex;
+    flex: 0 0 auto;
     gap: 12px;
-    margin-top: 24px;
+    margin: 0;
+    padding: 16px 24px 24px;
+    border-top: 1px solid var(--border-secondary);
+    background: var(--bg-primary);
   }
 
   .btn-cancel,

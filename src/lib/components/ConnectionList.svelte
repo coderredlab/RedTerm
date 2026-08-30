@@ -7,12 +7,22 @@
   interface Props {
     onEdit?: (connection: SavedConnection) => void;
     onNewConnection?: () => void;
+    onOpenLocal?: () => void;
+    showNewActions?: boolean;
   }
 
-  let { onEdit, onNewConnection }: Props = $props();
+  let { onEdit, onNewConnection, onOpenLocal, showNewActions = true }: Props = $props();
+
+  let errorContext = $state<"load" | "delete">("load");
+  let deletingId = $state<string | null>(null);
+
+  async function loadConnectionList() {
+    errorContext = "load";
+    await connectionsStore.load();
+  }
 
   onMount(() => {
-    connectionsStore.load();
+    void loadConnectionList();
   });
 
   function handleQuickConnect(connection: SavedConnection) {
@@ -38,30 +48,59 @@
   }
 
   async function handleDelete(connection: SavedConnection) {
-    if (confirm(`Delete "${connection.name}"?`)) {
+    if (!confirm(`Delete "${connection.name}"?`)) return;
+
+    errorContext = "delete";
+    deletingId = connection.id;
+    try {
       await connectionsStore.delete(connection.id);
+    } catch {
+      // The store exposes the backend error for the inline alert below.
+    } finally {
+      deletingId = null;
     }
   }
 </script>
 
 <div class="connection-list">
   <div class="header">
-    <h3>Saved Connections</h3>
-    <button class="btn-new" onclick={onNewConnection}>
-      + New
-    </button>
+    <h3>Connections</h3>
+    {#if showNewActions}
+      <button class="btn-new" onclick={onNewConnection}>
+        + New
+      </button>
+    {/if}
   </div>
-
+  {#if onOpenLocal}
+    <button class="local-entry" onclick={onOpenLocal}>
+      <span class="local-entry-glyph" aria-hidden="true">&gt;_</span>
+      <span class="local-entry-text">
+        <span class="local-entry-name">Local Shell</span>
+        <span class="local-entry-sub">This machine</span>
+      </span>
+    </button>
+  {/if}
+  {#if connectionsStore.error}
+    <div class="connection-error" role="alert">
+      <strong>{errorContext === "delete"
+        ? "Couldn’t delete connection."
+        : "Couldn’t load saved connections."}</strong>
+      <span>{connectionsStore.error}</span>
+      <button type="button" onclick={() => void loadConnectionList()}>Reload</button>
+    </div>
+  {/if}
   {#if connectionsStore.loading}
     <div class="loading">Loading…</div>
-  {:else if connectionsStore.connections.length === 0}
+  {:else if connectionsStore.connections.length === 0 && !connectionsStore.error}
     <div class="empty">
       <p>No saved connections</p>
-      <button class="btn-primary" onclick={onNewConnection}>
-        Add Connection
-      </button>
+      {#if showNewActions}
+        <button class="btn-primary" onclick={onNewConnection}>
+          Add Connection
+        </button>
+      {/if}
     </div>
-  {:else}
+  {:else if connectionsStore.connections.length > 0}
     <div class="connections">
       {#each connectionsStore.connections as connection (connection.id)}
         <div class="connection-item">
@@ -92,6 +131,7 @@
             <button
               class="btn-icon delete"
               title="Delete"
+              disabled={deletingId === connection.id}
               onclick={() => handleDelete(connection)}
             >
               ✕
@@ -140,6 +180,97 @@
     background: var(--accent-hover);
   }
 
+  .local-entry {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 8px 10px 4px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .local-entry:hover {
+    border-color: var(--accent-muted);
+    color: var(--text-primary);
+  }
+
+  .local-entry-glyph {
+    width: 26px;
+    height: 26px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--status-success);
+    border-radius: 4px;
+    color: var(--status-success);
+    font-size: 10px;
+    font-weight: 700;
+    flex: 0 0 auto;
+  }
+
+  .local-entry-text {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .local-entry-name {
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .local-entry-sub {
+    color: var(--text-secondary);
+    font-size: 11px;
+  }
+
+  .connection-error {
+    flex: 0 0 auto;
+    display: grid;
+    gap: 7px;
+    margin: 8px 10px 4px;
+    padding: 12px;
+    border: 1px solid color-mix(in srgb, var(--status-error) 58%, var(--border-primary));
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--status-error) 10%, var(--bg-secondary));
+  }
+
+  .connection-error strong {
+    color: var(--status-error);
+    font-size: 12px;
+  }
+
+  .connection-error span {
+    color: var(--text-secondary);
+    font-size: 11px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+  }
+
+  .connection-error button {
+    justify-self: start;
+    padding: 6px 10px;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .connection-error button:hover {
+    border-color: var(--accent-muted);
+  }
+
   .loading,
   .empty {
     padding: 32px;
@@ -148,10 +279,11 @@
   }
 
   .empty p {
-    margin-bottom: 16px;
+    margin: 0;
   }
 
   .btn-primary {
+    margin-top: 16px;
     padding: 12px 24px;
     background: var(--accent-primary);
     border: none;

@@ -316,4 +316,54 @@ describe("tabs store persistence", () => {
     }
   });
 
+  test("replaces a failed pane connection in place", async () => {
+    const storage = new MemoryStorage();
+    installBrowserStorage(storage);
+    const { tabsStore } = await import("./tabs.svelte");
+    const tabId = tabsStore.addTab(
+      "old.example.com",
+      22,
+      { username: "old-user", method: { type: "password", password: "old" } },
+      "connection-old"
+    );
+
+    try {
+      const paneId = tabsStore.getTab(tabId)!.activePaneId!;
+      tabsStore.setPaneConnected(tabId, paneId, "stale-session");
+      tabsStore.updatePaneConnection(tabId, paneId, {
+        host: "new.example.com",
+        port: 2202,
+        auth: { username: "new-user", method: { type: "key", key_id: "key-new" } },
+        connectionId: "connection-new",
+      });
+
+      const tab = tabsStore.getTab(tabId)!;
+      expect(tab.panes).toHaveLength(1);
+      expect(tab.panes[0]).toMatchObject({
+        id: paneId,
+        title: "new-user@new.example.com",
+        sessionId: null,
+        connected: false,
+        connection: {
+          host: "new.example.com",
+          port: 2202,
+          connectionId: "connection-new",
+        },
+      });
+      expect(tab).toMatchObject({
+        id: tabId,
+        host: "new.example.com",
+        port: 2202,
+        connectionId: "connection-new",
+        sessionId: null,
+        connected: false,
+      });
+      const persisted = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null");
+      expect(persisted.tabs[0].panes[0].connection.host).toBe("new.example.com");
+      expect(JSON.stringify(persisted)).not.toContain("stale-session");
+    } finally {
+      tabsStore.removeTab(tabId);
+    }
+  });
+
 });

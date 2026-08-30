@@ -2,6 +2,7 @@
   import { onMount, tick } from "svelte";
   import ConnectionDialog from "$lib/components/ConnectionDialog.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
+  import { connectionsStore } from "$lib/stores/connections.svelte";
   import type { SavedConnection } from "$lib/tauri/commands";
   import {
     loadRuntimeInstanceId,
@@ -27,6 +28,7 @@
   let showDialog = $state(false);
   let settingsOpen = $state(false);
   let editingConnection = $state<SavedConnection | undefined>(undefined);
+  let editingPane = $state<{ tabId: string; paneId: string } | undefined>(undefined);
   let runtimeInstanceId = $state<string | null>(null);
   let sessionsReconciled = $state(false);
   let workspaceEl: HTMLElement | null = $state(null);
@@ -35,7 +37,7 @@
 
   const sidebarColumn = $derived(
     desktopPrefsStore.prefs.sidebarCollapsed
-      ? "48px"
+      ? "0px"
       : `${desktopPrefsStore.prefs.sidebarWidth}px`
   );
 
@@ -128,17 +130,32 @@
 
   function handleNewConnection() {
     editingConnection = undefined;
+    editingPane = undefined;
     showDialog = true;
   }
 
   function handleEdit(connection: SavedConnection) {
     editingConnection = connection;
+    editingPane = undefined;
+    showDialog = true;
+  }
+
+  function handleEditPaneConnection(tabId: string, paneId: string) {
+    const pane = tabsStore.getPane(tabId, paneId);
+    if (!pane || pane.kind === "local") return;
+    editingConnection = pane.connection.connectionId
+      ? connectionsStore.connections.find(
+          (connection) => connection.id === pane.connection.connectionId
+        )
+      : undefined;
+    editingPane = { tabId, paneId };
     showDialog = true;
   }
 
   function handleCloseDialog() {
     showDialog = false;
     editingConnection = undefined;
+    editingPane = undefined;
   }
 
   async function closeTabById(tabId: string) {
@@ -340,6 +357,12 @@
     paneDisconnected(tabId, paneId) {
       tabsStore.setPaneDisconnected(tabId, paneId);
     },
+    editPaneConnection(tabId, paneId) {
+      handleEditPaneConnection(tabId, paneId);
+    },
+    closeTab(tabId) {
+      void closeTabById(tabId);
+    },
     closePane(tabId, paneId) {
       void serializeLayoutSnapshotOperation(async () => {
         await storeTabSnapshots([tabId]);
@@ -431,23 +454,21 @@
   class="desktop-app"
   style:grid-template-columns="{sidebarColumn} minmax(0, 1fr)"
 >
-  <Sidebar
-    collapsed={desktopPrefsStore.prefs.sidebarCollapsed}
-    width={desktopPrefsStore.prefs.sidebarWidth}
-    activeSessionId={activeSessionId}
-    explorerKind={explorerKind}
-    onToggleCollapsed={() => desktopPrefsStore.toggleSidebar()}
-    onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
-    onEdit={handleEdit}
-    onNewConnection={handleNewConnection}
-    onOpenLocal={() => void tabsStore.addLocalTab()}
-    onPreview={(entry) => (previewEntry = entry)}
-  />
+  {#if !desktopPrefsStore.prefs.sidebarCollapsed}
+    <Sidebar
+      width={desktopPrefsStore.prefs.sidebarWidth}
+      activeSessionId={activeSessionId}
+      explorerKind={explorerKind}
+      onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
+      onEdit={handleEdit}
+      onNewConnection={handleNewConnection}
+      onOpenLocal={() => void tabsStore.addLocalTab()}
+      onPreview={(entry) => (previewEntry = entry)}
+    />
+  {/if}
 
   <section class="workspace">
     <TabStrip
-      onNewConnection={handleNewConnection}
-      onOpenLocal={() => void tabsStore.addLocalTab()}
       onCloseTab={(tabId) => void closeTabById(tabId)}
       onOpenSettings={() => {
         settingsOpen = true;
@@ -512,6 +533,7 @@
   <ConnectionDialog
     open={showDialog}
     editConnection={editingConnection}
+    editPane={editingPane}
     onClose={handleCloseDialog}
   />
 
@@ -570,6 +592,7 @@
   }
 
   .workspace {
+    grid-column: 2;
     min-width: 0;
     min-height: 0;
     display: flex;

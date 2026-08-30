@@ -93,6 +93,8 @@
     onConnected?: (sessionId: string) => void;
     onDisconnected?: () => void;
     onError?: (error: string) => void;
+    onEditConnection?: () => void;
+    onCloseTab?: () => void;
     onTitleChange?: (title: string) => void;
   }
   type TerminalMouseModifiers = Pick<
@@ -115,6 +117,8 @@
     onConnected,
     onDisconnected,
     onError,
+    onEditConnection,
+    onCloseTab,
     onTitleChange
   }: Props = $props();
 
@@ -3555,13 +3559,35 @@
     calculateSize();
   }
 
+  async function retryFailedConnection() {
+    if (destroyed || connected || reconnecting || disconnectRequested) return;
+    const didConnect = await connectNewSession();
+    if (!didConnect || destroyed) return;
+    await tick();
+    focusInput();
+  }
+
+  function isConnectionFailureStatus(message: string): boolean {
+    const lower = message.toLowerCase();
+    return (
+      lower.includes("connection failed") ||
+      lower.includes("failed to start local shell")
+    );
+  }
+
   function isErrorStatus(message: string): boolean {
     const lower = message.toLowerCase();
-    return lower.includes("connection lost") || lower.includes("connection failed");
+    return (
+      lower.includes("connection lost") ||
+      isConnectionFailureStatus(message)
+    );
   }
 
   function getStatusTitle(message: string): string {
-    if (isErrorStatus(message)) return "Connection Lost";
+    const lower = message.toLowerCase();
+    if (lower.includes("failed to start local shell")) return "Local Shell Failed";
+    if (lower.includes("connection failed")) return "Connection Failed";
+    if (lower.includes("connection lost")) return "Connection Lost";
     return "Connecting";
   }
 </script>
@@ -3588,12 +3614,44 @@
   <!-- Status message -->
   {#if statusMessage}
     <div class="status-overlay" class:error={isErrorStatus(statusMessage)}>
-      <div class="status-card">
+      <div class="status-card" role={isErrorStatus(statusMessage) ? "alert" : "status"}>
         <div class="status-header">
           <span class="status-indicator" aria-hidden="true"></span>
           <strong>{getStatusTitle(statusMessage)}</strong>
         </div>
         <div class="status-message">{statusMessage}</div>
+        {#if isConnectionFailureStatus(statusMessage)}
+          <div class="status-actions">
+            <button
+              type="button"
+              class="status-action primary"
+              onclick={(event) => {
+                event.stopPropagation();
+                void retryFailedConnection();
+              }}
+            >Retry</button>
+            {#if onEditConnection}
+              <button
+                type="button"
+                class="status-action"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  onEditConnection?.();
+                }}
+              >Edit connection</button>
+            {/if}
+            {#if onCloseTab}
+              <button
+                type="button"
+                class="status-action"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  onCloseTab?.();
+                }}
+              >Close tab</button>
+            {/if}
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
@@ -4151,6 +4209,45 @@
     font-size: 13px;
     line-height: 1.4;
     word-break: break-word;
+  }
+
+  .status-overlay.error .status-card {
+    pointer-events: auto;
+  }
+
+  .status-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 14px;
+  }
+
+  .status-action {
+    min-height: 32px;
+    padding: 6px 10px;
+    border: 1px solid rgba(255, 218, 218, 0.28);
+    border-radius: 6px;
+    background: transparent;
+    color: #ffdada;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .status-action:hover {
+    border-color: rgba(255, 218, 218, 0.58);
+    background: rgba(255, 218, 218, 0.09);
+  }
+
+  .status-action.primary {
+    border-color: #ffdada;
+    background: #ffdada;
+    color: #301212;
+  }
+
+  .status-action.primary:hover {
+    background: #ffffff;
   }
 
   .status-overlay:not(.error) .status-card {

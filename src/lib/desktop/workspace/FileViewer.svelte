@@ -23,6 +23,7 @@
     formatBytes,
     type FilePreviewKind,
   } from "./file-kinds";
+  import { modalFocus } from "./modal-focus";
 
   export interface PreviewEntry {
     name: string;
@@ -209,11 +210,6 @@
     }
   }
 
-  function handleKeydown(event: KeyboardEvent) {
-    if (event.key === "Escape") {
-      onClose();
-    }
-  }
 
   let downloading = $state(false);
   let savedHint = $state(false);
@@ -249,10 +245,15 @@
   }
 </script>
 
-<svelte:window onkeydown={entry ? handleKeydown : undefined} />
-
 {#if entry}
-  <div class="viewer-overlay" role="dialog" aria-modal="true" aria-label={entry.name}>
+  <div
+    class="viewer-overlay"
+    role="dialog"
+    aria-modal="true"
+    aria-label={entry.name}
+    tabindex="-1"
+    use:modalFocus={{ onClose }}
+  >
     <div class="viewer-backdrop" onclick={onClose} aria-hidden="true"></div>
     <div class="viewer-modal">
       <header class="viewer-header">
@@ -271,6 +272,7 @@
           <button
             class="viewer-close"
             title="Close preview"
+            data-modal-initial-focus
             aria-label="Close preview"
             onclick={onClose}
           >×</button>

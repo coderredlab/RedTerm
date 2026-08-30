@@ -244,6 +244,7 @@
         </button>
       </header>
       <div class="pane-terminal">
+        {#key pane.connection}
         <Terminal
           host={pane.connection.host}
           port={pane.connection.port}
@@ -258,10 +259,15 @@
           kind={pane.kind ?? "ssh"}
           onConnected={(sessionId) =>
             workspace.paneConnected(tabId, node.paneId, sessionId)}
+          onEditConnection={pane.kind === "local"
+            ? undefined
+            : () => workspace.editPaneConnection(tabId, node.paneId)}
+          onCloseTab={() => workspace.closeTab(tabId)}
           onDisconnected={() => workspace.paneDisconnected(tabId, node.paneId)}
           bind:this={term}
           onTitleChange={(title) => tabsStore.setPaneTitle(tabId, node.paneId, title)}
         />
+        {/key}
       </div>
       </section>
     {/key}
@@ -376,8 +382,8 @@
   }
 
   .pane-action {
-    width: 24px;
-    height: 22px;
+    width: 28px;
+    height: 28px;
     display: grid;
     place-items: center;
     border: 0;

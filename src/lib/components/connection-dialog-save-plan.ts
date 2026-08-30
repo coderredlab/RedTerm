@@ -43,7 +43,9 @@ export function buildConnectionDialogSavePlan({
   startupScript,
   startupScriptReadyText,
 }: BuildConnectionDialogSavePlanInput): ConnectionDialogSavePlan {
-  const isUsingStoredPassword = password === STORED_PASSWORD_PLACEHOLDER && Boolean(editConnection?.id);
+  const isUsingStoredPassword =
+    password === STORED_PASSWORD_PLACEHOLDER &&
+    Boolean(connectionId ?? editConnection?.id);
   const passwordToSave = authType === "password" && savePasswordChecked && !isUsingStoredPassword
     ? password
     : undefined;

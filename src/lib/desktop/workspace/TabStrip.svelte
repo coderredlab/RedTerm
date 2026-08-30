@@ -9,8 +9,6 @@
   } from "./drag-state.svelte";
 
   interface Props {
-    onNewConnection: () => void;
-    onOpenLocal: () => void;
     onCloseTab: (tabId: string) => void;
     onOpenSettings: () => void;
     onToggleSidebar: () => void;
@@ -19,8 +17,6 @@
   }
 
   let {
-    onNewConnection,
-    onOpenLocal,
     onCloseTab,
     onOpenSettings,
     onToggleSidebar,
@@ -156,6 +152,45 @@
     if (suppressClick) return;
     tabsStore.setActiveTab(tabId);
   }
+
+  function activateAndFocusTab(index: number) {
+    const tab = tabsStore.tabs[index];
+    if (!tab) return;
+
+    tabsStore.setActiveTab(tab.id);
+    requestAnimationFrame(() => {
+      stripEl
+        ?.querySelectorAll<HTMLElement>('[role="tab"]')
+        [index]?.focus();
+    });
+  }
+
+  function handleTabKeydown(event: KeyboardEvent, tabId: string, index: number) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      activate(tabId);
+      return;
+    }
+
+    const tabCount = tabsStore.tabs.length;
+    if (tabCount === 0) return;
+
+    let nextIndex = index;
+    if (event.key === "ArrowLeft") {
+      nextIndex = (index - 1 + tabCount) % tabCount;
+    } else if (event.key === "ArrowRight") {
+      nextIndex = (index + 1) % tabCount;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = tabCount - 1;
+    } else {
+      return;
+    }
+
+    event.preventDefault();
+    activateAndFocusTab(nextIndex);
+  }
 </script>
 
 <div class="tabstrip" bind:this={stripEl}>
@@ -181,19 +216,14 @@
           tabDrag.insertIndex === index}
         data-tab-id={tab.id}
         role="tab"
-        tabindex="0"
+        tabindex={tab.id === tabsStore.activeTabId ? 0 : -1}
         aria-selected={tab.id === tabsStore.activeTabId}
         onpointerdown={(event) => beginDrag(event, tab.id)}
         onclick={() => activate(tab.id)}
         onauxclick={(event) => {
           if (event.button === 1) onCloseTab(tab.id);
         }}
-        onkeydown={(event) => {
-          if (event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            activate(tab.id);
-          }
-        }}
+        onkeydown={(event) => handleTabKeydown(event, tab.id, index)}
       >
         <span
           class="connection-state"
@@ -218,15 +248,6 @@
     {/if}
   </div>
 
-  <button class="new-session" onclick={onNewConnection}>
-    <span aria-hidden="true">+</span>
-    New connection
-  </button>
-
-  <button class="local-session" title="Open a local shell" onclick={onOpenLocal}>
-    <span aria-hidden="true">&gt;_</span>
-    Local
-  </button>
 
   <button
     class="strip-action"
@@ -336,8 +357,8 @@
   }
 
   .close-tab {
-    width: 18px;
-    height: 18px;
+    width: 28px;
+    height: 28px;
     flex: 0 0 auto;
     display: grid;
     place-items: center;
@@ -371,58 +392,6 @@
     background: var(--accent-primary);
   }
 
-  .new-session {
-    flex: 0 0 auto;
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    padding: 0 16px;
-    border: 0;
-    border-left: 1px solid var(--border-primary);
-    background: transparent;
-    color: var(--text-secondary);
-    font: inherit;
-    font-size: 11px;
-    cursor: pointer;
-    transition:
-      background-color 120ms ease,
-      color 120ms ease;
-  }
-
-  .new-session span {
-    color: var(--accent-primary);
-    font-size: 17px;
-  }
-
-  .new-session:hover {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-  }
-
-  .local-session {
-    flex: 0 0 auto;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 0 14px;
-    border: 0;
-    border-left: 1px solid var(--border-primary);
-    background: transparent;
-    color: var(--text-secondary);
-    font: inherit;
-    font-size: 11px;
-    cursor: pointer;
-  }
-
-  .local-session span {
-    color: var(--status-success);
-    font-weight: 700;
-  }
-
-  .local-session:hover {
-    background: var(--bg-secondary);
-    color: var(--text-primary);
-  }
 
   .strip-action {
     flex: 0 0 auto;

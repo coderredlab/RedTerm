@@ -59,4 +59,16 @@ describe("connection dialog saved password edit planning", () => {
     expect(plan.passwordToSave).toBeUndefined();
     expect(plan.canRestorePassword).toBe(true);
   });
+
+  test("recognizes a stored credential from the pane connection id", () => {
+    const plan = buildConnectionDialogSavePlan({
+      ...storedPasswordEditInput(true),
+      editConnection: undefined,
+      connectionId: savedPasswordConnection.id,
+    });
+
+    expect(plan.connection.id).toBe(savedPasswordConnection.id);
+    expect(plan.passwordToSave).toBeUndefined();
+    expect(plan.canRestorePassword).toBe(true);
+  });
 });

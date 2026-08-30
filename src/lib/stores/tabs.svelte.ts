@@ -791,6 +791,21 @@ function createTabsStore() {
       });
     },
 
+    updatePaneConnection(
+      tabId: string,
+      paneId: string,
+      connection: PaneConnection
+    ) {
+      mutateTab(tabId, (tab) => {
+        const pane = tab.panes.find((candidate) => candidate.id === paneId);
+        if (!pane) return;
+        pane.connection = connection;
+        pane.title = paneTitle(connection);
+        pane.sessionId = null;
+        pane.runtimeInstanceId = null;
+        pane.connected = false;
+      });
+    },
     /** Split a pane in the given direction, cloning its connection target. */
     async splitPane(
       tabId: string,
