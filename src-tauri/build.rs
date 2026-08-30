@@ -2,6 +2,7 @@ fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
             "get_runtime_instance_id",
+            "get_keyboard_layout_map",
             "check_voice_input_permissions",
             "request_voice_input_permissions",
             "list_voice_input_languages",

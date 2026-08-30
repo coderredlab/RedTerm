@@ -5,6 +5,8 @@
   import { CanvasRenderer } from './CanvasRenderer';
   import {
     MAX_CLIPBOARD_IMAGE_BYTES,
+    getKeyboardLayoutMap,
+    listenKeyboardLayoutChanged,
     sshConnect,
     sshWrite,
     sshResize,
@@ -28,6 +30,7 @@
     listenLocalExit,
     type AuthConfig,
     type HostKeyCheckResult,
+    type KeyboardLayoutMap,
   } from "$lib/tauri/commands";
   import { modifiersStore } from "$lib/stores/modifiers.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
@@ -48,6 +51,12 @@
     takeRuntimeSessionSnapshot,
   } from "./session-runtime-snapshot";
   import { composeJamoSequence, HangulComposer } from "./hangul-compose";
+  import {
+    encodeKittyInputText,
+    encodeKittyKeyboardEvent,
+    resolveKittyLayoutKey,
+    type KittyKeyboardEvent,
+  } from "./kitty-keyboard";
   import type { HangulFeedResult } from "./hangul-compose";
   import { getThemeById, THEMES } from "$lib/styles/themes";
   import {
@@ -870,6 +879,58 @@
       });
     }
 
+    const applyNativeKeyboardLayout = (layout: KeyboardLayoutMap) => {
+      if (destroyed) return;
+      observedUnshiftedKeys.clear();
+      browserKeyboardLayoutMap = null;
+      nativeKeyboardLayoutMap = layout;
+    };
+    const nativeLayoutUnlisten = await listenKeyboardLayoutChanged(
+      applyNativeKeyboardLayout,
+    ).catch(() => null);
+    if (destroyed) {
+      nativeLayoutUnlisten?.();
+      return;
+    }
+    keyboardLayoutUnlisten = nativeLayoutUnlisten;
+
+    const loadNativeKeyboardLayout = async (): Promise<boolean> => {
+      const layout = await getKeyboardLayoutMap();
+      if (destroyed) return false;
+      applyNativeKeyboardLayout(layout);
+      return Object.keys(layout).length > 0;
+    };
+    keyboardLayoutApi = (
+      navigator as Navigator & { keyboard?: BrowserKeyboardApi }
+    ).keyboard ?? null;
+    const loadBrowserKeyboardLayout = async (): Promise<boolean> => {
+      if (!keyboardLayoutApi?.getLayoutMap) return false;
+      try {
+        const layout = await keyboardLayoutApi.getLayoutMap();
+        if (destroyed) return false;
+        observedUnshiftedKeys.clear();
+        browserKeyboardLayoutMap = layout;
+        nativeKeyboardLayoutMap = {};
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    keyboardLayoutChangeHandler = () => {
+      observedUnshiftedKeys.clear();
+      browserKeyboardLayoutMap = null;
+      nativeKeyboardLayoutMap = {};
+      void loadNativeKeyboardLayout().catch(() => false).then((loaded) => {
+        if (!loaded) void loadBrowserKeyboardLayout();
+      });
+    };
+    keyboardLayoutApi?.addEventListener?.("layoutchange", keyboardLayoutChangeHandler);
+    const loadedNativeKeyboardLayout = await loadNativeKeyboardLayout().catch(() => false);
+    if (!loadedNativeKeyboardLayout) {
+      await loadBrowserKeyboardLayout();
+    }
+    if (destroyed) return;
+
     // Cursor blink
     cursorInterval = window.setInterval(() => {
       if (destroyed) return;
@@ -883,6 +944,7 @@
     if (hiddenInput) {
       hiddenInput.addEventListener('input', handleInput);
       hiddenInput.addEventListener('keydown', handleKeyDown);
+      hiddenInput.addEventListener('keyup', handleKeyUp);
       hiddenInput.addEventListener('compositionstart', handleCompositionStart);
       hiddenInput.addEventListener('compositionend', handleCompositionEnd);
       pasteHandler = (e: ClipboardEvent) => {
@@ -1083,10 +1145,22 @@
   let immediateCompositionText = "";
   let compositionTimeout: number | null = null;
   const hangulComposer = new HangulComposer();
-  let pendingCommitKey: string | null = null;
+  let pendingCommitKey: { data: string; suppressPlainSpace: boolean } | null = null;
   let suppressPlainSpace = false;
   let pendingWrite = "";
   let writeFlushScheduled = false;
+  type BrowserKeyboardLayoutMap = { get(code: string): string | undefined };
+  type BrowserKeyboardApi = {
+    getLayoutMap?: () => Promise<BrowserKeyboardLayoutMap>;
+    addEventListener?: (type: "layoutchange", listener: () => void) => void;
+    removeEventListener?: (type: "layoutchange", listener: () => void) => void;
+  };
+  const observedUnshiftedKeys = new Map<string, string>();
+  let browserKeyboardLayoutMap: BrowserKeyboardLayoutMap | null = null;
+  let nativeKeyboardLayoutMap: KeyboardLayoutMap = {};
+  let keyboardLayoutApi: BrowserKeyboardApi | null = null;
+  let keyboardLayoutChangeHandler: (() => void) | null = null;
+  let keyboardLayoutUnlisten: (() => void) | null = null;
   const automaticResponseBuffer = new AutomaticResponseBuffer();
   let automaticResponseFlushScheduled = false;
   let automaticResponseGeneration = 0;
@@ -1302,6 +1376,10 @@
           terminalModesStore.setAppCursorMode(
             sessionId,
             parser.isApplicationCursorKeys(),
+          );
+          terminalModesStore.setKittyKeyboardFlags(
+            sessionId,
+            parser.getKittyKeyboardFlags(),
           );
         }
       }
@@ -1711,6 +1789,10 @@
         nextSessionId,
         parser?.isApplicationCursorKeys() ?? terminalModesStore.isAppCursorMode(nextSessionId)
       );
+      terminalModesStore.setKittyKeyboardFlags(
+        nextSessionId,
+        parser?.getKittyKeyboardFlags() ?? terminalModesStore.getKittyKeyboardFlags(nextSessionId),
+      );
       await sshResize(nextSessionId, cols, rows);
       if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
       clearSessionSnapshot(nextSessionId);
@@ -2112,6 +2194,7 @@
       statusMessage = "";
       startupScriptDispatcher = createStartupScriptDispatcher(startupScript, startupScriptReadyText);
       terminalModesStore.setAppCursorMode(nextSessionId, false);
+      terminalModesStore.setKittyKeyboardFlags(nextSessionId, 0);
       replayBufferedChunks = [];
       replayBufferedBytes = 0;
       if (!(await bindSessionListener(nextSessionId, generation))) {
@@ -2356,6 +2439,17 @@
       }
     }
     if (!replayIsActive()) return false;
+    const replaySessionId = expectedSessionId ?? sessionId;
+    if (replaySessionId) {
+      terminalModesStore.setAppCursorMode(
+        replaySessionId,
+        replayParser.isApplicationCursorKeys(),
+      );
+      terminalModesStore.setKittyKeyboardFlags(
+        replaySessionId,
+        replayParser.getKittyKeyboardFlags(),
+      );
+    }
     updateBuffer();
     return true;
   }
@@ -2743,7 +2837,12 @@
       resetTouchLongPressState();
     }
   }
-
+  function getBackspaceInputCode(): string {
+    return encodeKittyKeyboardEvent(
+      { key: "Backspace", code: "Backspace" },
+      parser?.getKittyKeyboardFlags() ?? 0,
+    ) ?? "\x7f";
+  }
   // Composition handlers for Korean/CJK input
   function handleCompositionStart() {
     isComposing = true;
@@ -2795,28 +2894,28 @@
           }
         } else if (immediateCompositionText.startsWith(data)) {
           // Composition shrank below the ASCII already sent.
-          queueWrite("\x7f".repeat(immediateCompositionText.length - data.length));
+          queueWrite(getBackspaceInputCode().repeat(immediateCompositionText.length - data.length));
           hangulComposer.breakWord();
         } else {
           // Composition replaced (e.g. candidate pick): erase, then send anew.
-          queueWrite("\x7f".repeat(immediateCompositionText.length));
+          queueWrite(getBackspaceInputCode().repeat(immediateCompositionText.length));
           writeComposed(hangulComposer.feed(data));
         }
         const pending = pendingCommitKey;
         pendingCommitKey = null;
-        if (pending) queueWrite(pending);
+        if (pending) queueWrite(pending.data);
         // WebKit may also deliver the committing space as a plain input
         // event after compositionend; drop that duplicate.
-        suppressPlainSpace = pending === " ";
+        suppressPlainSpace = pending?.suppressPlainSpace ?? false;
       } else if (data.startsWith(immediateCompositionText)) {
         const remainingText = data.slice(immediateCompositionText.length);
         if (remainingText) sendText(remainingText);
       } else if (immediateCompositionText.startsWith(data)) {
         // Composition shrank or was canceled: erase already-sent chars.
-        queueWrite("\x7f".repeat(immediateCompositionText.length - data.length));
+        queueWrite(getBackspaceInputCode().repeat(immediateCompositionText.length - data.length));
       } else {
         // Composition replaced (e.g. suggestion pick): erase, then send anew.
-        queueWrite("\x7f".repeat(immediateCompositionText.length));
+        queueWrite(getBackspaceInputCode().repeat(immediateCompositionText.length));
         sendText(data);
       }
     }
@@ -2838,10 +2937,10 @@
     // remote DELs while CJK composition is still local-only.
     if (inputEvent.inputType === "deleteContentBackward") {
       if (!isComposing) {
-        queueWrite("\x7f");
+        queueWrite(getBackspaceInputCode());
         target.value = "";
       } else if (immediateCompositionText.length > 0) {
-        queueWrite("\x7f");
+        queueWrite(getBackspaceInputCode());
         immediateCompositionText = immediateCompositionText.slice(0, -1);
         target.value = "";
       }
@@ -2887,10 +2986,10 @@
           if (nextText) sendText(nextText);
         } else if (immediateCompositionText.startsWith(text)) {
           // IME deleted composed chars (backspace reported as composition update).
-          queueWrite("\x7f".repeat(immediateCompositionText.length - text.length));
+          queueWrite(getBackspaceInputCode().repeat(immediateCompositionText.length - text.length));
         } else {
           // IME replaced the composition (e.g. suggestion pick).
-          queueWrite("\x7f".repeat(immediateCompositionText.length));
+          queueWrite(getBackspaceInputCode().repeat(immediateCompositionText.length));
           sendText(text);
         }
         immediateCompositionText = text;
@@ -2927,6 +3026,51 @@
     }
   }
 
+  function isSinglePrintableKeyboardKey(value: string): boolean {
+    const codePoint = value.codePointAt(0);
+    return codePoint !== undefined && codePoint >= 0x20 && String.fromCodePoint(codePoint) === value;
+  }
+
+  function nativeLayoutKey(event: KeyboardEvent) {
+    return resolveKittyLayoutKey(event, nativeKeyboardLayoutMap[event.code] ?? []);
+  }
+
+  function toKittyKeyboardEvent(event: KeyboardEvent): KittyKeyboardEvent {
+    const nativeLayout = event.code ? nativeLayoutKey(event) : undefined;
+    let unshiftedKey = event.code
+      ? observedUnshiftedKeys.get(event.code)
+        ?? nativeLayout?.unshifted
+        ?? browserKeyboardLayoutMap?.get(event.code)
+      : undefined;
+    const shiftedKey = event.shiftKey ? nativeLayout?.shifted ?? undefined : undefined;
+    if (
+      event.code &&
+      !event.shiftKey &&
+      !event.altKey &&
+      !event.metaKey &&
+      !event.getModifierState("CapsLock") &&
+      !event.getModifierState("NumLock") &&
+      isSinglePrintableKeyboardKey(event.key)
+    ) {
+      unshiftedKey = event.key;
+      observedUnshiftedKeys.set(event.code, event.key);
+    }
+    if ((!unshiftedKey || unshiftedKey === event.key) && !shiftedKey) return event;
+
+    return {
+      key: event.key,
+      code: event.code,
+      shiftKey: event.shiftKey,
+      altKey: event.altKey,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      repeat: event.repeat,
+      getModifierState: (key) => event.getModifierState(key),
+      unshiftedKey,
+      shiftedKey,
+    };
+  }
+
   // Handle keydown for special keys
   function handleKeyDown(e: KeyboardEvent) {
     if (!sessionId) return;
@@ -2943,7 +3087,23 @@
         (e.key === "Process" && (e.code === "Enter" || e.code === "NumpadEnter"));
       const isSpace = e.key === " " || (e.key === "Process" && e.code === "Space");
       if (isEnter || (isSpace && hangulComposer.hasActiveWord())) {
-        pendingCommitKey = isEnter ? "\r" : " ";
+        const pendingEvent = {
+          key: isEnter ? "Enter" : " ",
+          code: isEnter ? e.code : "Space",
+          shiftKey: e.shiftKey,
+          altKey: e.altKey,
+          ctrlKey: e.ctrlKey,
+          metaKey: e.metaKey,
+          repeat: e.repeat,
+          getModifierState: (key: string) => e.getModifierState(key),
+        };
+        pendingCommitKey = {
+          data: encodeKittyKeyboardEvent(
+            pendingEvent,
+            parser?.getKittyKeyboardFlags() ?? 0,
+          ) ?? (isEnter ? "\r" : " "),
+          suppressPlainSpace: isSpace,
+        };
       }
       return;
     }
@@ -2966,7 +3126,15 @@
       pendingCommitKey = null;
       suppressPlainSpace = false;
     }
-
+    const kittyKey = encodeKittyKeyboardEvent(
+      toKittyKeyboardEvent(e),
+      parser?.getKittyKeyboardFlags() ?? 0,
+    );
+    if (kittyKey) {
+      e.preventDefault();
+      queueWrite(kittyKey);
+      return;
+    }
     // Enter key
     if (e.key === "Enter") {
       e.preventDefault();
@@ -2996,7 +3164,8 @@
     }
 
     // Arrow keys
-    const appCursorMode = parser?.isApplicationCursorKeys() ?? false;    if (e.key === "ArrowUp") {
+    const appCursorMode = parser?.isApplicationCursorKeys() ?? false;
+    if (e.key === "ArrowUp") {
       e.preventDefault();
       queueWrite(getArrowKeyCode("up", appCursorMode));
       return;
@@ -3030,7 +3199,17 @@
       }
     }
   }
-
+  function handleKeyUp(e: KeyboardEvent) {
+    if (!sessionId || e.isComposing) return;
+    const kittyKey = encodeKittyKeyboardEvent(
+      toKittyKeyboardEvent(e),
+      parser?.getKittyKeyboardFlags() ?? 0,
+      "release",
+    );
+    if (!kittyKey) return;
+    e.preventDefault();
+    queueWrite(kittyKey);
+  }
   function handleWriteError(e: unknown) {
     console.error('[SSH] write failed:', e);
     if (String(e).includes('Channel closed') || String(e).includes('closed')) {
@@ -3091,20 +3270,33 @@
       sendSessionData(encoder.encode(payload));
     });
   }
+  // Apply Kitty reporting or on-screen modifiers before writing text.
+  function writeInputText(data: string) {
+    if (!data) return;
+    if (data.length === 1 && (modifiersStore.ctrlActive || modifiersStore.altActive)) {
+      const ctrlActive = modifiersStore.ctrlActive;
+      const altActive = modifiersStore.altActive;
+      const kittyKey = encodeKittyKeyboardEvent(
+        { key: data, ctrlKey: ctrlActive, altKey: altActive },
+        parser?.getKittyKeyboardFlags() ?? 0,
+      );
+      if (ctrlActive) modifiersStore.resetCtrl();
+      else modifiersStore.resetAlt();
+      if (kittyKey) {
+        queueWrite(kittyKey);
+        return;
+      }
+      data = ctrlActive ? ctrlKey(data) : altKey(data);
+    }
+
+    const kittyText = encodeKittyInputText(data, parser?.getKittyKeyboardFlags() ?? 0);
+    if (kittyText) queueWrite(kittyText);
+  }
+
   // Apply on-screen modifier state to a single composed character and write.
   function writeComposed(result: HangulFeedResult) {
-    if (result.erase > 0) queueWrite("\x7f".repeat(result.erase));
-    let data = result.send;
-    if (data.length === 1) {
-      if (modifiersStore.ctrlActive) {
-        data = ctrlKey(data);
-        modifiersStore.resetCtrl();
-      } else if (modifiersStore.altActive) {
-        data = altKey(data);
-        modifiersStore.resetAlt();
-      }
-    }
-    if (data) queueWrite(data);
+    if (result.erase > 0) queueWrite(getBackspaceInputCode().repeat(result.erase));
+    writeInputText(result.send);
   }
 
   function sendText(text: string) {
@@ -3120,20 +3312,7 @@
 
     // Mobile IMEs deliver composed text; only NFC + one-shot Jamo
     // composition is needed.
-    let data = composeJamoSequence(text.normalize("NFC"));
-
-    // Apply modifiers for single character
-    if (data.length === 1) {
-      if (modifiersStore.ctrlActive) {
-        data = ctrlKey(data);
-        modifiersStore.resetCtrl();
-      } else if (modifiersStore.altActive) {
-        data = altKey(data);
-        modifiersStore.resetAlt();
-      }
-    }
-
-    if (data) queueWrite(data);
+    writeInputText(composeJamoSequence(text.normalize("NFC")));
   }
 
   onDestroy(() => {
@@ -3187,6 +3366,13 @@
     }
 
     clearTouchLongPressTimer();
+    keyboardLayoutUnlisten?.();
+    keyboardLayoutUnlisten = null;
+    if (keyboardLayoutApi && keyboardLayoutChangeHandler) {
+      keyboardLayoutApi.removeEventListener?.("layoutchange", keyboardLayoutChangeHandler);
+    }
+    keyboardLayoutApi = null;
+    keyboardLayoutChangeHandler = null;
 
     clearSelectionFeedbackTimer();
     surfaceVisibilityObserver?.disconnect();
@@ -3226,6 +3412,7 @@
     if (hiddenInput) {
       hiddenInput.removeEventListener('input', handleInput);
       hiddenInput.removeEventListener('keydown', handleKeyDown);
+      hiddenInput.removeEventListener('keyup', handleKeyUp);
       hiddenInput.removeEventListener('compositionstart', handleCompositionStart);
       hiddenInput.removeEventListener('compositionend', handleCompositionEnd);
       if (pasteHandler) {

@@ -140,6 +140,28 @@ export async function getRuntimeInstanceId(): Promise<string> {
   return invoke<string>("get_runtime_instance_id");
 }
 
+export interface KeyboardLayoutEntry {
+  unshifted: string;
+  shifted: string | null;
+  alt_gr: string | null;
+  shifted_alt_gr: string | null;
+  other: string[];
+}
+
+export type KeyboardLayoutMap = Record<string, KeyboardLayoutEntry[]>;
+
+export async function getKeyboardLayoutMap(): Promise<KeyboardLayoutMap> {
+  return invoke<KeyboardLayoutMap>("get_keyboard_layout_map");
+}
+
+export async function listenKeyboardLayoutChanged(
+  callback: (layout: KeyboardLayoutMap) => void
+): Promise<UnlistenFn> {
+  return listen<KeyboardLayoutMap>("keyboard-layout-changed", (event) => {
+    callback(event.payload);
+  });
+}
+
 export async function sshGetSessionOutput(
   sessionId: string
 ): Promise<Array<{ seq: number; data: Uint8Array }>> {

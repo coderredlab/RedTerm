@@ -6,6 +6,11 @@
     getArrowKeyCode,
     type ExtraKey,
   } from "$lib/utils/key-mapper";
+  import {
+    encodeKittyKeyboardEvent,
+    type KittyKeyboardEvent,
+    type KittyKeyboardEventType,
+  } from "$lib/terminal/kitty-keyboard";
   import { terminalModesStore } from "$lib/stores/terminal-modes.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import { modifiersStore } from "$lib/stores/modifiers.svelte";
@@ -28,6 +33,23 @@
   const LONG_PRESS_REPEAT_MS = 80;
   const STATUS_MESSAGE_DURATION_MS = 1800;
   const backspaceKey: ExtraKey = { label: "⌫", code: "\x7f", repeatable: true };
+  const virtualKittyKeys: Record<string, KittyKeyboardEvent> = {
+    ESC: { key: "Escape", code: "Escape" },
+    HOME: { key: "Home", code: "Home" },
+    PGUP: { key: "PageUp", code: "PageUp" },
+    "↑": { key: "ArrowUp", code: "ArrowUp" },
+    PGDN: { key: "PageDown", code: "PageDown" },
+    "/": { key: "/", code: "Slash" },
+    TAB: { key: "Tab", code: "Tab" },
+    END: { key: "End", code: "End" },
+    INS: { key: "Insert", code: "Insert" },
+    DEL: { key: "Delete", code: "Delete" },
+    "←": { key: "ArrowLeft", code: "ArrowLeft" },
+    "↓": { key: "ArrowDown", code: "ArrowDown" },
+    "→": { key: "ArrowRight", code: "ArrowRight" },
+    ENTER: { key: "Enter", code: "Enter" },
+    "⌫": { key: "Backspace", code: "Backspace" },
+  };
   let repeatDelayTimer: number | null = null;
   let repeatInterval: number | null = null;
   let repeatingKey: ExtraKey | null = null;
@@ -65,27 +87,53 @@
     return key.label !== "CTRL" && key.label !== "ALT";
   }
 
-  function handleKeyPress(key: ExtraKey) {
-    // Handle modifiers - 토글만
-    if (key.label === "CTRL") {
+  function virtualKittyEvent(key: ExtraKey, rawCode: string): KittyKeyboardEvent | null {
+    const mapped = virtualKittyKeys[key.label];
+    if (mapped) return mapped;
+    if (/^F(?:[1-9]|[12]\d|3[0-5])$/.test(key.label)) {
+      return { key: key.label, code: key.label };
+    }
+    const controlCode = rawCode.length === 1 ? rawCode.charCodeAt(0) : 0;
+    if (key.label.length === 1 && controlCode >= 1 && controlCode <= 26) {
+      return {
+        key: key.label.toLowerCase(),
+        code: "Key" + key.label.toUpperCase(),
+        ctrlKey: true,
+      };
+    }
+    return null;
+  }
+
+  function handleKeyPress(key: ExtraKey, eventType: KittyKeyboardEventType = "press") {
+    if (eventType === "press" && key.label === "CTRL") {
       modifiersStore.toggleCtrl();
       return;
     }
 
-    if (key.label === "ALT") {
+    if (eventType === "press" && key.label === "ALT") {
       modifiersStore.toggleAlt();
       return;
     }
 
-    // Get the key code
     const rawCode = typeof key.code === "function" ? key.code() : key.code;
     const activeTab = tabsStore.activeTab;
-    const code = resolveArrowKeyCode(key.label, activeTab?.sessionId, rawCode);
-
-    // ExtraKeysBar 키는 modifier 적용 안 함 (ESC, TAB, 방향키 등은 그대로 전송)
-    if (code) {
-      sendKey(code);
+    const sessionId = activeTab?.sessionId;
+    const virtualEvent = virtualKittyEvent(key, rawCode);
+    const kittyCode = virtualEvent
+      ? encodeKittyKeyboardEvent(
+          virtualEvent,
+          terminalModesStore.getKittyKeyboardFlags(sessionId),
+          eventType,
+        )
+      : null;
+    if (kittyCode) {
+      sendKey(kittyCode);
+      return;
     }
+    if (eventType === "release") return;
+
+    const code = resolveArrowKeyCode(key.label, sessionId, rawCode);
+    if (code) sendKey(code);
   }
 
   function clearRepeatTimers() {
@@ -166,7 +214,7 @@
   function handlePointerDown(key: ExtraKey, e: PointerEvent) {
     e.preventDefault();
     clearRepeatTimers();
-    handleKeyPress(key);
+    handleKeyPress(key, "press");
 
     if (!canRepeat(key)) return;
 
@@ -179,15 +227,16 @@
 
     repeatDelayTimer = window.setTimeout(() => {
       if (!repeatingKey) return;
-      handleKeyPress(repeatingKey);
+      handleKeyPress(repeatingKey, "repeat");
       repeatInterval = window.setInterval(() => {
         if (!repeatingKey) return;
-        handleKeyPress(repeatingKey);
+        handleKeyPress(repeatingKey, "repeat");
       }, LONG_PRESS_REPEAT_MS);
     }, LONG_PRESS_DELAY_MS);
   }
 
   function handlePointerEnd() {
+    if (repeatingKey) handleKeyPress(repeatingKey, "release");
     clearRepeatTimers();
   }
 

@@ -164,7 +164,67 @@ describe("AnsiParser unsupported string controls", () => {
     });
   }
 });
+describe("AnsiParser Kitty keyboard protocol", () => {
+  test("queries and applies progressive enhancement flags", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
 
+    parser.write("\x1b[?u\x1b[=3u\x1b[=4;2u\x1b[=2;3u\x1b[?u");
+
+    expect(responses).toEqual(["\x1b[?0u", "\x1b[?5u"]);
+    expect(parser.getKittyKeyboardFlags()).toBe(5);
+
+    parser.write("\x1b[=63u\x1b[=bad;1u");
+    expect(parser.getKittyKeyboardFlags()).toBe(31);
+  });
+
+  test("pushes and pops bounded keyboard mode state", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write("\x1b[=5u\x1b[>9u\x1b[>3u\x1b[<u");
+    expect(parser.getKittyKeyboardFlags()).toBe(9);
+    parser.write("\x1b[<2u");
+    expect(parser.getKittyKeyboardFlags()).toBe(0);
+
+    const exactPop = new AnsiParser(20, 3);
+    exactPop.write("\x1b[=5u\x1b[>9u\x1b[<u");
+    expect(exactPop.getKittyKeyboardFlags()).toBe(0);
+    expect(exactPop.createSnapshot().kittyKeyboard?.mainStack).toHaveLength(0);
+
+    for (let flags = 1; flags <= 65; flags++) parser.write(`\x1b[>${flags}u`);
+    expect(parser.createSnapshot().kittyKeyboard?.mainStack).toHaveLength(64);
+
+    parser.write("\x1b[<2147483647u");
+    expect(parser.getKittyKeyboardFlags()).toBe(0);
+    expect(parser.createSnapshot().kittyKeyboard?.mainStack).toHaveLength(0);
+  });
+
+  test("keeps main and alternate screen keyboard stacks independent", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write("\x1b[=1u\x1b[?1049h");
+    expect(parser.getKittyKeyboardFlags()).toBe(0);
+    parser.write("\x1b[>10u\x1b[?1049l");
+    expect(parser.getKittyKeyboardFlags()).toBe(1);
+    parser.write("\x1b[?1049h");
+    expect(parser.getKittyKeyboardFlags()).toBe(10);
+    parser.write("\x1b[<u");
+    expect(parser.getKittyKeyboardFlags()).toBe(0);
+  });
+
+  test("restores both keyboard mode stacks from snapshots", () => {
+    const source = new AnsiParser(20, 3);
+    source.write("\x1b[=1u\x1b[>3u\x1b[?1049h\x1b[=8u");
+
+    const restored = new AnsiParser(20, 3);
+    restored.restoreSnapshot(source.createSnapshot());
+    expect(restored.getKittyKeyboardFlags()).toBe(8);
+    restored.write("\x1b[?1049l");
+    expect(restored.getKittyKeyboardFlags()).toBe(3);
+    restored.write("\x1b[<u");
+    expect(restored.getKittyKeyboardFlags()).toBe(0);
+    expect(restored.createSnapshot().kittyKeyboard?.mainStack).toHaveLength(0);
+  });
+});
 describe("AnsiParser terminal capabilities and SGR", () => {
   test("advertises Sixel support in primary device attributes only", () => {
     const parser = new AnsiParser(20, 3);

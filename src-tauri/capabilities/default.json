@@ -10,6 +10,7 @@
     "opener:allow-default-urls",
     "dialog:allow-open",
     "allow-get-runtime-instance-id",
+    "allow-get-keyboard-layout-map",
     "allow-check-voice-input-permissions",
     "allow-request-voice-input-permissions",
     "allow-list-voice-input-languages",

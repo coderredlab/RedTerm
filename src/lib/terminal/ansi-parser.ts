@@ -4,6 +4,10 @@ import { convertIndexedToRgb, decode as decodePngBytes, type DecodedPng } from '
 import { Unzlib } from 'fflate';
 import { decodeSixel } from './sixel-decoder';
 import { kittyDiacriticIndex } from './kitty-placeholder';
+import {
+  KITTY_KEYBOARD_STACK_LIMIT,
+  KITTY_KEYBOARD_SUPPORTED_FLAGS,
+} from './kitty-keyboard';
 
 export interface TextStyle {
   fg: string | null;
@@ -239,6 +243,12 @@ export interface TerminalSnapshot {
   synchronizedOutput?: boolean;
   sgrMouseEncoding?: boolean;
   usingAlternateScreen: boolean;
+  kittyKeyboard?: {
+    mainFlags: number;
+    alternateFlags: number;
+    mainStack: number[];
+    alternateStack: number[];
+  };
   scrollTop: number;
   scrollBottom: number;
   outputOffset: number;
@@ -463,6 +473,10 @@ export class AnsiParser {
   private savedCursor = { x: 0, y: 0 };
   private lastPrintedChar = ' '; // CSI b (REP) 용
   private applicationCursorKeys = false;
+  private kittyKeyboardMainFlags = 0;
+  private kittyKeyboardAlternateFlags = 0;
+  private kittyKeyboardMainStack: number[] = [];
+  private kittyKeyboardAlternateStack: number[] = [];
   private bracketedPasteMode = false;
   private cursorVisible = true;
   private usingAlternateScreen = false;
@@ -3498,6 +3512,7 @@ export class AnsiParser {
   private handleCSI(seq: string) {
     const command = seq[seq.length - 1];
     const rawParams = seq.slice(0, -1);
+    if (command === 'u' && this.handleKittyKeyboardProtocol(rawParams)) return;
     const isPrivateMode = rawParams.startsWith('?');
     const isSecondaryDeviceAttributes = rawParams.startsWith('>');
     const normalizedParams = isPrivateMode || isSecondaryDeviceAttributes ? rawParams.slice(1) : rawParams;
@@ -3628,7 +3643,81 @@ export class AnsiParser {
         break;
     }
   }
+  private normalizeKittyKeyboardFlags(value: unknown): number {
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+      ? value & KITTY_KEYBOARD_SUPPORTED_FLAGS
+      : 0;
+  }
 
+  private currentKittyKeyboardStack(): number[] {
+    return this.usingAlternateScreen
+      ? this.kittyKeyboardAlternateStack
+      : this.kittyKeyboardMainStack;
+  }
+
+  private setKittyKeyboardFlags(flags: number) {
+    if (this.usingAlternateScreen) this.kittyKeyboardAlternateFlags = flags;
+    else this.kittyKeyboardMainFlags = flags;
+  }
+
+  private parseKittyKeyboardParameter(value: string, fallback: number): number | null {
+    if (value === '') return fallback;
+    if (!/^\d+$/.test(value)) return null;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? Math.min(parsed, MAX_CSI_PARAMETER) : null;
+  }
+
+  private handleKittyKeyboardProtocol(rawParams: string): boolean {
+    const prefix = rawParams[0];
+    if (prefix !== '?' && prefix !== '=' && prefix !== '>' && prefix !== '<') return false;
+
+    const body = rawParams.slice(1);
+    if (prefix === '?') {
+      if (body === '') this.onResponse?.(`\x1b[?${this.getKittyKeyboardFlags()}u`);
+      return true;
+    }
+
+    const fields = body.split(';');
+    if (prefix === '=') {
+      if (fields.length > 2) return true;
+      const requested = this.parseKittyKeyboardParameter(fields[0], 0);
+      const mode = this.parseKittyKeyboardParameter(fields[1] ?? '', 1);
+      if (requested === null || mode === null || mode < 1 || mode > 3) return true;
+
+      const flags = requested & KITTY_KEYBOARD_SUPPORTED_FLAGS;
+      const current = this.getKittyKeyboardFlags();
+      this.setKittyKeyboardFlags(
+        mode === 1 ? flags : mode === 2 ? current | flags : current & ~flags,
+      );
+      return true;
+    }
+
+    if (fields.length > 1) return true;
+    if (prefix === '>') {
+      const requested = this.parseKittyKeyboardParameter(fields[0], 0);
+      if (requested === null) return true;
+      const stack = this.currentKittyKeyboardStack();
+      if (stack.length === KITTY_KEYBOARD_STACK_LIMIT) stack.shift();
+      stack.push(this.getKittyKeyboardFlags());
+      this.setKittyKeyboardFlags(requested & KITTY_KEYBOARD_SUPPORTED_FLAGS);
+      return true;
+    }
+
+    const count = this.parseKittyKeyboardParameter(fields[0], 1);
+    if (count === null) return true;
+    const stack = this.currentKittyKeyboardStack();
+    if (count > 0 && count >= stack.length) {
+      stack.length = 0;
+      this.setKittyKeyboardFlags(0);
+      return true;
+    }
+
+
+    let flags = this.getKittyKeyboardFlags();
+    for (let index = 0; index < count; index++) flags = stack.pop()!;
+    this.setKittyKeyboardFlags(flags);
+    return true;
+  }
   private handlePrivateMode(params: number[], enabled: boolean) {
     for (const mode of params) {
       if (mode === 1) {
@@ -4545,6 +4634,12 @@ export class AnsiParser {
     return this.applicationCursorKeys;
   }
 
+  getKittyKeyboardFlags(): number {
+    return this.usingAlternateScreen
+      ? this.kittyKeyboardAlternateFlags
+      : this.kittyKeyboardMainFlags;
+  }
+
   isBracketedPasteMode(): boolean {
     return this.bracketedPasteMode;
   }
@@ -4684,6 +4779,12 @@ export class AnsiParser {
       mouseMode: this.mouseMode,
       sgrMouseEncoding: this.sgrMouseEncoding,
       usingAlternateScreen: this.usingAlternateScreen,
+      kittyKeyboard: {
+        mainFlags: this.kittyKeyboardMainFlags,
+        alternateFlags: this.kittyKeyboardAlternateFlags,
+        mainStack: [...this.kittyKeyboardMainStack],
+        alternateStack: [...this.kittyKeyboardAlternateStack],
+      },
       scrollTop: this.scrollTop,
       scrollBottom: this.scrollBottom,
       outputOffset: 0,
@@ -5064,6 +5165,19 @@ export class AnsiParser {
     this.cursorVisible = snapshot.cursorVisible ?? true;
     this.synchronizedOutput = snapshot.synchronizedOutput ?? false;
     this.usingAlternateScreen = snapshot.usingAlternateScreen;
+    const kittyKeyboard = snapshot.kittyKeyboard;
+    this.kittyKeyboardMainFlags = this.normalizeKittyKeyboardFlags(kittyKeyboard?.mainFlags);
+    this.kittyKeyboardAlternateFlags = this.normalizeKittyKeyboardFlags(kittyKeyboard?.alternateFlags);
+    this.kittyKeyboardMainStack = Array.isArray(kittyKeyboard?.mainStack)
+      ? kittyKeyboard.mainStack
+          .slice(-KITTY_KEYBOARD_STACK_LIMIT)
+          .map((flags) => this.normalizeKittyKeyboardFlags(flags))
+      : [];
+    this.kittyKeyboardAlternateStack = Array.isArray(kittyKeyboard?.alternateStack)
+      ? kittyKeyboard.alternateStack
+          .slice(-KITTY_KEYBOARD_STACK_LIMIT)
+          .map((flags) => this.normalizeKittyKeyboardFlags(flags))
+      : [];
     this.scrollTop = Math.min(this.rows - 1, Math.max(0, snapshot.scrollTop));
     this.scrollBottom = Math.min(this.rows - 1, Math.max(this.scrollTop, snapshot.scrollBottom));
 

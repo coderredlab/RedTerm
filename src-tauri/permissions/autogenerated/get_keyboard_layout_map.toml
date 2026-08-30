@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-get-keyboard-layout-map"
+description = "Enables the get_keyboard_layout_map command without any pre-configured scope."
+commands.allow = ["get_keyboard_layout_map"]
+
+[[permission]]
+identifier = "deny-get-keyboard-layout-map"
+description = "Denies the get_keyboard_layout_map command without any pre-configured scope."
+commands.deny = ["get_keyboard_layout_map"]
