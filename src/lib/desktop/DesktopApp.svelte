@@ -107,7 +107,7 @@
       .find((candidate) => candidate.id === paneId);
     try {
       if (terminal?.disconnect) {
-        await terminal.disconnect();
+        await terminal.disconnect(pane?.sessionId ?? undefined);
       } else if (pane?.sessionId) {
         if (pane.kind === "local") await localShellDisconnect(pane.sessionId);
         else await sshDisconnect(pane.sessionId);

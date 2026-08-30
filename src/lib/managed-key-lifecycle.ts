@@ -1,8 +1,10 @@
 import { connectionsStore } from "$lib/stores/connections.svelte";
 import { tabsStore, type Pane } from "$lib/stores/tabs.svelte";
 import {
+  acknowledgeUploadedSshKey,
   deleteUploadedSshKey,
   loadConnections,
+  listPendingUploadedSshKeys,
   type SavedConnection,
 } from "$lib/tauri/commands";
 
@@ -114,7 +116,12 @@ async function flushPendingCleanup(): Promise<void> {
       (connection) => connection.key_id === keyId
     );
     if (paneUsesManagedKey(keyId) || usedBySavedConnection) {
-      completed.add(keyId);
+      try {
+        await acknowledgeUploadedSshKey(keyId);
+        completed.add(keyId);
+      } catch (error) {
+        console.error("Failed to acknowledge referenced SSH key:", error);
+      }
       continue;
     }
 
@@ -182,5 +189,12 @@ export function cleanupUnreferencedManagedKeys(
 }
 
 export function retryPendingManagedKeyCleanup(): Promise<void> {
-  return enqueueCleanup(flushPendingCleanup);
+  return enqueueCleanup(async () => {
+    try {
+      stageManagedKeyCleanup(await listPendingUploadedSshKeys());
+    } catch (error) {
+      console.error("Failed to list pending SSH key uploads:", error);
+    }
+    await flushPendingCleanup();
+  });
 }

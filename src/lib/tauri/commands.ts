@@ -231,6 +231,14 @@ export async function deleteUploadedSshKey(keyId: string): Promise<void> {
   return invoke("delete_uploaded_ssh_key", { keyId });
 }
 
+export async function listPendingUploadedSshKeys(): Promise<string[]> {
+  return invoke<string[]>("list_pending_uploaded_ssh_keys");
+}
+
+export async function acknowledgeUploadedSshKey(keyId: string): Promise<void> {
+  return invoke("acknowledge_uploaded_ssh_key", { keyId });
+}
+
 export async function listenSshData(
   sessionId: string,
   callback: (data: Uint8Array, seq: number) => void

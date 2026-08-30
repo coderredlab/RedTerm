@@ -220,7 +220,7 @@
     const tab = tabsStore.getTab(tabId);
     if (terminal?.disconnect) {
       try {
-        await terminal.disconnect();
+        await terminal.disconnect(tab?.sessionId ?? undefined);
       } catch (e) {
         console.error("Tab disconnect error:", e);
       }

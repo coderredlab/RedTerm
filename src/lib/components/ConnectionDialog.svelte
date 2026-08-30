@@ -15,7 +15,6 @@
   import { modalFocus } from "$lib/desktop/workspace/modal-focus";
   import {
     cleanupUnreferencedManagedKeys,
-    stageManagedKeyCleanup,
     retainPendingManagedKey,
   } from "$lib/managed-key-lifecycle";
   import { buildConnectionAuthPlan } from "./connection-auth-plan";
@@ -248,6 +247,9 @@
       editPane: editPane ? { ...editPane } : undefined,
     };
     const submissionKeyLease = selectedKeyLease;
+    let replacedSavedKeyLease:
+      | { keyId: string; release: () => void }
+      | undefined;
 
     error = null;
     connecting = true;
@@ -335,7 +337,10 @@
           previousSavedKeyId !== savePlan.connection.key_id
         ) {
           replacedSavedKeyId = previousSavedKeyId;
-          stageManagedKeyCleanup([previousSavedKeyId]);
+          replacedSavedKeyLease = {
+            keyId: previousSavedKeyId,
+            release: retainPendingManagedKey(previousSavedKeyId),
+          };
         }
         await connectionsStore.save(savePlan.connection, savePlan.passwordToSave);
       }
@@ -431,6 +436,8 @@
       const activeKeyId =
         submission.authType === "key" ? submission.keyId : undefined;
       if (replacedSavedKeyId) {
+        replacedSavedKeyLease?.release();
+        replacedSavedKeyLease = undefined;
         await cleanupUnreferencedManagedKeys([replacedSavedKeyId]);
       }
       if (previousPaneKeyId && previousPaneKeyId !== activeKeyId) {
@@ -450,6 +457,12 @@
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
+      if (replacedSavedKeyLease) {
+        const pendingLease = replacedSavedKeyLease;
+        replacedSavedKeyLease = undefined;
+        pendingLease.release();
+        await cleanupUnreferencedManagedKeys([pendingLease.keyId]);
+      }
       connecting = false;
     }
   }

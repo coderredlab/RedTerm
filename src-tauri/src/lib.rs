@@ -20,7 +20,8 @@ use commands::{
     RuntimeState, SessionManager,
 };
 use storage::{
-    delete_connection, delete_uploaded_ssh_key, load_connections, save_connection, upload_ssh_key,
+    acknowledge_uploaded_ssh_key, delete_connection, delete_uploaded_ssh_key,
+    list_pending_uploaded_ssh_keys, load_connections, save_connection, upload_ssh_key,
 };
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -91,6 +92,8 @@ pub fn run() {
             ssh_check_host_key,
             save_connection,
             delete_uploaded_ssh_key,
+            list_pending_uploaded_ssh_keys,
+            acknowledge_uploaded_ssh_key,
             delete_connection,
             ssh_trust_host_key,
             list_known_hosts,

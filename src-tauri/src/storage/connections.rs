@@ -369,6 +369,11 @@ fn managed_ssh_key_metadata_path(keys_dir: &Path, key_id: &str) -> Result<PathBu
     Ok(keys_dir.join(format!("{key_id}.json")))
 }
 
+fn managed_ssh_key_pending_path(keys_dir: &Path, key_id: &str) -> Result<PathBuf, String> {
+    validate_managed_ssh_key_id(key_id)?;
+    Ok(keys_dir.join(format!("{key_id}.pending.json")))
+}
+
 fn resolve_managed_ssh_key_path(
     keys_dir: &Path,
     key_id: &str,
@@ -428,6 +433,41 @@ fn managed_ssh_key_usage(keys_dir: &Path) -> Result<(usize, u64), String> {
     Ok((key_count, total_bytes))
 }
 
+fn list_pending_uploaded_ssh_key_ids(keys_dir: &Path) -> Result<Vec<String>, String> {
+    let mut pending = Vec::new();
+    for entry in fs::read_dir(keys_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let Some(key_id) = file_name.strip_suffix(".pending.json") else {
+            continue;
+        };
+        let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err("Managed SSH key pending marker is invalid".to_string());
+        }
+        validate_managed_ssh_key_id(key_id)?;
+        pending.push(key_id.to_string());
+    }
+    pending.sort();
+    Ok(pending)
+}
+
+fn acknowledge_uploaded_ssh_key_file(keys_dir: &Path, key_id: &str) -> Result<(), String> {
+    let pending_path = managed_ssh_key_pending_path(keys_dir, key_id)?;
+    match fs::symlink_metadata(&pending_path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(pending_path).map_err(|e| e.to_string())?;
+        }
+        Ok(_) => return Err("Managed SSH key pending marker is invalid".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    Ok(())
+}
+
 fn delete_managed_ssh_key_file(app: &AppHandle, key_id: &str) -> Result<(), String> {
     let _guard = SSH_KEY_STORE_LOCK
         .lock()
@@ -435,7 +475,8 @@ fn delete_managed_ssh_key_file(app: &AppHandle, key_id: &str) -> Result<(), Stri
     let keys_dir = get_ssh_keys_dir(app)?;
     let key_path = managed_ssh_key_path(&keys_dir, key_id)?;
     let metadata_path = managed_ssh_key_metadata_path(&keys_dir, key_id)?;
-    for path in [key_path, metadata_path] {
+    let pending_path = managed_ssh_key_pending_path(&keys_dir, key_id)?;
+    for path in [key_path, metadata_path, pending_path] {
         match fs::symlink_metadata(&path) {
             Ok(metadata)
                 if metadata.file_type().is_file() && !metadata.file_type().is_symlink() =>
@@ -501,15 +542,38 @@ fn store_uploaded_ssh_key(
 
     let key_path = managed_ssh_key_path(keys_dir, &key_id)?;
     let metadata_path = managed_ssh_key_metadata_path(keys_dir, &key_id)?;
+    let pending_path = managed_ssh_key_pending_path(keys_dir, &key_id)?;
+
+    let mut pending_options = OpenOptions::new();
+    pending_options.write(true).create_new(true);
+    #[cfg(unix)]
+    pending_options.mode(0o600);
+    let pending_file = pending_options
+        .open(&pending_path)
+        .map_err(|e| e.to_string())?;
+    if let Err(error) = pending_file.sync_all() {
+        drop(pending_file);
+        let _ = fs::remove_file(&pending_path);
+        return Err(error.to_string());
+    }
+    drop(pending_file);
+
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
 
-    let mut key_file = options.open(&key_path).map_err(|e| e.to_string())?;
+    let mut key_file = match options.open(&key_path) {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(&pending_path);
+            return Err(error.to_string());
+        }
+    };
     if let Err(error) = key_file.write_all(data) {
         drop(key_file);
         let _ = fs::remove_file(&key_path);
+        let _ = fs::remove_file(&pending_path);
         return Err(error.to_string());
     }
     drop(key_file);
@@ -524,6 +588,7 @@ fn store_uploaded_ssh_key(
     if let Err(error) = metadata_result {
         let _ = fs::remove_file(&key_path);
         let _ = fs::remove_file(&metadata_path);
+        let _ = fs::remove_file(&pending_path);
         return Err(error.to_string());
     }
 
@@ -552,6 +617,24 @@ pub fn upload_ssh_key(
 #[tauri::command]
 pub fn delete_uploaded_ssh_key(app: AppHandle, key_id: String) -> Result<(), String> {
     delete_managed_ssh_key_file(&app, &key_id)
+}
+
+#[tauri::command]
+pub fn list_pending_uploaded_ssh_keys(app: AppHandle) -> Result<Vec<String>, String> {
+    let _guard = SSH_KEY_STORE_LOCK
+        .lock()
+        .map_err(|_| "Managed SSH key store lock was poisoned".to_string())?;
+    let keys_dir = get_ssh_keys_dir(&app)?;
+    list_pending_uploaded_ssh_key_ids(&keys_dir)
+}
+
+#[tauri::command]
+pub fn acknowledge_uploaded_ssh_key(app: AppHandle, key_id: String) -> Result<(), String> {
+    let _guard = SSH_KEY_STORE_LOCK
+        .lock()
+        .map_err(|_| "Managed SSH key store lock was poisoned".to_string())?;
+    let keys_dir = get_ssh_keys_dir(&app)?;
+    acknowledge_uploaded_ssh_key_file(&keys_dir, &key_id)
 }
 
 fn validate_saved_connection(
@@ -885,6 +968,15 @@ mod tests {
             "deploy",
         )
         .expect("failed to store managed key fixture");
+
+        assert_eq!(
+            list_pending_uploaded_ssh_key_ids(&keys_dir).unwrap(),
+            vec![uploaded.key_id.clone()]
+        );
+        acknowledge_uploaded_ssh_key_file(&keys_dir, &uploaded.key_id).unwrap();
+        assert!(list_pending_uploaded_ssh_key_ids(&keys_dir)
+            .unwrap()
+            .is_empty());
 
         let resolved =
             resolve_managed_ssh_key_path(&keys_dir, &uploaded.key_id, "example.com", 22, "deploy")

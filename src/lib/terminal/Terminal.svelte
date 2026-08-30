@@ -3478,13 +3478,13 @@
     }
   }
 
-  export async function disconnect() {
+  export async function disconnect(fallbackSessionId?: string) {
     connectionGeneration++;
     if (hostKeyPromptResolver) resolveHostKeyPrompt("cancel");
     if (keyPassphrasePromptResolver) resolveKeyPassphrasePrompt(null);
     disconnectRequested = true;
 
-    const activeSessionId = sessionId;
+    const activeSessionId = sessionId ?? fallbackSessionId ?? null;
     sessionId = null;
     connected = false;
     pendingWrite = "";

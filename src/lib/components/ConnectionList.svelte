@@ -6,7 +6,7 @@
   import {
     cleanupUnreferencedManagedKeys,
     retryPendingManagedKeyCleanup,
-    stageManagedKeyCleanup,
+    retainPendingManagedKey,
   } from "$lib/managed-key-lifecycle";
 
   interface Props {
@@ -77,19 +77,29 @@
     if (!confirm(`Delete "${connection.name}"?`)) return;
 
     deletingId = connection.id;
-    if (connection.key_id) {
-      stageManagedKeyCleanup([connection.key_id]);
-    }
+    let keyLease = connection.key_id
+      ? {
+          keyId: connection.key_id,
+          release: retainPendingManagedKey(connection.key_id),
+        }
+      : undefined;
     try {
       await connectionsStore.delete(connection.id);
       tabsStore.detachSavedConnection(connection.id);
+      if (keyLease) {
+        keyLease.release();
+        keyLease = undefined;
+      }
       if (connection.key_id) {
         await cleanupUnreferencedManagedKeys([connection.key_id]);
       }
     } catch {
+      keyLease?.release();
+      keyLease = undefined;
       await retryPendingManagedKeyCleanup();
       // The store exposes the backend error for the inline alert below.
     } finally {
+      keyLease?.release();
       deletingId = null;
     }
   }
