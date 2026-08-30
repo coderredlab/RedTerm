@@ -65,6 +65,17 @@ export function ctrlKey(char: string): string {
   return "";
 }
 
+type BackspaceModifiers = Pick<
+  KeyboardEvent,
+  "ctrlKey" | "altKey" | "metaKey" | "shiftKey"
+>;
+
+export function getBackspaceKeyCode(modifiers: BackspaceModifiers): string {
+  const controlOnly =
+    modifiers.ctrlKey && !modifiers.altKey && !modifiers.metaKey && !modifiers.shiftKey;
+  return controlOnly ? ctrlKey("W") : KeyCodes.BACKSPACE;
+}
+
 // Alt key combinations (ESC + char)
 export function altKey(char: string): string {
   return "\x1b" + char;

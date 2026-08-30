@@ -32,7 +32,7 @@
   import { modifiersStore } from "$lib/stores/modifiers.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import { terminalModesStore } from "$lib/stores/terminal-modes.svelte";
-  import { ctrlKey, altKey, getArrowKeyCode } from "$lib/utils/key-mapper";
+  import { ctrlKey, altKey, getArrowKeyCode, getBackspaceKeyCode } from "$lib/utils/key-mapper";
   import { settingsStore } from "$lib/stores/settings.svelte";
   import { createStartupScriptDispatcher, type StartupScriptDispatcher } from "./startup-script";
   import { findUrlAtCell, validateTerminalUrl, type SafeTerminalUrl } from "./terminal-links";
@@ -2977,7 +2977,7 @@
     // Backspace
     if (e.key === "Backspace") {
       e.preventDefault();
-      queueWrite("\x7f");
+      queueWrite(getBackspaceKeyCode(e));
       return;
     }
 
