@@ -845,15 +845,53 @@ function createTabsStore() {
         });
       }
     },
+    detachManagedKeyReferences(connectionId: string, keyId: string) {
+      for (const tab of [...tabs]) {
+        if (
+          !tab.panes.some((pane) => {
+            const method = pane.connection.auth.method;
+            return (
+              pane.connection.connectionId === connectionId &&
+              method.type === "key" &&
+              method.key_id === keyId
+            );
+          })
+        ) {
+          continue;
+        }
+
+        mutateTab(tab.id, (candidate) => {
+          for (const pane of candidate.panes) {
+            const method = pane.connection.auth.method;
+            if (
+              pane.connection.connectionId !== connectionId ||
+              method.type !== "key" ||
+              method.key_id !== keyId
+            ) {
+              continue;
+            }
+            pane.connection.connectionId = undefined;
+            pane.connection.saveConnection = false;
+            pane.connection.savePassword = false;
+            pane.connection.canRestorePassword = false;
+          }
+        });
+      }
+    },
     replaceManagedKeyReferences(
       keyId: string,
       replacement: PaneConnection
     ) {
+      if (!replacement.connectionId) return;
       for (const tab of [...tabs]) {
         if (
           !tab.panes.some((pane) => {
             const currentMethod = pane.connection.auth.method;
-            return currentMethod.type === "key" && currentMethod.key_id === keyId;
+            return (
+              pane.connection.connectionId === replacement.connectionId &&
+              currentMethod.type === "key" &&
+              currentMethod.key_id === keyId
+            );
           })
         ) {
           continue;
@@ -862,7 +900,11 @@ function createTabsStore() {
         mutateTab(tab.id, (candidate) => {
           for (const pane of candidate.panes) {
             const currentMethod = pane.connection.auth.method;
-            if (currentMethod.type !== "key" || currentMethod.key_id !== keyId) {
+            if (
+              pane.connection.connectionId !== replacement.connectionId ||
+              currentMethod.type !== "key" ||
+              currentMethod.key_id !== keyId
+            ) {
               continue;
             }
             Object.assign(pane.connection, {
@@ -919,20 +961,25 @@ function createTabsStore() {
     },
 
     /** Close a pane; closes the tab when it holds the last pane. */
-    async closePane(tabId: string, paneId: string) {
+    async closePane(tabId: string, paneId: string): Promise<Pane | null> {
       const tab = tabs.find((candidate) => candidate.id === tabId);
-      if (!tab) return;
-      if (!tab.panes.some((pane) => pane.id === paneId)) return;
+      if (!tab) return null;
+      const removedPane = tab.panes.find((pane) => pane.id === paneId);
+      if (!removedPane) return null;
 
       const remaining = tab.panes.filter((pane) => pane.id !== paneId);
       if (remaining.length === 0) {
         this.removeTab(tabId);
-        return;
+        return removedPane;
       }
 
+      let removedAtMutation: Pane | null = null;
       await withPreservedLayout([tabId], () => {
         const candidate = tabs.find((entry) => entry.id === tabId);
         if (!candidate) return;
+        removedAtMutation =
+          candidate.panes.find((pane) => pane.id === paneId) ?? null;
+        if (!removedAtMutation) return;
         candidate.panes = candidate.panes.filter(
           (pane) => pane.id !== paneId
         );
@@ -947,6 +994,7 @@ function createTabsStore() {
         }
         syncTabFromPanes(candidate);
       });
+      return removedAtMutation;
     },
 
     /**

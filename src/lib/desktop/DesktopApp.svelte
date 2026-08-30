@@ -126,8 +126,8 @@
         );
         if (verdict === "keep") continue;
         if (verdict === "remove") {
-          const keyIds = transientManagedKeyIds([pane]);
-          await tabsStore.closePane(tab.id, pane.id);
+          const removedPane = await tabsStore.closePane(tab.id, pane.id);
+          const keyIds = transientManagedKeyIds(removedPane ? [removedPane] : []);
           await cleanupUnreferencedManagedKeys(keyIds);
           continue;
         }
@@ -200,10 +200,11 @@
   async function closeTabById(tabId: string) {
     const tab = tabsStore.getTab(tabId);
     if (!tab) return;
-    const keyIds = transientManagedKeyIds(tab.panes);
     for (const pane of tab.panes) {
       await disconnectTerminal(pane.id);
     }
+    const closingTab = tabsStore.getTab(tabId);
+    const keyIds = transientManagedKeyIds(closingTab?.panes ?? []);
     tabsStore.removeTab(tabId);
     await cleanupUnreferencedManagedKeys(keyIds);
   }
@@ -415,11 +416,10 @@
     },
     closePane(tabId, paneId) {
       void serializeLayoutSnapshotOperation(async () => {
-        const pane = tabsStore.getPane(tabId, paneId);
-        const keyIds = transientManagedKeyIds(pane ? [pane] : []);
         await storeTabSnapshots([tabId]);
         await disconnectTerminal(paneId);
-        await tabsStore.closePane(tabId, paneId);
+        const removedPane = await tabsStore.closePane(tabId, paneId);
+        const keyIds = transientManagedKeyIds(removedPane ? [removedPane] : []);
         await cleanupUnreferencedManagedKeys(keyIds);
         await tick();
         for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {

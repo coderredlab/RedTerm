@@ -218,7 +218,6 @@
   async function handleCloseTab(tabId: string) {
     const terminal = terminalRefs[tabId];
     const tab = tabsStore.getTab(tabId);
-    const keyIds = transientManagedKeyIds(tab?.panes ?? []);
     if (terminal?.disconnect) {
       try {
         await terminal.disconnect();
@@ -233,6 +232,8 @@
         console.error("Fallback tab disconnect error:", e);
       }
     }
+    const closingTab = tabsStore.getTab(tabId);
+    const keyIds = transientManagedKeyIds(closingTab?.panes ?? []);
     tabsStore.removeTab(tabId);
     await cleanupUnreferencedManagedKeys(keyIds);
     delete terminalRefs[tabId];

@@ -8,30 +8,47 @@ import {
 
 const PENDING_CLEANUP_STORAGE_KEY = "redterm.pending-key-cleanup.v1";
 let cleanupQueue: Promise<void> = Promise.resolve();
+let cleanupTokenCounter = 0;
 
-function readPendingCleanup(): Set<string> {
-  if (typeof localStorage === "undefined") return new Set();
+function nextCleanupToken(): string {
+  cleanupTokenCounter += 1;
+  return Date.now().toString() + ":" + cleanupTokenCounter.toString();
+}
+
+function readPendingCleanup(): Map<string, string> {
+  if (typeof localStorage === "undefined") return new Map();
   try {
     const stored = JSON.parse(
-      localStorage.getItem(PENDING_CLEANUP_STORAGE_KEY) ?? "[]"
+      localStorage.getItem(PENDING_CLEANUP_STORAGE_KEY) ?? "{}"
     );
-    return new Set(
-      Array.isArray(stored)
-        ? stored.filter((value): value is string => typeof value === "string")
-        : []
+    if (Array.isArray(stored)) {
+      return new Map(
+        stored
+          .filter((value): value is string => typeof value === "string")
+          .map((keyId) => [keyId, "legacy"] as const)
+      );
+    }
+    if (!stored || typeof stored !== "object") return new Map();
+    return new Map(
+      Object.entries(stored).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string"
+      )
     );
   } catch {
-    return new Set();
+    return new Map();
   }
 }
 
-function writePendingCleanup(keyIds: ReadonlySet<string>) {
+function writePendingCleanup(pending: ReadonlyMap<string, string>) {
   if (typeof localStorage === "undefined") return;
-  if (keyIds.size === 0) {
+  if (pending.size === 0) {
     localStorage.removeItem(PENDING_CLEANUP_STORAGE_KEY);
     return;
   }
-  localStorage.setItem(PENDING_CLEANUP_STORAGE_KEY, JSON.stringify([...keyIds]));
+  localStorage.setItem(
+    PENDING_CLEANUP_STORAGE_KEY,
+    JSON.stringify(Object.fromEntries(pending))
+  );
 }
 
 function paneUsesManagedKey(keyId: string): boolean {
@@ -41,6 +58,34 @@ function paneUsesManagedKey(keyId: string): boolean {
       return method.type === "key" && method.key_id === keyId;
     })
   );
+}
+
+function detachStaleManagedKeyReferences(
+  keyId: string,
+  savedConnections: readonly SavedConnection[]
+) {
+  const savedById = new Map(
+    savedConnections.map((connection) => [connection.id, connection])
+  );
+  const staleConnectionIds = new Set<string>();
+  for (const tab of tabsStore.tabs) {
+    for (const pane of tab.panes) {
+      const method = pane.connection.auth.method;
+      const connectionId = pane.connection.connectionId;
+      if (
+        connectionId &&
+        pane.connection.saveConnection !== false &&
+        method.type === "key" &&
+        method.key_id === keyId &&
+        savedById.get(connectionId)?.key_id !== keyId
+      ) {
+        staleConnectionIds.add(connectionId);
+      }
+    }
+  }
+  for (const connectionId of staleConnectionIds) {
+    tabsStore.detachManagedKeyReferences(connectionId, keyId);
+  }
 }
 
 async function currentSavedConnections(): Promise<SavedConnection[] | null> {
@@ -60,7 +105,8 @@ async function flushPendingCleanup(): Promise<void> {
   if (!savedConnections) return;
 
   const completed = new Set<string>();
-  for (const keyId of candidates) {
+  for (const keyId of candidates.keys()) {
+    detachStaleManagedKeyReferences(keyId, savedConnections);
     const usedBySavedConnection = savedConnections.some(
       (connection) => connection.key_id === keyId
     );
@@ -78,7 +124,9 @@ async function flushPendingCleanup(): Promise<void> {
   }
 
   const pending = readPendingCleanup();
-  for (const keyId of completed) pending.delete(keyId);
+  for (const keyId of completed) {
+    if (pending.get(keyId) === candidates.get(keyId)) pending.delete(keyId);
+  }
   writePendingCleanup(pending);
 }
 
@@ -105,7 +153,7 @@ export function transientManagedKeyIds(panes: readonly Pane[]): string[] {
 
 export function stageManagedKeyCleanup(keyIds: readonly string[]): void {
   const pending = readPendingCleanup();
-  for (const keyId of keyIds) pending.add(keyId);
+  for (const keyId of keyIds) pending.set(keyId, nextCleanupToken());
   writePendingCleanup(pending);
 }
 

@@ -393,6 +393,18 @@ describe("tabs store persistence", () => {
       true,
       false
     );
+    const otherTabId = tabsStore.addTab(
+      "shared.example.com",
+      22,
+      { username: "deploy", method: { type: "key", key_id: "key-old" } },
+      "connection-other",
+      false,
+      undefined,
+      undefined,
+      "id_old",
+      true,
+      false
+    );
 
     try {
       const firstPaneId = tabsStore.getTab(tabId)!.activePaneId!;
@@ -439,6 +451,13 @@ describe("tabs store persistence", () => {
         "operator",
         "operator",
       ]);
+      const otherPane = tabsStore.getTab(otherTabId)!.panes[0]!;
+      expect(otherPane.connection.connectionId).toBe("connection-other");
+      expect(otherPane.connection.host).toBe("shared.example.com");
+      expect(otherPane.connection.auth.method).toEqual({
+        type: "key",
+        key_id: "key-old",
+      });
 
       const persisted = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null");
       expect(JSON.stringify(persisted)).not.toContain("runtime-only");
@@ -450,6 +469,7 @@ describe("tabs store persistence", () => {
       ).toBe(true);
     } finally {
       tabsStore.removeTab(tabId);
+      tabsStore.removeTab(otherTabId);
     }
   });
   test("detaches panes while preserving managed key authentication", async () => {
