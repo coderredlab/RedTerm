@@ -10,6 +10,7 @@ function createConnectionsStore() {
   let loading = $state(false);
   let error = $state<string | null>(null);
   let loaded = $state(false);
+  let loadGeneration = 0;
 
   return {
     get connections() {
@@ -29,39 +30,49 @@ function createConnectionsStore() {
     },
 
     async load(): Promise<boolean> {
+      const generation = ++loadGeneration;
       loading = true;
       error = null;
       loaded = false;
       try {
-        connections = await loadConnections();
+        const nextConnections = await loadConnections();
+        if (generation !== loadGeneration) return false;
+        connections = nextConnections;
         loaded = true;
         return true;
       } catch (e) {
-        error = e instanceof Error ? e.message : String(e);
+        if (generation === loadGeneration) {
+          error = e instanceof Error ? e.message : String(e);
+        }
         return false;
       } finally {
-        loading = false;
+        if (generation === loadGeneration) loading = false;
       }
     },
 
-    async save(connection: SavedConnection, password?: string) {
+    async save(connection: SavedConnection, password?: string): Promise<boolean> {
       error = null;
       try {
         await saveConnection(connection, password);
-        // Reload to get updated list
-        await this.load();
+        const index = connections.findIndex((candidate) => candidate.id === connection.id);
+        connections = index === -1
+          ? [...connections, connection]
+          : connections.map((candidate) =>
+              candidate.id === connection.id ? connection : candidate
+            );
+        return await this.load();
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
         throw e;
       }
     },
 
-    async delete(id: string) {
+    async delete(id: string): Promise<boolean> {
       error = null;
       try {
         await deleteConnection(id);
-        // Reload to get updated list
-        await this.load();
+        connections = connections.filter((connection) => connection.id !== id);
+        return await this.load();
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
         throw e;

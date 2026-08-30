@@ -10,6 +10,9 @@ export interface PaneConnection {
   canRestorePassword?: boolean;
   startupScript?: string;
   startupScriptReadyText?: string;
+  keyName?: string;
+  saveConnection?: boolean;
+  savePassword?: boolean;
 }
 
 /** One terminal instance slot. Each pane owns its connection target and session. */
@@ -302,6 +305,15 @@ function validatePane(candidate: unknown, tabId: string): Pane | null {
     canRestorePassword: connection.canRestorePassword,
     startupScript: connection.startupScript,
     startupScriptReadyText: connection.startupScriptReadyText,
+    keyName: typeof connection.keyName === "string" ? connection.keyName : undefined,
+    saveConnection:
+      typeof connection.saveConnection === "boolean"
+        ? connection.saveConnection
+        : undefined,
+    savePassword:
+      typeof connection.savePassword === "boolean"
+        ? connection.savePassword
+        : undefined,
   };
   const pane: Pane = {
     id: raw.id,
@@ -648,7 +660,10 @@ function createTabsStore() {
       connectionId?: string,
       canRestorePassword = false,
       startupScript?: string,
-      startupScriptReadyText?: string
+      startupScriptReadyText?: string,
+      keyName?: string,
+      saveConnection?: boolean,
+      savePassword?: boolean
     ): string {
       const id = crypto.randomUUID();
       const connection: PaneConnection = {
@@ -659,6 +674,9 @@ function createTabsStore() {
         canRestorePassword,
         startupScript,
         startupScriptReadyText,
+        keyName,
+        saveConnection,
+        savePassword,
       };
       const pane = makePane(id, connection);
       const tab = buildTab(id, [pane], leaf(pane.id), pane.id);

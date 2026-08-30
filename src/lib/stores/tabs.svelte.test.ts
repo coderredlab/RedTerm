@@ -335,6 +335,9 @@ describe("tabs store persistence", () => {
         port: 2202,
         auth: { username: "new-user", method: { type: "key", key_id: "key-new" } },
         connectionId: "connection-new",
+        keyName: "id_ed25519",
+        saveConnection: false,
+        savePassword: false,
       });
 
       const tab = tabsStore.getTab(tabId)!;
@@ -348,6 +351,9 @@ describe("tabs store persistence", () => {
           host: "new.example.com",
           port: 2202,
           connectionId: "connection-new",
+          keyName: "id_ed25519",
+          saveConnection: false,
+          savePassword: false,
         },
       });
       expect(tab).toMatchObject({
@@ -359,7 +365,12 @@ describe("tabs store persistence", () => {
         connected: false,
       });
       const persisted = JSON.parse(storage.getItem(STORAGE_KEY) ?? "null");
-      expect(persisted.tabs[0].panes[0].connection.host).toBe("new.example.com");
+      expect(persisted.tabs[0].panes[0].connection).toMatchObject({
+        host: "new.example.com",
+        keyName: "id_ed25519",
+        saveConnection: false,
+        savePassword: false,
+      });
       expect(JSON.stringify(persisted)).not.toContain("stale-session");
     } finally {
       tabsStore.removeTab(tabId);

@@ -55,19 +55,26 @@
 
     if (editConnection || paneConnection) {
       const paneKeyId = paneMethod?.type === "key" ? paneMethod.key_id : undefined;
+      const nextKeyId = paneConnection
+        ? paneKeyId ?? ""
+        : editConnection?.key_id ?? "";
+      const nextSaveConnection =
+        paneConnection?.saveConnection ?? Boolean(editConnection);
       name = editConnection?.name ?? paneConnection?.host ?? "";
       host = paneConnection?.host ?? editConnection?.host ?? "";
       port = paneConnection?.port ?? editConnection?.port ?? 22;
       username = paneConnection?.auth.username ?? editConnection?.username ?? "";
-      keyId = paneConnection ? paneKeyId ?? "" : editConnection?.key_id ?? "";
-      selectedKeyName =
-        !paneConnection || paneKeyId === editConnection?.key_id
-          ? editConnection?.key_name ?? ""
-          : "";
+      keyId = nextKeyId;
+      selectedKeyName = paneConnection
+        ? paneConnection.keyName ??
+          (paneKeyId === editConnection?.key_id ? editConnection?.key_name ?? "" : "")
+        : editConnection?.key_name ?? "";
       keyPassphrase = paneMethod?.type === "key" ? paneMethod.passphrase ?? "" : "";
-      authType = keyId ? "key" : "password";
-      saveConnectionChecked = Boolean(editConnection);
-      savePasswordChecked = editConnection?.has_saved_password ?? false;
+      authType = nextKeyId ? "key" : "password";
+      saveConnectionChecked = nextSaveConnection;
+      savePasswordChecked =
+        nextSaveConnection &&
+        (paneConnection?.savePassword ?? editConnection?.has_saved_password ?? false);
       startupScript = paneConnection?.startupScript ?? editConnection?.startup_script ?? "";
       startupScriptReadyText =
         paneConnection?.startupScriptReadyText ??
@@ -282,6 +289,9 @@
           connectionId,
           canRestorePassword,
           startupScript: startupScriptToUse,
+          keyName: authType === "key" ? selectedKeyName || undefined : undefined,
+          saveConnection: saveConnectionChecked,
+          savePassword: saveConnectionChecked && savePasswordChecked,
           startupScriptReadyText: startupScriptReadyTextToUse,
         });
       } else {
@@ -292,7 +302,10 @@
           connectionId,
           canRestorePassword,
           startupScriptToUse,
-          startupScriptReadyTextToUse
+          startupScriptReadyTextToUse,
+          authType === "key" ? selectedKeyName || undefined : undefined,
+          saveConnectionChecked,
+          saveConnectionChecked && savePasswordChecked
         );
       }
 

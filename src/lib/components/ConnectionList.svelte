@@ -31,7 +31,18 @@
         username: connection.username,
         method: { type: "key", key_id: connection.key_id },
       };
-      tabsStore.addTab(connection.host, connection.port, auth, connection.id, false, connection.startup_script, connection.startup_script_ready_text);
+      tabsStore.addTab(
+        connection.host,
+        connection.port,
+        auth,
+        connection.id,
+        false,
+        connection.startup_script,
+        connection.startup_script_ready_text,
+        connection.key_name,
+        true,
+        false
+      );
       return;
     }
 
@@ -40,7 +51,18 @@
         username: connection.username,
         method: { type: "stored_password", connection_id: connection.id },
       };
-      tabsStore.addTab(connection.host, connection.port, auth, connection.id, true, connection.startup_script, connection.startup_script_ready_text);
+      tabsStore.addTab(
+        connection.host,
+        connection.port,
+        auth,
+        connection.id,
+        true,
+        connection.startup_script,
+        connection.startup_script_ready_text,
+        undefined,
+        true,
+        true
+      );
       return;
     }
 
@@ -53,7 +75,8 @@
     errorContext = "delete";
     deletingId = connection.id;
     try {
-      await connectionsStore.delete(connection.id);
+      const refreshed = await connectionsStore.delete(connection.id);
+      if (!refreshed) errorContext = "load";
     } catch {
       // The store exposes the backend error for the inline alert below.
     } finally {
