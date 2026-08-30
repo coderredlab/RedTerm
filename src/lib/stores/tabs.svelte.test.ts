@@ -502,4 +502,43 @@ describe("tabs store persistence", () => {
     }
   });
 
+  test("does not merge panes from a source tab closed before the queued mutation", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const sourceTabId = tabsStore.addTab(
+      "source.example.com",
+      22,
+      { username: "source", method: { type: "password", password: "" } }
+    );
+    const targetTabId = tabsStore.addTab(
+      "target.example.com",
+      22,
+      { username: "target", method: { type: "password", password: "" } }
+    );
+
+    try {
+      const sourcePane = tabsStore.getTab(sourceTabId)!.panes[0]!;
+      tabsStore.setPaneConnected(sourceTabId, sourcePane.id, "session-race");
+
+      const merge = tabsStore.mergeTab(
+        sourceTabId,
+        targetTabId,
+        "row",
+        "before"
+      );
+      tabsStore.removeTab(sourceTabId);
+      await merge;
+
+      expect(tabsStore.getTab(targetTabId)!.panes).toHaveLength(1);
+      expect(
+        tabsStore.getTab(targetTabId)!.panes.some(
+          (pane) => pane.sessionId === "session-race"
+        )
+      ).toBe(false);
+    } finally {
+      tabsStore.removeTab(sourceTabId);
+      tabsStore.removeTab(targetTabId);
+    }
+  });
+
 });

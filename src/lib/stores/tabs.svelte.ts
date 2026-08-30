@@ -1009,25 +1009,23 @@ function createTabsStore() {
       side: "before" | "after"
     ) {
       if (sourceTabId === targetTabId) return;
-      const source = tabs.find((candidate) => candidate.id === sourceTabId);
-      const target = tabs.find((candidate) => candidate.id === targetTabId);
-      if (!source || !target) return;
-
-      const movedPanes = source.panes.map((pane) => ({
-        ...pane,
-        tabId: targetTabId,
-      }));
-
-      const mergedLayout = makeSplit(dir, 0.5, [
-        side === "before" ? source.layout : target.layout,
-        side === "before" ? target.layout : source.layout,
-      ]);
-
       await withPreservedLayout([sourceTabId, targetTabId], () => {
+        const source = tabs.find(
+          (candidate) => candidate.id === sourceTabId
+        );
         const destination = tabs.find(
           (candidate) => candidate.id === targetTabId
         );
-        if (!destination) return;
+        if (!source || !destination) return;
+
+        const movedPanes = source.panes.map((pane) => ({
+          ...pane,
+          tabId: targetTabId,
+        }));
+        const mergedLayout = makeSplit(dir, 0.5, [
+          side === "before" ? source.layout : destination.layout,
+          side === "before" ? destination.layout : source.layout,
+        ]);
         destination.panes = [...destination.panes, ...movedPanes];
         destination.layout = mergedLayout;
         destination.activePaneId = movedPanes[0]?.id ?? destination.activePaneId;
