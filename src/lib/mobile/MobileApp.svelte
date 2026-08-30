@@ -121,12 +121,17 @@
     showDialog = true;
   }
 
-  function handleEditFailedConnection(tabId: string) {
+  async function handleEditFailedConnection(tabId: string) {
     const tab = tabsStore.getTab(tabId);
     const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
     if (!paneId) return;
-    const pane = tabsStore.getPane(tabId, paneId);
+    let pane = tabsStore.getPane(tabId, paneId);
     if (!pane || pane.kind === "local") return;
+    if (pane.connection.connectionId && !connectionsStore.loaded) {
+      await connectionsStore.load();
+      pane = tabsStore.getPane(tabId, paneId);
+      if (!pane || pane.kind === "local") return;
+    }
     editingConnection = pane.connection.connectionId
       ? connectionsStore.connections.find(
           (connection) => connection.id === pane.connection.connectionId
@@ -254,7 +259,7 @@
             onDisconnected={() => handleDisconnected(tab.id)}
             onEditConnection={tab.panes[0]?.kind === "local"
               ? undefined
-              : () => handleEditFailedConnection(tab.id)}
+              : () => void handleEditFailedConnection(tab.id)}
             onCloseTab={() => void handleCloseTab(tab.id)}
             bind:this={terminalRefs[tab.id]}
             onTitleChange={(title) => handleTitleChanged(tab.id, title)}

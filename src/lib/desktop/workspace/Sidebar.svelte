@@ -10,6 +10,7 @@
 
   interface Props {
     width: number;
+    collapsed: boolean;
     activeSessionId: string | null;
     explorerKind: "ssh" | "local" | null;
     onWidthChange: (width: number) => void;
@@ -21,6 +22,7 @@
 
   let {
     width,
+    collapsed,
     activeSessionId,
     explorerKind,
     onWidthChange,
@@ -84,7 +86,10 @@
 
 <aside
   class="connections-panel"
-  style:width="{width}px"
+  class:collapsed
+  style:width="{collapsed ? 0 : width}px"
+  aria-hidden={collapsed}
+  inert={collapsed}
   bind:this={panelEl}
 >
   <div class="product-mark">
@@ -148,6 +153,13 @@
     flex-direction: column;
     border-right: 1px solid var(--border-primary);
     background: color-mix(in srgb, var(--bg-secondary) 78%, var(--bg-primary));
+  }
+
+  .connections-panel.collapsed {
+    overflow: hidden;
+    border-right: 0;
+    visibility: hidden;
+    pointer-events: none;
   }
 
   .product-mark {

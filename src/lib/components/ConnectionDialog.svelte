@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import {
@@ -47,7 +48,7 @@
     activeDialogTab = "general";
     error = null;
     const pane = editPane
-      ? tabsStore.getPane(editPane.tabId, editPane.paneId)
+      ? untrack(() => tabsStore.getPane(editPane.tabId, editPane.paneId))
       : undefined;
     const paneConnection = pane?.connection;
     const paneMethod = paneConnection?.auth.method;
@@ -61,10 +62,8 @@
       selectedKeyName = editConnection?.key_name ?? "";
       keyPassphrase = paneMethod?.type === "key" ? paneMethod.passphrase ?? "" : "";
       authType = keyId ? "key" : "password";
-      saveConnectionChecked = Boolean(editConnection || paneConnection?.connectionId);
-      savePasswordChecked = editConnection?.has_saved_password ?? Boolean(
-        paneConnection?.canRestorePassword && paneMethod?.type === "stored_password"
-      );
+      saveConnectionChecked = Boolean(editConnection);
+      savePasswordChecked = editConnection?.has_saved_password ?? false;
       startupScript = editConnection?.startup_script ?? paneConnection?.startupScript ?? "";
       startupScriptReadyText =
         editConnection?.startup_script_ready_text ??
@@ -214,14 +213,19 @@
       if (authType === "password" && !isUsingStoredPassword && password.length === 0) {
         throw new Error("Password is required");
       }
+      if (isUsingStoredPassword && saveConnectionChecked && !editConnection) {
+        throw new Error("Enter the password before saving this connection");
+      }
       if (isUsingStoredPassword && saveConnectionChecked && !savePasswordChecked) {
         throw new Error("Enter the password before removing secure password storage");
       }
 
-      let canRestorePassword = false;
-
+      let canRestorePassword =
+        isUsingStoredPassword && !editConnection
+          ? Boolean(targetPane?.connection.canRestorePassword)
+          : false;
       if (saveConnectionChecked) {
-        const id = connectionId || crypto.randomUUID();
+        const id = editConnection?.id || crypto.randomUUID();
         const savePlan = buildConnectionDialogSavePlan({
           editConnection,
           connectionId: id,

@@ -140,9 +140,14 @@
     showDialog = true;
   }
 
-  function handleEditPaneConnection(tabId: string, paneId: string) {
-    const pane = tabsStore.getPane(tabId, paneId);
+  async function handleEditPaneConnection(tabId: string, paneId: string) {
+    let pane = tabsStore.getPane(tabId, paneId);
     if (!pane || pane.kind === "local") return;
+    if (pane.connection.connectionId && !connectionsStore.loaded) {
+      await connectionsStore.load();
+      pane = tabsStore.getPane(tabId, paneId);
+      if (!pane || pane.kind === "local") return;
+    }
     editingConnection = pane.connection.connectionId
       ? connectionsStore.connections.find(
           (connection) => connection.id === pane.connection.connectionId
@@ -151,7 +156,6 @@
     editingPane = { tabId, paneId };
     showDialog = true;
   }
-
   function handleCloseDialog() {
     showDialog = false;
     editingConnection = undefined;
@@ -358,7 +362,7 @@
       tabsStore.setPaneDisconnected(tabId, paneId);
     },
     editPaneConnection(tabId, paneId) {
-      handleEditPaneConnection(tabId, paneId);
+      void handleEditPaneConnection(tabId, paneId);
     },
     closeTab(tabId) {
       void closeTabById(tabId);
@@ -454,18 +458,17 @@
   class="desktop-app"
   style:grid-template-columns="{sidebarColumn} minmax(0, 1fr)"
 >
-  {#if !desktopPrefsStore.prefs.sidebarCollapsed}
-    <Sidebar
-      width={desktopPrefsStore.prefs.sidebarWidth}
-      activeSessionId={activeSessionId}
-      explorerKind={explorerKind}
-      onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
-      onEdit={handleEdit}
-      onNewConnection={handleNewConnection}
-      onOpenLocal={() => void tabsStore.addLocalTab()}
-      onPreview={(entry) => (previewEntry = entry)}
-    />
-  {/if}
+  <Sidebar
+    width={desktopPrefsStore.prefs.sidebarWidth}
+    collapsed={desktopPrefsStore.prefs.sidebarCollapsed}
+    activeSessionId={activeSessionId}
+    explorerKind={explorerKind}
+    onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
+    onEdit={handleEdit}
+    onNewConnection={handleNewConnection}
+    onOpenLocal={() => void tabsStore.addLocalTab()}
+    onPreview={(entry) => (previewEntry = entry)}
+  />
 
   <section class="workspace">
     <TabStrip

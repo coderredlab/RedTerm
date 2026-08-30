@@ -9,6 +9,7 @@ function createConnectionsStore() {
   let connections = $state<SavedConnection[]>([]);
   let loading = $state(false);
   let error = $state<string | null>(null);
+  let loaded = $state(false);
 
   return {
     get connections() {
@@ -23,11 +24,16 @@ function createConnectionsStore() {
       return error;
     },
 
+    get loaded() {
+      return loaded;
+    },
+
     async load() {
       loading = true;
       error = null;
       try {
         connections = await loadConnections();
+        loaded = true;
       } catch (e) {
         error = e instanceof Error ? e.message : String(e);
       } finally {
