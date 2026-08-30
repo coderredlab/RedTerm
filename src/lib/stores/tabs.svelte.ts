@@ -824,6 +824,27 @@ function createTabsStore() {
         pane.connected = false;
       });
     },
+    detachSavedConnection(connectionId: string) {
+      for (const tab of [...tabs]) {
+        if (
+          !tab.panes.some(
+            (pane) => pane.connection.connectionId === connectionId
+          )
+        ) {
+          continue;
+        }
+
+        mutateTab(tab.id, (candidate) => {
+          for (const pane of candidate.panes) {
+            if (pane.connection.connectionId !== connectionId) continue;
+            pane.connection.connectionId = undefined;
+            pane.connection.saveConnection = false;
+            pane.connection.savePassword = false;
+            pane.connection.canRestorePassword = false;
+          }
+        });
+      }
+    },
     replaceManagedKeyReferences(
       keyId: string,
       method: AuthConfig["method"],
@@ -841,26 +862,20 @@ function createTabsStore() {
         }
 
         mutateTab(tab.id, (candidate) => {
-          candidate.panes = candidate.panes.map((pane) => {
+          for (const pane of candidate.panes) {
             const currentMethod = pane.connection.auth.method;
             if (currentMethod.type !== "key" || currentMethod.key_id !== keyId) {
-              return pane;
+              continue;
             }
-            return {
-              ...pane,
-              connection: {
-                ...pane.connection,
-                auth: {
-                  username: pane.connection.auth.username,
-                  method: { ...method },
-                },
-                keyName,
-                canRestorePassword,
-                saveConnection: true,
-                savePassword: canRestorePassword,
-              },
+            pane.connection.auth = {
+              username: pane.connection.auth.username,
+              method: { ...method },
             };
-          });
+            pane.connection.keyName = keyName;
+            pane.connection.canRestorePassword = canRestorePassword;
+            pane.connection.saveConnection = true;
+            pane.connection.savePassword = canRestorePassword;
+          }
         });
       }
     },

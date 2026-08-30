@@ -12,6 +12,7 @@
   import { cancelVoiceInput, checkVoiceInputPermissions, listenVoiceInput, listVoiceInputLanguages, requestVoiceInputPermissions, setKeyboardVisible, sshDisconnect, sshWrite, startVoiceInput, stopVoiceInput } from "$lib/tauri/commands";
   import {
     cleanupUnreferencedManagedKeys,
+    retryPendingManagedKeyCleanup,
     transientManagedKeyIds,
   } from "$lib/managed-key-lifecycle";
   import { loadRuntimeInstanceId, resolveRecovery } from "$lib/session/reconcile";
@@ -89,6 +90,7 @@
     appElement.addEventListener('touchmove', preventNonTerminalPinchZoom, { passive: false });
 
     void reconcilePersistedSessions();
+    void retryPendingManagedKeyCleanup();
   });
 
   onDestroy(() => {
@@ -107,6 +109,10 @@
     editPaneRequestGeneration += 1;
     // Show connection list instead of dialog
     showConnectionListManual = true;
+  }
+  function handleSelectTab(tabId: string) {
+    editPaneRequestGeneration += 1;
+    tabsStore.setActiveTab(tabId);
   }
   function handleOpenSettings() {
     editPaneRequestGeneration += 1;
@@ -154,7 +160,10 @@
         return;
       }
     }
-    if (requestGeneration !== editPaneRequestGeneration) return;
+    if (
+      requestGeneration !== editPaneRequestGeneration ||
+      tabsStore.activeTabId !== tabId
+    ) return;
 
     editingConnection = pane.connection.connectionId && connectionsStore.loaded
       ? connectionsStore.connections.find(
@@ -259,6 +268,7 @@
   <div style:order={settingsStore.tabBarPosition === "bottom" ? 1 : 0}>
     <TabBar
       onAddTab={handleAddTab}
+      onSelectTab={handleSelectTab}
       onCloseTab={handleCloseTab}
       onOpenSettings={handleOpenSettings}
     />

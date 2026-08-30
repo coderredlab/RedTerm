@@ -10,6 +10,7 @@
   } from "$lib/session/reconcile";
   import {
     cleanupUnreferencedManagedKeys,
+    retryPendingManagedKeyCleanup,
     transientManagedKeyIds,
   } from "$lib/managed-key-lifecycle";
   import Terminal from "$lib/terminal/Terminal.svelte";
@@ -92,6 +93,7 @@
 
   onMount(() => {
     void reconcilePersistedSessions();
+    void retryPendingManagedKeyCleanup();
   });
 
   async function disconnectTerminal(paneId: string) {
@@ -169,7 +171,10 @@
         return;
       }
     }
-    if (requestGeneration !== editPaneRequestGeneration) return;
+    if (
+      requestGeneration !== editPaneRequestGeneration ||
+      tabsStore.activeTabId !== tabId
+    ) return;
 
     editingConnection = pane.connection.connectionId && connectionsStore.loaded
       ? connectionsStore.connections.find(
@@ -215,6 +220,11 @@
     if (tabId) void closeTabById(tabId);
   }
 
+  function handleSelectTab(tabId: string) {
+    editPaneRequestGeneration += 1;
+    tabsStore.setActiveTab(tabId);
+  }
+
   function cycleTab(delta: number) {
     const count = tabsStore.tabs.length;
     if (count < 2) return;
@@ -222,12 +232,12 @@
       (tab) => tab.id === tabsStore.activeTabId
     );
     const next = tabsStore.tabs[(index + delta + count) % count]!;
-    tabsStore.setActiveTab(next.id);
+    handleSelectTab(next.id);
   }
   function selectTabByIndex(index: number) {
     const tab = tabsStore.tabs[index];
     if (tab) {
-      tabsStore.setActiveTab(tab.id);
+      handleSelectTab(tab.id);
     }
   }
 
@@ -513,6 +523,7 @@
 
   <section class="workspace">
     <TabStrip
+      onSelectTab={handleSelectTab}
       onCloseTab={(tabId) => void closeTabById(tabId)}
       onOpenSettings={handleOpenSettings}
       onToggleSidebar={() => desktopPrefsStore.toggleSidebar()}

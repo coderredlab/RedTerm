@@ -66,13 +66,25 @@
 
     onEdit?.(connection);
   }
+  function paneUsesManagedKey(keyId: string): boolean {
+    return tabsStore.tabs.some((tab) =>
+      tab.panes.some((pane) => {
+        const method = pane.connection.auth.method;
+        return method.type === "key" && method.key_id === keyId;
+      })
+    );
+  }
 
   async function handleDelete(connection: SavedConnection) {
     if (!confirm(`Delete "${connection.name}"?`)) return;
 
     deletingId = connection.id;
     try {
-      await connectionsStore.delete(connection.id);
+      const preserveManagedKey = Boolean(
+        connection.key_id && paneUsesManagedKey(connection.key_id)
+      );
+      await connectionsStore.delete(connection.id, preserveManagedKey);
+      tabsStore.detachSavedConnection(connection.id);
     } catch {
       // The store exposes the backend error for the inline alert below.
     } finally {

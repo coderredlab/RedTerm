@@ -10,6 +10,7 @@
 
   interface Props {
     onCloseTab: (tabId: string) => void;
+    onSelectTab: (tabId: string) => void;
     onOpenSettings: () => void;
     onToggleSidebar: () => void;
     sidebarCollapsed: boolean;
@@ -18,6 +19,7 @@
 
   let {
     onCloseTab,
+    onSelectTab,
     onOpenSettings,
     onToggleSidebar,
     sidebarCollapsed,
@@ -150,14 +152,14 @@
 
   function activate(tabId: string) {
     if (suppressClick) return;
-    tabsStore.setActiveTab(tabId);
+    onSelectTab(tabId);
   }
 
   function activateAndFocusTab(index: number) {
     const tab = tabsStore.tabs[index];
     if (!tab) return;
 
-    tabsStore.setActiveTab(tab.id);
+    onSelectTab(tab.id);
     requestAnimationFrame(() => {
       stripEl
         ?.querySelectorAll<HTMLElement>('[role="tab"]')

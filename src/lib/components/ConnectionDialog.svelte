@@ -3,7 +3,6 @@
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import {
-    deleteUploadedSshKey,
     MAX_SSH_KEY_BYTES,
     uploadSshKey,
     type AuthConfig,
@@ -14,6 +13,7 @@
     buildConnectionDialogSavePlan,
   } from "./connection-dialog-save-plan";
   import { modalFocus } from "$lib/desktop/workspace/modal-focus";
+  import { cleanupUnreferencedManagedKeys } from "$lib/managed-key-lifecycle";
   import { buildConnectionAuthPlan } from "./connection-auth-plan";
 
   interface Props {
@@ -134,11 +134,7 @@
       return;
     }
 
-    try {
-      await deleteUploadedSshKey(id);
-    } catch (e) {
-      console.error("Failed to delete uploaded SSH key:", e);
-    }
+    await cleanupUnreferencedManagedKeys([id]);
   }
 
   async function handleKeyFileChange(event: Event) {

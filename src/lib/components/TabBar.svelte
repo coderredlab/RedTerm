@@ -3,14 +3,15 @@
 
   interface Props {
     onAddTab?: () => void;
+    onSelectTab: (id: string) => void;
     onCloseTab: (id: string) => void | Promise<void>;
     onOpenSettings?: () => void;
   }
 
-  let { onAddTab, onCloseTab, onOpenSettings }: Props = $props();
+  let { onAddTab, onSelectTab, onCloseTab, onOpenSettings }: Props = $props();
 
   function handleTabClick(id: string) {
-    tabsStore.setActiveTab(id);
+    onSelectTab(id);
   }
   function handleCloseTab(e: MouseEvent, id: string) {
     e.stopPropagation();

@@ -258,8 +258,11 @@ export async function saveConnection(connection: SavedConnection, password?: str
 }
 
 
-export async function deleteConnection(id: string): Promise<void> {
-  return invoke("delete_connection", { id });
+export async function deleteConnection(
+  id: string,
+  preserveManagedKey = false
+): Promise<void> {
+  return invoke("delete_connection", { id, preserveManagedKey });
 }
 
 export async function readClipboardImage(): Promise<ClipboardImageResult> {

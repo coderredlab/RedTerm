@@ -604,6 +604,20 @@ fn validate_connection_store(store: &ConnectionsStore) -> Result<(), String> {
     }
     Ok(())
 }
+fn managed_key_is_referenced(store: &ConnectionsStore, key_id: &str) -> bool {
+    store
+        .connections
+        .iter()
+        .any(|connection| connection.key_id.as_deref() == Some(key_id))
+}
+
+fn should_delete_managed_key(
+    store: &ConnectionsStore,
+    key_id: &str,
+    preserve_managed_key: bool,
+) -> bool {
+    !preserve_managed_key && !managed_key_is_referenced(store, key_id)
+}
 
 // Tauri commands for connections
 #[tauri::command]
@@ -695,7 +709,8 @@ pub fn save_connection(
     }
 
     if let Some(old_key_id) = existing_key_id {
-        if connection.key_id.as_deref() != Some(old_key_id.as_str()) {
+        let old_key_still_referenced = managed_key_is_referenced(&candidate_store, &old_key_id);
+        if connection.key_id.as_deref() != Some(old_key_id.as_str()) && !old_key_still_referenced {
             delete_managed_ssh_key_file(&app, &old_key_id)?;
         }
     }
@@ -757,7 +772,11 @@ pub(crate) fn resolve_uploaded_key_for_auth(
 }
 
 #[tauri::command]
-pub fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
+pub fn delete_connection(
+    app: AppHandle,
+    id: String,
+    preserve_managed_key: bool,
+) -> Result<(), String> {
     let _guard = CONNECTION_STORE_LOCK
         .lock()
         .map_err(|_| "Connection store lock was poisoned".to_string())?;
@@ -778,6 +797,9 @@ pub fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
         delete_secure_password(&app, &id)?;
     }
     store.remove_connection(&id);
+    let delete_key = key_id.as_deref().is_some_and(|candidate_key_id| {
+        should_delete_managed_key(&store, candidate_key_id, preserve_managed_key)
+    });
     if let Err(save_error) = store.save(&app) {
         let rollback_error = restore_secure_password(&app, &id, previous_credential.as_ref()).err();
         return Err(match rollback_error {
@@ -788,8 +810,10 @@ pub fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
         });
     }
 
-    if let Some(key_id) = key_id {
-        delete_managed_ssh_key_file(&app, &key_id)?;
+    if delete_key {
+        if let Some(key_id) = key_id {
+            delete_managed_ssh_key_file(&app, &key_id)?;
+        }
     }
 
     Ok(())
@@ -846,6 +870,31 @@ mod tests {
         let restored: StoredCredential =
             serde_json::from_str(&serialized).expect("failed to deserialize credential");
         assert_eq!(restored, credential);
+    }
+
+    #[test]
+    fn managed_key_deletion_respects_saved_and_runtime_references() {
+        let connection = SavedConnection {
+            id: "connection-1".to_string(),
+            name: "Production".to_string(),
+            host: "example.com".to_string(),
+            port: 22,
+            username: "deploy".to_string(),
+            key_id: Some("key-shared".to_string()),
+            key_name: Some("id_ed25519".to_string()),
+            has_saved_password: false,
+            use_keyboard_interactive: false,
+            startup_script: None,
+            startup_script_ready_text: None,
+        };
+        let mut store = ConnectionsStore {
+            connections: vec![connection],
+        };
+
+        assert!(!should_delete_managed_key(&store, "key-shared", false));
+        store.connections.clear();
+        assert!(should_delete_managed_key(&store, "key-shared", false));
+        assert!(!should_delete_managed_key(&store, "key-shared", true));
     }
 
     #[test]

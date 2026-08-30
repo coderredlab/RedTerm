@@ -400,6 +400,9 @@ describe("tabs store persistence", () => {
       expect(secondPaneId).not.toBeNull();
       tabsStore.setPaneConnected(tabId, firstPaneId, "session-one");
       tabsStore.setPaneConnected(tabId, secondPaneId!, "session-two");
+      const connectionRefs = tabsStore
+        .getTab(tabId)!
+        .panes.map((pane) => pane.connection);
 
       tabsStore.replaceManagedKeyReferences(
         "key-old",
@@ -409,6 +412,8 @@ describe("tabs store persistence", () => {
       );
 
       const panes = tabsStore.getTab(tabId)!.panes;
+      expect(panes[0]!.connection).toBe(connectionRefs[0]);
+      expect(panes[1]!.connection).toBe(connectionRefs[1]);
       expect(panes.map((pane) => pane.connection.auth.method)).toEqual([
         { type: "key", key_id: "key-new", passphrase: "runtime-only" },
         { type: "key", key_id: "key-new", passphrase: "runtime-only" },
@@ -427,6 +432,35 @@ describe("tabs store persistence", () => {
             pane.connection.auth.method.key_id === "key-new"
         )
       ).toBe(true);
+    } finally {
+      tabsStore.removeTab(tabId);
+    }
+  });
+  test("detaches panes while preserving managed key authentication", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const tabId = tabsStore.addTab(
+      "shared.example.com",
+      22,
+      { username: "deploy", method: { type: "key", key_id: "key-live" } },
+      "connection-deleted",
+      false,
+      undefined,
+      undefined,
+      "id_ed25519",
+      true,
+      false
+    );
+
+    try {
+      tabsStore.detachSavedConnection("connection-deleted");
+
+      const connection = tabsStore.getTab(tabId)!.panes[0]!.connection;
+      expect(connection.connectionId).toBeUndefined();
+      expect(connection.saveConnection).toBe(false);
+      expect(connection.savePassword).toBe(false);
+      expect(connection.canRestorePassword).toBe(false);
+      expect(connection.auth.method).toEqual({ type: "key", key_id: "key-live" });
     } finally {
       tabsStore.removeTab(tabId);
     }

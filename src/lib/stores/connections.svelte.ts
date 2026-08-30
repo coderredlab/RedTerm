@@ -78,11 +78,11 @@ function createConnectionsStore() {
       }
     },
 
-    async delete(id: string): Promise<boolean> {
+    async delete(id: string, preserveManagedKey = false): Promise<boolean> {
       error = null;
       errorContext = null;
       try {
-        await deleteConnection(id);
+        await deleteConnection(id, preserveManagedKey);
         connections = connections.filter((connection) => connection.id !== id);
         return await this.load();
       } catch (e) {
