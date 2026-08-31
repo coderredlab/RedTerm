@@ -5,6 +5,7 @@ import {
   encodeKittyInputText,
   encodeKittyKeyboardEvent,
   encodeKittyTextEvent,
+  encodeTerminalKeyboardEvent,
   KITTY_KEYBOARD_FLAGS,
   resolveKittyLayoutKey,
   resolveKittyUnshiftedKey,
@@ -43,6 +44,42 @@ describe("Kitty keyboard event encoding", () => {
         KITTY_KEYBOARD_FLAGS.REPORT_EVENTS,
       ),
     ).toBeNull();
+  });
+
+  test("keeps Backspace legacy and suppresses Kitty release events", () => {
+    const reportModes = [
+      KITTY_KEYBOARD_FLAGS.REPORT_EVENTS,
+      KITTY_KEYBOARD_FLAGS.REPORT_ALL_KEYS | KITTY_KEYBOARD_FLAGS.REPORT_EVENTS,
+    ];
+
+    for (const flags of reportModes) {
+      const commandBackspace = {
+        ...plainKey("Backspace", "Backspace"),
+        metaKey: true,
+      };
+      expect(
+        encodeTerminalKeyboardEvent(commandBackspace, "MacIntel", flags, "press"),
+      ).toBe(String.fromCharCode(0x17));
+      expect(
+        encodeTerminalKeyboardEvent(commandBackspace, "MacIntel", flags, "release"),
+      ).toBeNull();
+      expect(
+        encodeTerminalKeyboardEvent(
+          plainKey("Backspace", "Backspace"),
+          "MacIntel",
+          flags,
+          "press",
+        ),
+      ).toBe(String.fromCharCode(0x7f));
+      expect(
+        encodeTerminalKeyboardEvent(
+          plainKey("Backspace", "Backspace"),
+          "MacIntel",
+          flags,
+          "release",
+        ),
+      ).toBeNull();
+    }
   });
 
   test("reports shifted and base-layout alternate keys", () => {

@@ -28,6 +28,7 @@ fn main() {
             "preview_cache_acquire",
             "preview_cache_release",
             "read_clipboard_text",
+            "write_clipboard_text",
             "local_shell_start",
             "local_shell_write",
             "local_shell_resize",

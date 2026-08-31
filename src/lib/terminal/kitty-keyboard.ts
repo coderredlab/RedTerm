@@ -1,3 +1,5 @@
+import { getBackspaceKeyCode } from "$lib/utils/key-mapper";
+
 export const KITTY_KEYBOARD_FLAGS = {
   DISAMBIGUATE: 1,
   REPORT_EVENTS: 2,
@@ -472,6 +474,27 @@ export function encodeKittyKeyboardEvent(
   const includeText =
     reportAll && (flags & KITTY_KEYBOARD_FLAGS.REPORT_ASSOCIATED_TEXT) !== 0;
   return encodeUnicodeKey(event, description.codePoint, flags, eventType, includeText);
+}
+export function encodeTerminalKeyboardEvent(
+  event: KittyKeyboardEvent,
+  platform: string,
+  rawFlags: number,
+  explicitEventType?: KittyKeyboardEventType,
+): string | null {
+  const eventType = explicitEventType ?? (event.repeat ? "repeat" : "press");
+  if (event.key === "Backspace") {
+    if (eventType === "release") return null;
+    return getBackspaceKeyCode(
+      {
+        ctrlKey: Boolean(event.ctrlKey),
+        altKey: Boolean(event.altKey),
+        metaKey: Boolean(event.metaKey),
+        shiftKey: Boolean(event.shiftKey),
+      },
+      platform,
+    );
+  }
+  return encodeKittyKeyboardEvent(event, rawFlags, eventType);
 }
 
 export function encodeKittyTextEvent(text: string, rawFlags: number): string | null {

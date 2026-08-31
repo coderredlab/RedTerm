@@ -17,6 +17,18 @@ function isMacPlatform(): boolean {
   return typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
 }
 
+export function isTerminalShortcutTarget(
+  target: EventTarget | null,
+  activeTerminalHasSelection: boolean,
+): boolean {
+  const targetElement =
+    typeof Element !== "undefined" && target instanceof Element ? target : null;
+  if (targetElement?.closest(".pane-terminal")) return true;
+  const selectionBlurTarget =
+    target === null || (typeof document !== "undefined" && target === document.body);
+  return activeTerminalHasSelection && selectionBlurTarget;
+}
+
 /**
  * Match desktop shortcuts on a capture-phase keydown. Returns true when the
  * event was consumed and the caller must preventDefault + stopPropagation so
@@ -39,10 +51,14 @@ export function handleDesktopShortcuts(
   // Non-shell-reserved combos also accept the other modifier on macOS so
   // Ctrl+Tab / Ctrl+1..9 keep working alongside the Cmd variants.
   const modLike = event.ctrlKey || event.metaKey;
-  const terminalClipboardModifier = event.ctrlKey || (isMac && event.metaKey);
+  const terminalClipboardModifier = isMac
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey;
   const alt = event.altKey;
   const shift = event.shiftKey;
   const key = event.key;
+  const isCopyKey = event.code === "KeyC" || key === "c" || key === "C";
+  const isPasteKey = event.code === "KeyV" || key === "v" || key === "V";
   // Shells consume Ctrl+T/W/\ on Linux and Windows; leave those (and their
   // shifted variants, which the app also uses) for the terminal when the key
   // was pressed inside one.
@@ -55,13 +71,13 @@ export function handleDesktopShortcuts(
   if (shellReserved) return false;
 
   // Copy selection: the Shift variant keeps plain Ctrl/Cmd+C for the shell.
-  if (terminalTarget && terminalClipboardModifier && shift && (key === "c" || key === "C")) {
+  if (terminalTarget && terminalClipboardModifier && !alt && shift && isCopyKey) {
     handlers.copySelection();
     return true;
   }
 
   // Paste: the Shift variant keeps plain Ctrl/Cmd+V for the shell.
-  if (terminalTarget && terminalClipboardModifier && shift && (key === "v" || key === "V")) {
+  if (terminalTarget && terminalClipboardModifier && !alt && shift && isPasteKey) {
     handlers.pasteFromClipboard();
     return true;
   }

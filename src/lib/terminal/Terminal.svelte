@@ -20,6 +20,7 @@
     sshUploadClipboardImageFromLocalPath,
     readClipboardImage,
     readClipboardText,
+    writeClipboardText,
     sshCheckHostKey,
     sshTrustHostKey,
     localShellGetOutput,
@@ -36,13 +37,17 @@
   import { modifiersStore } from "$lib/stores/modifiers.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import { terminalModesStore } from "$lib/stores/terminal-modes.svelte";
-  import { ctrlKey, altKey, getArrowKeyCode, getBackspaceKeyCode } from "$lib/utils/key-mapper";
+  import { ctrlKey, altKey, getArrowKeyCode } from "$lib/utils/key-mapper";
   import { settingsStore } from "$lib/stores/settings.svelte";
   import { createStartupScriptDispatcher, type StartupScriptDispatcher } from "./startup-script";
   import { findUrlAtCell, validateTerminalUrl, type SafeTerminalUrl } from "./terminal-links";
   import { extractTerminalSelection } from "./terminal-selection";
   import { formatTerminalPaste } from "./terminal-paste";
   import { encodeTerminalMouseEvent, terminalMouseCellFromPoint } from "./terminal-mouse";
+  import {
+    resolveTerminalClipboardImagePath,
+    writeTerminalClipboardText,
+  } from "./terminal-clipboard";
   import { SshOutputDecoder } from "./ssh-output-decoder";
   import { cleanupFailedSessionAttach } from "./session-attach-cleanup";
   import { AutomaticResponseBuffer } from "./automatic-response-buffer";
@@ -55,6 +60,7 @@
   import {
     encodeKittyInputText,
     encodeKittyKeyboardEvent,
+    encodeTerminalKeyboardEvent,
     resolveKittyLayoutKey,
     type KittyKeyboardEvent,
   } from "./kitty-keyboard";
@@ -647,13 +653,20 @@
 
   }
 
+  function writeSystemClipboardText(text: string) {
+    return writeTerminalClipboardText(
+      text,
+      isDesktopTarget,
+      writeClipboardText,
+      navigator.clipboard,
+    );
+  }
+
   async function copySelectedText() {
     const text = extractSelectedText();
     if (!text.trim()) return;
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      }
+      await writeSystemClipboardText(text);
       showSelectionMessage("Copied");
       selectionStart = null;
       selectionEnd = null;
@@ -664,15 +677,18 @@
     }
   }
 
+  export function hasSelection(): boolean {
+    return Boolean(extractSelectedText().trim());
+  }
+
   /// Keyboard entry point (Ctrl/Cmd+Shift+C): copy without closing the
   /// selection, so repeated copies are possible.
   export function copySelection() {
     const text = extractSelectedText();
-    if (text.trim() && navigator.clipboard?.writeText) {
-      void navigator.clipboard.writeText(text).catch((e) => {
-        console.error("[Terminal] copy failed:", e);
-      });
-    }
+    if (!text.trim()) return;
+    void writeSystemClipboardText(text).catch((error) => {
+      console.error("[Terminal] copy failed:", error);
+    });
   }
 
   function cancelSelection() {
@@ -731,26 +747,47 @@
     }
   }
 
-  async function uploadClipboardImageFromLocalPath(
+  async function pasteClipboardImageFromLocalPath(
     localPath: string,
     targetSessionId: string | null = sessionId
   ) {
-    if (!targetSessionId || kind === "local") return;
+    if (!targetSessionId) return;
+    if (kind === "local") {
+      sendPastedText(await resolveTerminalClipboardImagePath(localPath, true));
+      return;
+    }
     const generation = connectionGeneration;
 
     const prevStatusMessage = statusMessage;
     statusMessage = "Uploading pasted image...";
 
     try {
-      const uploadResult = await sshUploadClipboardImageFromLocalPath(targetSessionId, localPath);
+      const pastedPath = await resolveTerminalClipboardImagePath(
+        localPath,
+        false,
+        async (sourcePath) =>
+          (await sshUploadClipboardImageFromLocalPath(targetSessionId, sourcePath)).remote_path,
+      );
       if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       statusMessage = prevStatusMessage;
-      sendPastedText(uploadResult.remote_path);
+      sendPastedText(pastedPath);
     } catch (error) {
       if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       const message = error instanceof Error ? error.message : String(error);
       statusMessage = "Image upload failed: " + message;
       console.error("[SSH] local image upload failed:", error);
+    }
+  }
+
+  async function pasteNativeClipboardImage(targetSessionId: string): Promise<boolean> {
+    try {
+      const result = await readClipboardImage();
+      if (!result.found || !result.localPath) return false;
+      await pasteClipboardImageFromLocalPath(result.localPath, targetSessionId);
+      return true;
+    } catch (error) {
+      console.error("[Terminal] clipboard image read failed:", error);
+      return false;
     }
   }
 
@@ -777,12 +814,15 @@
       if (imageItem) {
         const imageFile = imageItem.getAsFile();
         if (imageFile) {
+          e.preventDefault();
+          if (kind === "local") {
+            await pasteNativeClipboardImage(targetSessionId);
+            return;
+          }
           if (imageFile.size > MAX_CLIPBOARD_IMAGE_BYTES) {
-            e.preventDefault();
             statusMessage = "Image upload failed: Clipboard image exceeds 10 MiB";
             return;
           }
-          e.preventDefault();
           const bytes = new Uint8Array(await imageFile.arrayBuffer());
           await uploadClipboardImageBytes(bytes);
           return;
@@ -798,15 +838,8 @@
     }
 
     // Native clipboard fallback for desktop/mobile WebViews that omit image items.
-    if (kind === "local") return;
-    try {
-      const result = await readClipboardImage();
-      if (result.found && result.localPath) {
-        e.preventDefault();
-        await uploadClipboardImageFromLocalPath(result.localPath, targetSessionId);
-      }
-    } catch {
-      // readClipboardImage 실패 시 무시 (데스크톱에서는 no-op)
+    if (await pasteNativeClipboardImage(targetSessionId)) {
+      e.preventDefault();
     }
   }
 
@@ -1007,7 +1040,7 @@
       const localPath = customEvent.detail?.localPath;
       if (!localPath) return;
 
-      void uploadClipboardImageFromLocalPath(localPath, targetSessionId);
+      void pasteClipboardImageFromLocalPath(localPath, targetSessionId);
     };
     window.addEventListener("redterm:android-image-paste", androidImagePasteHandler);
 
@@ -2335,8 +2368,8 @@
       requestRedraw();
       return;
     }
-    if (!interactive || !navigator.clipboard?.writeText) return;
-    void navigator.clipboard.writeText(event.text).catch((error) => {
+    if (!interactive) return;
+    void writeSystemClipboardText(event.text).catch((error) => {
       console.error("[Terminal] OSC 52 clipboard write failed:", error);
     });
   }
@@ -3072,7 +3105,7 @@
         try {
           const result = await readClipboardImage();
           if (result.found && result.localPath) {
-            await uploadClipboardImageFromLocalPath(result.localPath, targetSessionId);
+            await pasteClipboardImageFromLocalPath(result.localPath, targetSessionId);
             return;
           }
         } catch {
@@ -3243,13 +3276,15 @@
       pendingCommitKey = null;
       suppressPlainSpace = false;
     }
-    const kittyKey = encodeKittyKeyboardEvent(
+
+    const terminalKey = encodeTerminalKeyboardEvent(
       toKittyKeyboardEvent(e),
+      navigator.platform,
       parser?.getKittyKeyboardFlags() ?? 0,
     );
-    if (kittyKey) {
+    if (terminalKey) {
       e.preventDefault();
-      queueWrite(kittyKey);
+      queueWrite(terminalKey);
       return;
     }
     // Enter key
@@ -3258,14 +3293,6 @@
       queueWrite("\r");
       return;
     }
-
-    // Backspace
-    if (e.key === "Backspace") {
-      e.preventDefault();
-      queueWrite(getBackspaceKeyCode(e));
-      return;
-    }
-
     // Tab
     if (e.key === "Tab") {
       e.preventDefault();
@@ -3318,14 +3345,15 @@
   }
   function handleKeyUp(e: KeyboardEvent) {
     if (!sessionId || e.isComposing) return;
-    const kittyKey = encodeKittyKeyboardEvent(
+    const terminalKey = encodeTerminalKeyboardEvent(
       toKittyKeyboardEvent(e),
+      navigator.platform,
       parser?.getKittyKeyboardFlags() ?? 0,
       "release",
     );
-    if (!kittyKey) return;
+    if (!terminalKey) return;
     e.preventDefault();
-    queueWrite(kittyKey);
+    queueWrite(terminalKey);
   }
   function handleWriteError(e: unknown) {
     console.error('[SSH] write failed:', e);
@@ -3636,17 +3664,7 @@
     if (!sessionId) return;
     const targetSessionId = sessionId;
 
-    if (kind !== "local") {
-      try {
-        const result = await readClipboardImage();
-        if (result.found && result.localPath) {
-          await uploadClipboardImageFromLocalPath(result.localPath, targetSessionId);
-          return;
-        }
-      } catch (error) {
-        console.error("[Terminal] clipboard image read failed:", error);
-      }
-    }
+    if (await pasteNativeClipboardImage(targetSessionId)) return;
 
     try {
       const text = await readClipboardText();

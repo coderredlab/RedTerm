@@ -55,6 +55,31 @@ pub struct RuntimeState {
     pub instance_id: String,
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Default)]
+pub struct DesktopClipboardState {
+    clipboard: Mutex<Option<arboard::Clipboard>>,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl DesktopClipboardState {
+    fn with_clipboard<T>(
+        &self,
+        operation: impl FnOnce(&mut arboard::Clipboard) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut guard = self
+            .clipboard
+            .lock()
+            .map_err(|_| "Clipboard state lock was poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = Some(
+                arboard::Clipboard::new()
+                    .map_err(|error| format!("Failed to open clipboard: {error}"))?,
+            );
+        }
+        operation(guard.as_mut().expect("clipboard initialized above"))
+    }
+}
 const HOST_KEY_CHALLENGE_LIFETIME: Duration = Duration::from_secs(120);
 const MAX_PENDING_HOST_KEY_CHALLENGES: usize = 32;
 
@@ -242,6 +267,12 @@ const SSH_DATA_CHANNEL_CAPACITY: usize = 64;
 const MAX_SSH_EVENT_BYTES: usize = 64 * 1024;
 const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_CLIPBOARD_IMAGE_PIXELS: usize = 32 * 1024 * 1024;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const MAX_CLIPBOARD_CACHE_BYTES: u64 = 50 * 1024 * 1024;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const MAX_CLIPBOARD_CACHE_FILES: usize = 20;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const MAX_CLIPBOARD_CACHE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_RECENT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECENT_CHUNK_COUNT: usize = 4096;
 const SSH_EVENT_BATCH_WINDOW: Duration = Duration::from_millis(4);
@@ -350,15 +381,128 @@ fn ensure_local_clipboard_image_path(app: &AppHandle, local_path: &str) -> Resul
     Ok(canonical_candidate)
 }
 
+fn prepare_clipboard_image_staging_directory(directory: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("Failed to prepare clipboard cache dir: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Failed to secure clipboard cache dir: {error}"))?;
+    }
+    Ok(())
+}
+
 fn clipboard_image_staging_directory(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
         .app_cache_dir()
         .map_err(|error| format!("Failed to resolve app cache dir: {error}"))?
         .join("clipboard-paste");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("Failed to prepare clipboard cache dir: {error}"))?;
+    prepare_clipboard_image_staging_directory(&directory)?;
     Ok(directory)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct ClipboardCacheEntry {
+    path: PathBuf,
+    modified: std::time::SystemTime,
+    len: u64,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn prune_clipboard_image_cache_with_limits(
+    directory: &Path,
+    protected_path: Option<&Path>,
+    now: std::time::SystemTime,
+    max_age: Duration,
+    max_files: usize,
+    max_bytes: u64,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("Failed to inspect clipboard cache dir: {error}"))?;
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Failed to inspect clipboard cache: {error}"))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("Failed to inspect clipboard cache file: {error}"))?;
+        if metadata.is_file() {
+            files.push(ClipboardCacheEntry {
+                path: entry.path(),
+                modified: metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                len: metadata.len(),
+            });
+        }
+    }
+    files.sort_by(|left, right| {
+        let left_protected = protected_path.is_some_and(|path| path == left.path);
+        let right_protected = protected_path.is_some_and(|path| path == right.path);
+        right_protected
+            .cmp(&left_protected)
+            .then_with(|| right.modified.cmp(&left.modified))
+    });
+
+    let mut retained_files = 0_usize;
+    let mut retained_bytes = 0_u64;
+    for file in files {
+        let protected = protected_path.is_some_and(|path| path == file.path);
+        let expired = now
+            .duration_since(file.modified)
+            .is_ok_and(|age| age > max_age);
+        let over_budget =
+            retained_files >= max_files || retained_bytes.saturating_add(file.len) > max_bytes;
+        if !protected && (expired || over_budget) {
+            match std::fs::remove_file(&file.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("Failed to prune clipboard cache file: {error}"));
+                }
+            }
+        } else {
+            retained_files += 1;
+            retained_bytes = retained_bytes.saturating_add(file.len);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn prune_clipboard_image_cache(
+    directory: &Path,
+    protected_path: Option<&Path>,
+) -> Result<(), String> {
+    prune_clipboard_image_cache_with_limits(
+        directory,
+        protected_path,
+        std::time::SystemTime::now(),
+        MAX_CLIPBOARD_CACHE_AGE,
+        MAX_CLIPBOARD_CACHE_FILES,
+        MAX_CLIPBOARD_CACHE_BYTES,
+    )
+}
+
+#[cfg(all(not(any(target_os = "android", target_os = "ios")), unix))]
+fn write_private_clipboard_image(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| format!("Failed to create staged clipboard image: {error}"))?;
+    file.write_all(bytes)
+        .map_err(|error| format!("Failed to stage clipboard image: {error}"))
+}
+
+#[cfg(all(not(any(target_os = "android", target_os = "ios")), not(unix)))]
+fn write_private_clipboard_image(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    std::fs::write(path, bytes).map_err(|error| format!("Failed to stage clipboard image: {error}"))
 }
 
 struct ClipboardPngWriter {
@@ -420,24 +564,36 @@ fn encode_clipboard_rgba_as_png(
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn read_desktop_clipboard_image(app: &AppHandle) -> Result<NativeClipboardImageResult, String> {
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|error| format!("Failed to open clipboard: {error}"))?;
-    let image = match clipboard.get_image() {
-        Ok(image) => image,
-        Err(arboard::Error::ContentNotAvailable) => {
-            return Ok(NativeClipboardImageResult {
-                found: false,
-                local_path: None,
-            });
-        }
-        Err(error) => return Err(format!("Failed to read clipboard image: {error}")),
+fn read_desktop_clipboard_image(
+    app: &AppHandle,
+    clipboard_state: &DesktopClipboardState,
+) -> Result<NativeClipboardImageResult, String> {
+    let png = clipboard_state.with_clipboard(|clipboard| {
+        let image = match clipboard.get_image() {
+            Ok(image) => image,
+            Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+            Err(error) => return Err(format!("Failed to read clipboard image: {error}")),
+        };
+        encode_clipboard_rgba_as_png(image.width, image.height, image.bytes.as_ref()).map(Some)
+    })?;
+    let Some(png) = png else {
+        return Ok(NativeClipboardImageResult {
+            found: false,
+            local_path: None,
+        });
     };
-    let png = encode_clipboard_rgba_as_png(image.width, image.height, image.bytes.as_ref())?;
-    let path =
-        clipboard_image_staging_directory(app)?.join(format!("clipboard-{}.png", Uuid::new_v4()));
-    std::fs::write(&path, png)
-        .map_err(|error| format!("Failed to stage clipboard image: {error}"))?;
+    let directory = clipboard_image_staging_directory(app)?;
+    prune_clipboard_image_cache(&directory, None)?;
+    let path = directory.join(format!("clipboard-{}.png", Uuid::new_v4()));
+    write_private_clipboard_image(&path, &png)?;
+    if let Err(prune_error) = prune_clipboard_image_cache(&directory, Some(&path)) {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Err(prune_error),
+            Err(remove_error) => Err(format!(
+                "{prune_error}; failed to remove newly staged clipboard image: {remove_error}"
+            )),
+        };
+    }
     Ok(NativeClipboardImageResult {
         found: true,
         local_path: Some(path.to_string_lossy().into_owned()),
@@ -993,19 +1149,26 @@ pub async fn ssh_upload_clipboard_image_from_local_path(
     upload_clipboard_image_bytes(&connection, &data).await
 }
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tauri::command]
+pub async fn read_clipboard_image(
+    app: AppHandle,
+    clipboard_state: State<'_, DesktopClipboardState>,
+) -> Result<NativeClipboardImageResult, String> {
+    read_desktop_clipboard_image(&app, &clipboard_state)
+}
+
+#[cfg(target_os = "ios")]
 #[tauri::command]
 pub async fn read_clipboard_image(app: AppHandle) -> Result<NativeClipboardImageResult, String> {
-    #[cfg(target_os = "ios")]
-    {
-        let directory = clipboard_image_staging_directory(&app)?;
-        return read_native_clipboard_image(&app, directory.to_string_lossy().into_owned());
-    }
+    let directory = clipboard_image_staging_directory(&app)?;
+    read_native_clipboard_image(&app, directory.to_string_lossy().into_owned())
+}
 
-    #[cfg(target_os = "android")]
-    return read_native_clipboard_image(&app);
-
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    read_desktop_clipboard_image(&app)
+#[cfg(target_os = "android")]
+#[tauri::command]
+pub async fn read_clipboard_image(app: AppHandle) -> Result<NativeClipboardImageResult, String> {
+    read_native_clipboard_image(&app)
 }
 
 #[tauri::command]
@@ -1297,24 +1460,44 @@ pub async fn sftp_download_file(
     })
 }
 
-/// Read plain text from the system clipboard (terminal paste shortcut).
-// arboard has no Android/iOS implementation; the paste shortcut only
-// exists in the desktop shell, so mobile returns unavailable.
+/// Read or write plain text through the native desktop clipboard.
+// arboard has no Android/iOS implementation; the desktop shell owns these
+// shortcuts, so mobile returns unavailable.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
-pub async fn read_clipboard_text() -> Result<Option<String>, String> {
-    use arboard::Clipboard;
+pub async fn read_clipboard_text(
+    clipboard_state: State<'_, DesktopClipboardState>,
+) -> Result<Option<String>, String> {
+    clipboard_state.with_clipboard(|clipboard| {
+        clipboard
+            .get_text()
+            .map(Some)
+            .map_err(|error| format!("Failed to read clipboard: {error}"))
+    })
+}
 
-    let mut clipboard = Clipboard::new().map_err(|e| format!("Failed to open clipboard: {}", e))?;
-    clipboard
-        .get_text()
-        .map(Some)
-        .map_err(|e| format!("Failed to read clipboard: {}", e))
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tauri::command]
+pub async fn write_clipboard_text(
+    clipboard_state: State<'_, DesktopClipboardState>,
+    text: String,
+) -> Result<(), String> {
+    clipboard_state.with_clipboard(|clipboard| {
+        clipboard
+            .set_text(text)
+            .map_err(|error| format!("Failed to write clipboard: {error}"))
+    })
 }
 
 #[cfg(any(target_os = "android", target_os = "ios"))]
 #[tauri::command]
 pub async fn read_clipboard_text() -> Result<Option<String>, String> {
+    Err("Clipboard text is unavailable on this platform".to_string())
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[tauri::command]
+pub async fn write_clipboard_text(_text: String) -> Result<(), String> {
     Err("Clipboard text is unavailable on this platform".to_string())
 }
 
@@ -1532,6 +1715,156 @@ mod tests {
         assert!(limited_writer.write_all(&[0; 5]).is_err());
         assert!(limited_writer.bytes.is_empty());
     }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn desktop_clipboard_cache_enforces_file_count_independently() {
+        let directory = std::env::temp_dir().join(format!(
+            "redterm-clipboard-cache-file-count-{}",
+            Uuid::new_v4()
+        ));
+        prepare_clipboard_image_staging_directory(&directory)
+            .expect("clipboard cache test dir should be created");
+        let newest = directory.join("newest.png");
+        let middle = directory.join("middle.png");
+        let oldest = directory.join("oldest.png");
+        for path in [&newest, &middle, &oldest] {
+            write_private_clipboard_image(path, &[1]).expect("clipboard image should be written");
+        }
+
+        let now = std::time::SystemTime::now();
+        for (path, age) in [(&newest, 1), (&middle, 2), (&oldest, 3)] {
+            let file = std::fs::File::open(path).expect("clipboard image should open");
+            file.set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(age)))
+                .expect("clipboard image time should be set");
+        }
+
+        prune_clipboard_image_cache_with_limits(
+            &directory,
+            None,
+            now,
+            Duration::from_secs(60),
+            2,
+            u64::MAX,
+        )
+        .expect("clipboard cache should enforce file count");
+
+        assert!(newest.exists());
+        assert!(middle.exists());
+        assert!(!oldest.exists());
+        std::fs::remove_dir_all(directory).expect("clipboard cache test dir should be removed");
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn desktop_clipboard_cache_enforces_byte_limit_independently() {
+        let directory = std::env::temp_dir().join(format!(
+            "redterm-clipboard-cache-byte-limit-{}",
+            Uuid::new_v4()
+        ));
+        prepare_clipboard_image_staging_directory(&directory)
+            .expect("clipboard cache test dir should be created");
+        let newest = directory.join("newest.png");
+        let older = directory.join("older.png");
+        write_private_clipboard_image(&newest, &[1; 4])
+            .expect("newest clipboard image should be written");
+        write_private_clipboard_image(&older, &[2; 3])
+            .expect("older clipboard image should be written");
+
+        let now = std::time::SystemTime::now();
+        for (path, age) in [(&newest, 1), (&older, 2)] {
+            let file = std::fs::File::open(path).expect("clipboard image should open");
+            file.set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(age)))
+                .expect("clipboard image time should be set");
+        }
+
+        prune_clipboard_image_cache_with_limits(
+            &directory,
+            None,
+            now,
+            Duration::from_secs(60),
+            usize::MAX,
+            4,
+        )
+        .expect("clipboard cache should enforce byte limit");
+
+        assert!(newest.exists());
+        assert!(!older.exists());
+        std::fs::remove_dir_all(directory).expect("clipboard cache test dir should be removed");
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn desktop_clipboard_cache_is_private_bounded_and_preserves_new_file() {
+        let directory =
+            std::env::temp_dir().join(format!("redterm-clipboard-cache-policy-{}", Uuid::new_v4()));
+        prepare_clipboard_image_staging_directory(&directory)
+            .expect("clipboard cache test dir should be created");
+        let protected = directory.join("protected.png");
+        let expired = directory.join("expired.png");
+        let newest = directory.join("newest.png");
+        let over_budget = directory.join("over-budget.png");
+        write_private_clipboard_image(&protected, &[1; 4])
+            .expect("protected image should be written");
+        write_private_clipboard_image(&expired, &[2]).expect("expired image should be written");
+        write_private_clipboard_image(&newest, &[3; 2]).expect("newest image should be written");
+        write_private_clipboard_image(&over_budget, &[4; 3])
+            .expect("over-budget image should be written");
+
+        let now = std::time::SystemTime::now();
+        let stale_time = now - Duration::from_secs(120);
+        for path in [&protected, &expired] {
+            let file = std::fs::File::open(path).expect("stale image should open");
+            file.set_times(std::fs::FileTimes::new().set_modified(stale_time))
+                .expect("stale image time should be set");
+        }
+        let over_budget_file =
+            std::fs::File::open(&over_budget).expect("over-budget image should open");
+        over_budget_file
+            .set_times(std::fs::FileTimes::new().set_modified(now - Duration::from_secs(1)))
+            .expect("over-budget image time should be set");
+
+        prune_clipboard_image_cache_with_limits(
+            &directory,
+            Some(&protected),
+            now,
+            Duration::from_secs(60),
+            2,
+            6,
+        )
+        .expect("clipboard cache should be pruned");
+
+        assert!(protected.exists());
+        assert!(newest.exists());
+        assert!(!expired.exists());
+        assert!(!over_budget.exists());
+        let retained = std::fs::read_dir(&directory)
+            .expect("clipboard cache should be readable")
+            .count();
+        assert_eq!(retained, 2);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&directory)
+                    .expect("clipboard cache dir metadata should exist")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&protected)
+                    .expect("clipboard image metadata should exist")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        std::fs::remove_dir_all(directory).expect("clipboard cache test dir should be removed");
+    }
+
     #[test]
     fn stale_preview_pruning_keeps_leased_files_until_release() {
         let dir =

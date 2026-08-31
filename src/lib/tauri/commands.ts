@@ -380,9 +380,13 @@ export async function localWriteFile(
   return invoke<void>("local_write_file", { path, content, expectedContent });
 }
 
-/** System clipboard plain text for the terminal paste shortcut. */
+/** System clipboard plain text for terminal copy and paste shortcuts. */
 export async function readClipboardText(): Promise<string | null> {
   return invoke<string | null>("read_clipboard_text");
+}
+
+export async function writeClipboardText(text: string): Promise<void> {
+  return invoke<void>("write_clipboard_text", { text });
 }
 
 export async function localDownloadFile(path: string): Promise<SftpDownloadedFile> {

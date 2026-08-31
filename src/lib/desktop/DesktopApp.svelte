@@ -19,7 +19,7 @@
     transientManagedKeyIds,
   } from "$lib/managed-key-lifecycle";
   import Terminal from "$lib/terminal/Terminal.svelte";
-  import { handleDesktopShortcuts } from "./shortcuts";
+  import { handleDesktopShortcuts, isTerminalShortcutTarget } from "./shortcuts";
   import Sidebar from "./workspace/Sidebar.svelte";
   import PaneView from "./workspace/PaneView.svelte";
   import TabStrip from "./workspace/TabStrip.svelte";
@@ -647,25 +647,27 @@
   };
   setWorkspaceApi(workspaceApi);
 
-  function copyActiveSelection() {
+  function activeTerminal(): Terminal | null {
     const tab = tabsStore.activeTab;
     const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
-    if (paneId) {
-      terminals.get(paneId)?.copySelection();
-    }
+    if (!tab || !paneId || paneShowsDocument(tab.layout, paneId)) return null;
+    return terminals.get(paneId) ?? null;
+  }
+
+  function copyActiveSelection() {
+    activeTerminal()?.copySelection();
   }
 
   function pasteFromClipboardToActivePane() {
-    const tab = tabsStore.activeTab;
-    const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
-    const terminal = paneId ? terminals.get(paneId) : null;
+    const terminal = activeTerminal();
     if (terminal) void terminal.pasteFromClipboard();
   }
 
   function onKeydownCapture(event: KeyboardEvent) {
-    const terminalTarget =
-      event.target instanceof Element &&
-      event.target.closest(".pane-terminal") !== null;
+    const terminalTarget = isTerminalShortcutTarget(
+      event.target,
+      activeTerminal()?.hasSelection() ?? false,
+    );
     const consumed = handleDesktopShortcuts(
       event,
       {

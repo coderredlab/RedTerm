@@ -7,6 +7,8 @@ mod storage;
 // Every editor backend shares this compare-and-replace critical section.
 pub(crate) static FILE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use commands::DesktopClipboardState;
 use commands::{
     cancel_voice_input, check_voice_input_permissions, delete_known_host, get_keyboard_layout_map,
     get_runtime_instance_id, install_keyboard_layout_change_listener, list_known_hosts,
@@ -19,9 +21,10 @@ use commands::{
     ssh_check_host_key, ssh_connect, ssh_disconnect, ssh_get_session_output,
     ssh_get_session_snapshot, ssh_resize, ssh_session_exists, ssh_store_session_snapshot,
     ssh_trust_host_key, ssh_upload_clipboard_image, ssh_upload_clipboard_image_from_local_path,
-    ssh_write, start_voice_input, stop_voice_input, HostKeyChallengeStore, LocalShellManager,
-    RuntimeState, SessionManager,
+    ssh_write, start_voice_input, stop_voice_input, write_clipboard_text, HostKeyChallengeStore,
+    LocalShellManager, RuntimeState, SessionManager,
 };
+
 use storage::{
     acknowledge_uploaded_ssh_key, delete_connection, delete_uploaded_ssh_key,
     list_pending_uploaded_ssh_keys, load_connections, save_connection, upload_ssh_key,
@@ -43,6 +46,9 @@ pub fn run() {
 
     #[cfg(target_os = "ios")]
     let builder = builder.plugin(tauri_plugin_redterm_ios_native::init());
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let builder = builder.manage(DesktopClipboardState::default());
 
     builder
         .setup(|app| {
@@ -80,6 +86,7 @@ pub fn run() {
             preview_cache_acquire,
             preview_cache_release,
             read_clipboard_text,
+            write_clipboard_text,
             local_shell_start,
             local_shell_write,
             local_shell_resize,

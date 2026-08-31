@@ -70,10 +70,15 @@ type BackspaceModifiers = Pick<
   "ctrlKey" | "altKey" | "metaKey" | "shiftKey"
 >;
 
-export function getBackspaceKeyCode(modifiers: BackspaceModifiers): string {
-  const controlOnly =
-    modifiers.ctrlKey && !modifiers.altKey && !modifiers.metaKey && !modifiers.shiftKey;
-  return controlOnly ? ctrlKey("W") : KeyCodes.BACKSPACE;
+export function getBackspaceKeyCode(
+  modifiers: BackspaceModifiers,
+  platform: string,
+): string {
+  const isMac = /mac/i.test(platform);
+  const deleteWord = isMac
+    ? modifiers.metaKey && !modifiers.ctrlKey && !modifiers.altKey && !modifiers.shiftKey
+    : modifiers.ctrlKey && !modifiers.metaKey && !modifiers.altKey && !modifiers.shiftKey;
+  return deleteWord ? ctrlKey("W") : KeyCodes.BACKSPACE;
 }
 
 // Alt key combinations (ESC + char)
