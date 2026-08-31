@@ -715,7 +715,7 @@
       const uploadResult = await sshUploadClipboardImage(targetSessionId, bytes);
       if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       statusMessage = prevStatusMessage;
-      queueWrite(uploadResult.remote_path);
+      sendPastedText(uploadResult.remote_path);
     } catch (error) {
       if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       const message = error instanceof Error ? error.message : String(error);
@@ -738,7 +738,7 @@
       const uploadResult = await sshUploadClipboardImageFromLocalPath(targetSessionId, localPath);
       if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       statusMessage = prevStatusMessage;
-      queueWrite(uploadResult.remote_path);
+      sendPastedText(uploadResult.remote_path);
     } catch (error) {
       if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       const message = error instanceof Error ? error.message : String(error);
@@ -969,6 +969,7 @@
       hiddenInput.addEventListener('keydown', handleKeyDown);
       hiddenInput.addEventListener('keyup', handleKeyUp);
       hiddenInput.addEventListener('compositionstart', handleCompositionStart);
+      hiddenInput.addEventListener('compositionupdate', handleCompositionUpdate);
       hiddenInput.addEventListener('compositionend', handleCompositionEnd);
       pasteHandler = (e: ClipboardEvent) => {
         void handlePaste(e);
@@ -1165,6 +1166,7 @@
   let updatePending = false;
   let redrawPending = false;
   let isComposing = $state(false);
+  let compositionText = $state("");
   let immediateCompositionText = "";
   let compositionTimeout: number | null = null;
   const hangulComposer = new HangulComposer();
@@ -2875,6 +2877,7 @@
   // Composition handlers for Korean/CJK input
   function handleCompositionStart() {
     isComposing = true;
+    compositionText = "";
     immediateCompositionText = "";
     // 3초 stuck 타이머는 모바일(안드로이드 WebView)용 — compositionend가
     // 없을 때 플래그를 풀어 입력 막힘을 방지한다. 데스크탑 IME는
@@ -2883,6 +2886,7 @@
       if (compositionTimeout) clearTimeout(compositionTimeout);
       compositionTimeout = window.setTimeout(() => {
         isComposing = false;
+        compositionText = "";
         compositionTimeout = null;
       }, 3000);
     } else {
@@ -2893,9 +2897,13 @@
       if (compositionTimeout) clearTimeout(compositionTimeout);
       compositionTimeout = window.setTimeout(() => {
         isComposing = false;
+        compositionText = "";
         compositionTimeout = null;
       }, 30000);
     }
+  }
+  function handleCompositionUpdate(e: CompositionEvent) {
+    compositionText = e.data ?? hiddenInput?.value ?? "";
   }
 
   function handleCompositionEnd(e: CompositionEvent) {
@@ -2904,6 +2912,7 @@
       compositionTimeout = null;
     }
     isComposing = false;
+    compositionText = "";
     if (sessionId) {
       const data = e.data ?? "";
       if (isDesktopTarget) {
@@ -3006,6 +3015,7 @@
     // deferred until compositionend.
     if (isComposing) {
       const text = value || inputEvent.data || "";
+      compositionText = text;
       if (
         inputEvent.inputType === "insertCompositionText" &&
         /^[\x20-\x7e]*$/.test(text) &&
@@ -3444,6 +3454,7 @@
       hiddenInput.removeEventListener('keydown', handleKeyDown);
       hiddenInput.removeEventListener('keyup', handleKeyUp);
       hiddenInput.removeEventListener('compositionstart', handleCompositionStart);
+      hiddenInput.removeEventListener('compositionupdate', handleCompositionUpdate);
       hiddenInput.removeEventListener('compositionend', handleCompositionEnd);
       if (pasteHandler) {
         hiddenInput.removeEventListener('paste', pasteHandler);
@@ -3668,6 +3679,12 @@
     enterkeyhint="send"
     wrap="off"
   ></textarea>
+
+  {#if isDesktopTarget && isComposing && compositionText}
+    <div class="composition-view" style={compositionInputStyle()} aria-hidden="true">
+      <span class="composition-text">{compositionText}</span><span class="composition-caret"></span>
+    </div>
+  {/if}
 
   <!-- Status message -->
   {#if statusMessage}
@@ -3970,16 +3987,43 @@
   .hidden-input.composing {
     right: var(--terminal-horizontal-padding, 4px);
     width: auto;
-    opacity: 1;
+    opacity: 0;
     margin: 0;
     padding: 0;
     overflow: hidden;
+    color: transparent;
+    caret-color: transparent;
+    background: transparent;
+    font-family: "Sarasa Term K Nerd", "JetBrains Mono", "Fira Code", monospace;
+    white-space: pre;
+    z-index: 2;
+  }
+
+  .composition-view {
+    position: absolute;
+    max-width: calc(100% - var(--terminal-horizontal-padding, 4px));
+    overflow: hidden;
     color: var(--terminal-fg, #f5f5f5);
-    caret-color: var(--terminal-cursor, #f5f5f5);
     background: var(--terminal-bg, #1a0f0f);
     font-family: "Sarasa Term K Nerd", "JetBrains Mono", "Fira Code", monospace;
     white-space: pre;
+    pointer-events: none;
     z-index: 1;
+  }
+
+  .composition-text {
+    text-decoration: underline;
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+  }
+
+  .composition-caret {
+    display: inline-block;
+    width: 1px;
+    height: 0.95em;
+    margin-left: 1px;
+    vertical-align: -0.15em;
+    background: var(--terminal-cursor, #f5f5f5);
   }
 
   .status-overlay {
