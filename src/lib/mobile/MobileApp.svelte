@@ -244,6 +244,10 @@
     return activeTabId ? terminalRefs[activeTabId] : undefined;
   }
 
+  function handleImageUploaded(tabId: string, sessionId: string, remotePath: string): boolean {
+    return terminalRefs[tabId]?.pasteUploadedImagePath(sessionId, remotePath) ?? false;
+  }
+
   async function handleToggleKeyboard() {
     const input = document.querySelector('.terminal-container.active textarea.hidden-input') as HTMLTextAreaElement | null;
     if (!input) return;
@@ -337,6 +341,7 @@
     <div style:order={settingsStore.tabBarPosition === "bottom" ? 2 : 2}>
       <ExtraKeysBar
         onToggleKeyboard={handleToggleKeyboard}
+        onImageUploaded={handleImageUploaded}
         voiceInputController={voiceInputController}
       />
     </div>

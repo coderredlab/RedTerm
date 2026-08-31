@@ -142,6 +142,8 @@ function syllableFrom(
 
 function decomposeChar(ch: string): string[] | null {
   if (CHOSEONG_MAP.has(ch) || JUNGSEONG_MAP.has(ch)) return [ch];
+  const splitJong = JONG_SPLIT.get(ch);
+  if (splitJong?.[0]) return splitJong;
   const code = ch.codePointAt(0)! - HANGUL_SYLLABLE_BASE;
   if (code < 0 || code > 11171) return null;
   const jong = code % 28;
@@ -241,6 +243,10 @@ function buildParts(raw: string): Part[] {
       const s = syllableFrom(decomp[0], decomp[1], decomp[2] ?? "");
       if (s) {
         parts.push({ ...s, span: 1 });
+        continue;
+      }
+      if (decomp.every((part) => CHOSEONG_MAP.has(part))) {
+        for (const part of decomp) parts.push({ kind: "lone", ch: part, span: 1 });
         continue;
       }
     }
@@ -358,6 +364,10 @@ export class HangulComposer {
       const parts = buildParts(this.raw);
       const lastPart = parts.at(-1);
       const firstRunParts = runChars[0] ? decomposeChar(runChars[0]) : null;
+      const expandsStandaloneJong =
+        runChars.length === 1 &&
+        firstRunParts?.length === 2 &&
+        firstRunParts.every((part) => CHOSEONG_MAP.has(part));
       const pendingJongSplit =
         lastPart?.kind === "syllable" && lastPart.jong
           ? JONG_SPLIT.get(lastPart.jong)
@@ -419,7 +429,7 @@ export class HangulComposer {
       }
 
       let composed = composeSmart(candidateRaw);
-      if (!isValidComposed(composed) && replacedTail) {
+      if (!isValidComposed(composed) && replacedTail && !expandsStandaloneJong) {
         candidateRaw = appendedRaw;
         composed = composeSmart(candidateRaw);
         replacedTail = false;

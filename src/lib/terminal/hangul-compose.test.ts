@@ -80,6 +80,13 @@ describe("HangulComposer", () => {
     expect(netText(["ㄱ", "ㄱ", "ㅏ"])).toBe("ㄱ가");
   });
 
+  test("standalone compound-final commits stay as separate consonants", () => {
+    expect(netText(["ㅄ"])).toBe("ㅂㅅ");
+    expect(netText(["ㅂ", "ㅄ"])).toBe("ㅂㅅ");
+    expect(netText(["ㄳ"])).toBe("ㄱㅅ");
+    expect(netText(["ㅁ", "ㅏ", "ㄳ"])).toBe("맋");
+  });
+
   test("direct tense consonant composes normally", () => {
     expect(netText(["ㄲ", "ㅏ"])).toBe("까");
   });
@@ -151,6 +158,7 @@ describe("composeJamoSequence", () => {
 
   test("keeps standalone jamo that cannot form syllables", () => {
     expect(composeJamoSequence("ㄱㄴㄷ")).toBe("ㄱㄴㄷ");
+    expect(composeJamoSequence("ㅄ")).toBe("ㅂㅅ");
   });
 
   test("leaves latin and digits untouched", () => {

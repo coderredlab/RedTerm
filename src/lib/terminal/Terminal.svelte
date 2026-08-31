@@ -176,9 +176,9 @@
   let charWidth = $state(8.4);
   let charHeight = $state(Math.round(settingsStore.fontSize * LINE_HEIGHT_MULTIPLIER));
 
-  function compositionInputStyle(): string {
-    const left = TERMINAL_HORIZONTAL_PADDING_PX + cursorPos.x * charWidth;
-    const top = cursorPos.y * charHeight - viewportTop;
+  function compositionInputStyle(position: { x: number; y: number } = cursorPos): string {
+    const left = TERMINAL_HORIZONTAL_PADDING_PX + position.x * charWidth;
+    const top = position.y * charHeight - viewportTop;
     return `left: calc(var(--terminal-horizontal-padding, 4px) + ${left}px); top: ${top}px; height: ${charHeight}px; font-size: ${settingsStore.fontSize}px; line-height: ${charHeight}px;`;
   }
 
@@ -1167,6 +1167,7 @@
   let redrawPending = false;
   let isComposing = $state(false);
   let compositionText = $state("");
+  let compositionAnchor = $state({ x: 0, y: 0 });
   let immediateCompositionText = "";
   let compositionTimeout: number | null = null;
   const hangulComposer = new HangulComposer();
@@ -2876,6 +2877,7 @@
   }
   // Composition handlers for Korean/CJK input
   function handleCompositionStart() {
+    compositionAnchor = { ...cursorPos };
     isComposing = true;
     compositionText = "";
     immediateCompositionText = "";
@@ -2903,7 +2905,8 @@
     }
   }
   function handleCompositionUpdate(e: CompositionEvent) {
-    compositionText = e.data ?? hiddenInput?.value ?? "";
+    const text = e.data ?? hiddenInput?.value ?? "";
+    compositionText = isDesktopTarget ? composeJamoSequence(text) : text;
   }
 
   function handleCompositionEnd(e: CompositionEvent) {
@@ -3015,7 +3018,7 @@
     // deferred until compositionend.
     if (isComposing) {
       const text = value || inputEvent.data || "";
-      compositionText = text;
+      compositionText = isDesktopTarget ? composeJamoSequence(text) : text;
       if (
         inputEvent.inputType === "insertCompositionText" &&
         /^[\x20-\x7e]*$/.test(text) &&
@@ -3570,6 +3573,12 @@
     }
   }
 
+  export function pasteUploadedImagePath(targetSessionId: string, remotePath: string): boolean {
+    if (kind === "local" || sessionId !== targetSessionId) return false;
+    sendPastedText(remotePath);
+    return true;
+  }
+
   /// Persist the current screen so a caller moving this terminal between
   /// containers can restore it exactly after the remount. Resolves once
   /// the backend snapshot is stored (or resolves immediately when there
@@ -3670,7 +3679,7 @@
     bind:this={hiddenInput}
     class="hidden-input"
     class:composing={isDesktopTarget && isComposing}
-    style={compositionInputStyle()}
+    style={compositionInputStyle(isComposing ? compositionAnchor : cursorPos)}
     inputmode="none"
     autocomplete="off"
     autocapitalize="off"
@@ -3681,7 +3690,7 @@
   ></textarea>
 
   {#if isDesktopTarget && isComposing && compositionText}
-    <div class="composition-view" style={compositionInputStyle()} aria-hidden="true">
+    <div class="composition-view" style={compositionInputStyle(compositionAnchor)} aria-hidden="true">
       <span class="composition-text">{compositionText}</span><span class="composition-caret"></span>
     </div>
   {/if}

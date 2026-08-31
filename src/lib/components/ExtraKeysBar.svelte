@@ -23,10 +23,11 @@
 
   interface Props {
     onToggleKeyboard?: () => void;
+    onImageUploaded: (tabId: string, sessionId: string, remotePath: string) => boolean;
     voiceInputController: VoiceInputController;
   }
 
-  let { onToggleKeyboard, voiceInputController }: Props = $props();
+  let { onToggleKeyboard, onImageUploaded, voiceInputController }: Props = $props();
 
   const encoder = new TextEncoder();
   const LONG_PRESS_DELAY_MS = 350;
@@ -187,6 +188,7 @@
       showStatus("No active session");
       return;
     }
+    const targetTabId = activeTab.id;
     const targetSessionId = activeTab.sessionId;
 
     if (file.size > MAX_CLIPBOARD_IMAGE_BYTES) {
@@ -200,7 +202,9 @@
     try {
       const bytes = new Uint8Array(await file.arrayBuffer());
       const uploadResult = await sshUploadClipboardImage(targetSessionId, bytes);
-      sshWrite(targetSessionId, encoder.encode(uploadResult.remote_path)).catch(console.error);
+      if (!onImageUploaded(targetTabId, targetSessionId, uploadResult.remote_path)) {
+        throw new Error("Session is no longer available");
+      }
       showStatus("Image path received");
     } catch (error) {
       console.error("[ExtraKeysBar] image upload failed:", error);
