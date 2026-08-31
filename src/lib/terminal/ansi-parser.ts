@@ -653,10 +653,17 @@ export class AnsiParser {
     return Math.max(1, last);
   }
 
-  resize(cols: number, rows: number) {
-    if (cols === this.cols && rows === this.rows) return;
+  resize(cols: number, rows: number, trackedPosition?: { x: number; y: number }) {
+    if (cols === this.cols && rows === this.rows) {
+      return trackedPosition ? { ...trackedPosition } : undefined;
+    }
 
-    type RowOrigin = { oldRow: number; startCol: number; endCol: number };
+    type RowOrigin = {
+      oldRow: number;
+      startCol: number;
+      endCol: number;
+      reflowed: boolean;
+    };
 
     const oldBuffer = this.buffer;
     const oldScrollback = this.scrollback;
@@ -678,6 +685,7 @@ export class AnsiParser {
       oldRow,
       startCol: 0,
       endCol: Math.max(oldCols, imageContentLengths.get(oldRow) ?? 0),
+      reflowed: false,
     });
     const mainScreenUsesFullScrollRegion =
       this.mainScreenBuffer !== null &&
@@ -775,6 +783,7 @@ export class AnsiParser {
                   oldRow: origin.oldRow,
                   startCol: origin.startCol + start,
                   endCol: origin.startCol + end,
+                  reflowed: true,
                 }
               : null,
           );
@@ -851,12 +860,17 @@ export class AnsiParser {
 
     const anchorDestinations = new Map<
       number,
-      Array<{ startCol: number; endCol: number; row: number }>
+      Array<{ startCol: number; endCol: number; row: number; reflowed: boolean }>
     >();
     const recordDestination = (origin: RowOrigin | null, row: number) => {
       if (!origin) return;
       const destinations = anchorDestinations.get(origin.oldRow) ?? [];
-      destinations.push({ startCol: origin.startCol, endCol: origin.endCol, row });
+      destinations.push({
+        startCol: origin.startCol,
+        endCol: origin.endCol,
+        row,
+        reflowed: origin.reflowed,
+      });
       anchorDestinations.set(origin.oldRow, destinations);
     };
     for (let y = 0; y < nextScrollbackOrigins.length; y++) {
@@ -864,6 +878,24 @@ export class AnsiParser {
     }
     for (let y = 0; y < finalOrigins.length; y++) {
       recordDestination(finalOrigins[y], nextScrollback.length + y);
+    }
+
+    let resizedTrackedPosition: { x: number; y: number } | null | undefined;
+    if (trackedPosition) {
+      const destinations = anchorDestinations.get(trackedPosition.y);
+      const destination =
+        destinations?.find((candidate) =>
+          trackedPosition.x >= candidate.startCol && trackedPosition.x < candidate.endCol
+        ) ?? destinations?.at(-1);
+      const trackedRowWillReflow = cols < oldCols && destination?.reflowed === true;
+      resizedTrackedPosition = destination
+        ? {
+            x: trackedRowWillReflow
+              ? trackedPosition.x % cols
+              : Math.min(cols - 1, Math.max(0, trackedPosition.x)),
+            y: destination.row,
+          }
+        : null;
     }
 
     const previousImages = this.images;
@@ -897,6 +929,7 @@ export class AnsiParser {
     this.markFullBufferDirty();
     this.refreshKittyVirtualOrigins();
     this.markAllRowsDirty();
+    return resizedTrackedPosition;
   }
 
   private oscSequenceLimit(): number {

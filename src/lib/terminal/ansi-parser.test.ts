@@ -2153,6 +2153,59 @@ describe("AnsiParser resize", () => {
     expect(parser.getCursor()).toEqual({ x: 2, y: 2 });
   });
 
+  test("maps a tracked preedit anchor independently from the live cursor", () => {
+    const parser = new AnsiParser(80, 6);
+    parser.write("x".repeat(73));
+
+    const resizedAnchor = parser.resize(40, 6, { x: 70, y: 0 });
+
+    expect(resizedAnchor).toEqual({ x: 30, y: 1 });
+    expect(parser.getFullCursor()).toEqual({ x: 33, y: 1 });
+  });
+
+  test("maps an anchor after trailing spaces with the cursor column rule", () => {
+    const parser = new AnsiParser(80, 6);
+    parser.write("abc ");
+
+    const resizedAnchor = parser.resize(2, 6, { x: 4, y: 0 });
+
+    expect(resizedAnchor).toEqual({ x: 0, y: 1 });
+    expect(parser.getFullCursor()).toEqual({ x: 0, y: 1 });
+  });
+
+  test("returns null when resize drops the tracked row", () => {
+    const parser = new AnsiParser(20, 6);
+    parser.write("\x1b[6;1Hanchor\x1b[1;1H");
+
+    expect(parser.resize(20, 3, { x: 0, y: 5 })).toBeNull();
+  });
+
+  test("does not reflow a tracked row trimmed into scrollback", () => {
+    const parser = new AnsiParser(80, 6);
+    parser.write("x".repeat(70));
+    parser.write("\x1b[6;1H");
+
+    expect(parser.resize(40, 3, { x: 70, y: 0 })).toEqual({ x: 39, y: 0 });
+  });
+
+  test("reflows a tracked scrollback row pulled into the viewport", () => {
+    const parser = new AnsiParser(80, 3);
+    parser.write(`${"x".repeat(70)}\r\nrow1\r\nrow2\r\nrow3`);
+
+    expect(parser.getScrollbackLength()).toBe(1);
+    expect(parser.resize(40, 6, { x: 70, y: 0 })).toEqual({ x: 30, y: 1 });
+  });
+
+  test("clamps a tracked alternate-screen anchor without reflowing it", () => {
+    const parser = new AnsiParser(80, 6);
+    parser.write("\x1b[?1049h\x1b[1;71H");
+
+    const resizedAnchor = parser.resize(40, 6, { x: 70, y: 0 });
+
+    expect(resizedAnchor).toEqual({ x: 39, y: 0 });
+    expect(parser.getFullCursor()).toEqual({ x: 39, y: 0 });
+  });
+
   test("does not create persistent scrollback while alternate screen resizes", () => {
     const parser = new AnsiParser(20, 6);
     parser.write("\x1b[?1049h\x1b[6;1Hstatus");

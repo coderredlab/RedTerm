@@ -182,6 +182,13 @@
     return `left: calc(var(--terminal-horizontal-padding, 4px) + ${left}px); top: ${top}px; height: ${charHeight}px; font-size: ${settingsStore.fontSize}px; line-height: ${charHeight}px;`;
   }
 
+  function hasUsableCompositionAnchor(): boolean {
+    return (
+      !compositionAnchorLost &&
+      (!parser || parser.isAlternateScreen() === compositionAnchorAlternateScreen)
+    );
+  }
+
   const encoder = new TextEncoder();
   const sshOutputDecoder = new SshOutputDecoder();
 
@@ -1088,7 +1095,20 @@
     rows = newRows;
 
     if (parser) {
-      parser.resize(cols, rows);
+      const canReflowCompositionAnchor =
+        isComposing &&
+        !compositionAnchorLost &&
+        parser.isAlternateScreen() === compositionAnchorAlternateScreen;
+      const resizedAnchor = parser.resize(
+        cols,
+        rows,
+        canReflowCompositionAnchor ? compositionAnchor : undefined,
+      );
+      if (isComposing && (!canReflowCompositionAnchor || resizedAnchor === null)) {
+        compositionAnchorLost = true;
+      } else if (resizedAnchor) {
+        compositionAnchor = resizedAnchor;
+      }
     }
 
     if (sessionId) {
@@ -1168,6 +1188,8 @@
   let isComposing = $state(false);
   let compositionText = $state("");
   let compositionAnchor = $state({ x: 0, y: 0 });
+  let compositionAnchorAlternateScreen = false;
+  let compositionAnchorLost = $state(false);
   let immediateCompositionText = "";
   let compositionTimeout: number | null = null;
   const hangulComposer = new HangulComposer();
@@ -2878,6 +2900,8 @@
   // Composition handlers for Korean/CJK input
   function handleCompositionStart() {
     compositionAnchor = { ...cursorPos };
+    compositionAnchorAlternateScreen = parser?.isAlternateScreen() ?? false;
+    compositionAnchorLost = false;
     isComposing = true;
     compositionText = "";
     immediateCompositionText = "";
@@ -3689,7 +3713,7 @@
     wrap="off"
   ></textarea>
 
-  {#if isDesktopTarget && isComposing && compositionText}
+  {#if isDesktopTarget && isComposing && hasUsableCompositionAnchor() && compositionText}
     <div class="composition-view" style={compositionInputStyle(compositionAnchor)} aria-hidden="true">
       <span class="composition-text">{compositionText}</span><span class="composition-caret"></span>
     </div>
