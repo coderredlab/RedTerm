@@ -1194,6 +1194,7 @@
   let compositionAnchorAlternateScreen = false;
   let compositionAnchorLost = $state(false);
   let immediateCompositionText = "";
+  let compositionUpdateStarted = false;
   let compositionTimeout: number | null = null;
   let pendingHangulEchoCells = 0;
   const hangulComposer = new HangulComposer();
@@ -2937,6 +2938,7 @@
     isComposing = true;
     compositionText = "";
     immediateCompositionText = "";
+    compositionUpdateStarted = false;
     if (isDesktopTarget) renderer?.hideCursor();
     // 3초 stuck 타이머는 모바일(안드로이드 WebView)용 — compositionend가
     // 없을 때 플래그를 풀어 입력 막힘을 방지한다. 데스크탑 IME는
@@ -2964,7 +2966,17 @@
   }
   function handleCompositionUpdate(e: CompositionEvent) {
     const text = e.data ?? hiddenInput?.value ?? "";
-    compositionText = isDesktopTarget ? composeJamoSequence(text) : text;
+    compositionText = trackCompositionText(text);
+  }
+
+  function trackCompositionText(text: string): string {
+    if (!isDesktopTarget) return text;
+    const composed = composeJamoSequence(text);
+    if (!compositionUpdateStarted && composed) {
+      hangulComposer.beginComposition(composed);
+      compositionUpdateStarted = true;
+    }
+    return composed;
   }
 
   function handleCompositionEnd(e: CompositionEvent) {
@@ -3080,7 +3092,7 @@
     // deferred until compositionend.
     if (isComposing) {
       const text = value || inputEvent.data || "";
-      compositionText = isDesktopTarget ? composeJamoSequence(text) : text;
+      compositionText = trackCompositionText(text);
       if (
         inputEvent.inputType === "insertCompositionText" &&
         /^[\x20-\x7e]*$/.test(text) &&

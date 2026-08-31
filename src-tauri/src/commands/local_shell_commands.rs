@@ -232,10 +232,54 @@ fn local_home_dir_path() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+fn is_parent_terminal_session_env_key(key: &std::ffi::OsStr) -> bool {
+    key.to_str()
+        .and_then(|key| key.get(..6))
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("HERDR_"))
+}
+
+fn remove_parent_terminal_session_env_keys<I>(command: &mut CommandBuilder, keys: I)
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    for key in keys {
+        if is_parent_terminal_session_env_key(&key) {
+            command.env_remove(key);
+        }
+    }
+}
+
 fn configure_local_shell_command(command: &mut CommandBuilder) {
+    remove_parent_terminal_session_env_keys(command, std::env::vars_os().map(|(key, _)| key));
     command.env("TERM", LOCAL_SHELL_TERM);
     if let Some(home) = local_home_dir_path() {
         command.cwd(home);
+    }
+}
+
+#[cfg(test)]
+mod command_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn removes_only_parent_terminal_session_environment() {
+        let mut command = CommandBuilder::new("test-shell");
+        command.env("HERDR_TEST_SENTINEL", "nested");
+        command.env("REDTERM_TEST_SENTINEL", "kept");
+
+        remove_parent_terminal_session_env_keys(
+            &mut command,
+            [
+                std::ffi::OsString::from("HERDR_TEST_SENTINEL"),
+                std::ffi::OsString::from("REDTERM_TEST_SENTINEL"),
+            ],
+        );
+
+        assert_eq!(command.get_env("HERDR_TEST_SENTINEL"), None);
+        assert_eq!(
+            command.get_env("REDTERM_TEST_SENTINEL"),
+            Some(std::ffi::OsStr::new("kept"))
+        );
     }
 }
 
@@ -760,10 +804,26 @@ mod tests {
             .read_to_string(&mut output)
             .expect("read test output");
         child.wait().expect("wait for test command");
-
         assert!(output
             .lines()
             .any(|line| line.trim_end() == "TERM=xterm-256color"));
+        assert!(!output.lines().any(|line| line.starts_with("HERDR_")));
+    }
+
+    #[test]
+    fn parent_terminal_session_env_key_matches_only_herdr_prefix() {
+        assert!(is_parent_terminal_session_env_key(std::ffi::OsStr::new(
+            "HERDR_ENV"
+        )));
+        assert!(is_parent_terminal_session_env_key(std::ffi::OsStr::new(
+            "herdr_socket_path"
+        )));
+        assert!(!is_parent_terminal_session_env_key(std::ffi::OsStr::new(
+            "HERDR"
+        )));
+        assert!(!is_parent_terminal_session_env_key(std::ffi::OsStr::new(
+            "PATH"
+        )));
     }
 
     #[test]

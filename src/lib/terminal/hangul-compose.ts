@@ -341,6 +341,15 @@ export class HangulComposer {
     return this.raw.length > 0;
   }
 
+  /** Preserve a committed standalone onset when the next composition starts with the same jamo. */
+  beginComposition(initialText: string): void {
+    const rawChars = [...this.raw];
+    if (rawChars.length !== 1) return;
+    const rawParts = decomposeChar(rawChars[0]);
+    if (rawParts?.length !== 1 || !CHOSEONG_MAP.has(rawParts[0])) return;
+    if (composeJamoSequence(initialText) === rawChars[0]) this.breakWord();
+  }
+
 
   feed(text: string): HangulFeedResult {
     let erase = 0;

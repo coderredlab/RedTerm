@@ -3635,7 +3635,15 @@ export class AnsiParser {
         this.deleteLines(params[0] || 1);
         break;
       case 'S':
-        this.scrollRegionUp(params[0] || 1);
+        if (isPrivateMode) {
+          // XTSMGRAPHICS. RedTerm does not expose Sixel geometry, so report
+          // failure instead of treating the query as a scroll command.
+          if (params[0] === 2 && params[1] === 1) {
+            this.onResponse?.('\x1b[?2;3;0S');
+          }
+        } else {
+          this.scrollRegionUp(params[0] || 1);
+        }
         break;
       case 'T':
         this.scrollRegionDown(params[0] || 1);

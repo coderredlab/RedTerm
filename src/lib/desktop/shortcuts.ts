@@ -13,8 +13,9 @@ export interface DesktopShortcutHandlers {
   pasteFromClipboard(): void;
 }
 
-const IS_MAC =
-  typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
+function isMacPlatform(): boolean {
+  return typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
+}
 
 /**
  * Match desktop shortcuts on a capture-phase keydown. Returns true when the
@@ -33,10 +34,12 @@ export function handleDesktopShortcuts(
 ): boolean {
   if (!isEnabled()) return false;
 
-  const mod = IS_MAC ? event.metaKey : event.ctrlKey;
+  const isMac = isMacPlatform();
+  const mod = isMac ? event.metaKey : event.ctrlKey;
   // Non-shell-reserved combos also accept the other modifier on macOS so
   // Ctrl+Tab / Ctrl+1..9 keep working alongside the Cmd variants.
   const modLike = event.ctrlKey || event.metaKey;
+  const terminalClipboardModifier = event.ctrlKey || (isMac && event.metaKey);
   const alt = event.altKey;
   const shift = event.shiftKey;
   const key = event.key;
@@ -44,7 +47,7 @@ export function handleDesktopShortcuts(
   // shifted variants, which the app also uses) for the terminal when the key
   // was pressed inside one.
   const shellReserved =
-    !IS_MAC &&
+    !isMac &&
     terminalTarget &&
     !shift &&
     (key === "t" || key === "T" || key === "w" || key === "W" || key === "\\");
@@ -52,13 +55,13 @@ export function handleDesktopShortcuts(
   if (shellReserved) return false;
 
   // Copy selection: the Shift variant keeps plain Ctrl/Cmd+C for the shell.
-  if (terminalTarget && mod && shift && (key === "c" || key === "C")) {
+  if (terminalTarget && terminalClipboardModifier && shift && (key === "c" || key === "C")) {
     handlers.copySelection();
     return true;
   }
 
   // Paste: the Shift variant keeps plain Ctrl/Cmd+V for the shell.
-  if (terminalTarget && mod && shift && (key === "v" || key === "V")) {
+  if (terminalTarget && terminalClipboardModifier && shift && (key === "v" || key === "V")) {
     handlers.pasteFromClipboard();
     return true;
   }

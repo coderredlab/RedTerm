@@ -149,6 +149,30 @@ describe("HangulComposer", () => {
     expect(r.erase).toBe(1);
     expect(r.send).toBe("하");
   });
+  test("preserves a repeated standalone onset before the next syllable", () => {
+    const composer = new HangulComposer();
+    let out = "";
+    const apply = (data: string) => {
+      const result = composer.feed(data);
+      out = out.slice(0, out.length - result.erase) + result.send;
+    };
+
+    apply("ㅇ");
+    composer.beginComposition("ㅇ");
+    apply("안");
+    apply("녕");
+
+    expect(out).toBe("ㅇ안녕");
+  });
+
+  test("keeps a growing onset when the next composition starts with a syllable", () => {
+    const composer = new HangulComposer();
+    composer.feed("ㅇ");
+
+    composer.beginComposition("아");
+
+    expect(composer.feed("안")).toEqual({ erase: 1, send: "안" });
+  });
 });
 
 describe("composeJamoSequence", () => {

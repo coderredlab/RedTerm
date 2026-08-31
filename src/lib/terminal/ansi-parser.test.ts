@@ -236,6 +236,35 @@ describe("AnsiParser terminal capabilities and SGR", () => {
     expect(responses).toEqual(["\x1b[?64;4c"]);
   });
 
+  test("rejects unsupported XTSMGRAPHICS queries without scrolling", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    parser.write("first\r\nsecond\r\nthird");
+
+    parser.write("\x1b[?2;1;0S");
+
+    expect(parser.getBuffer().map((_, row) => visibleRowText(parser, row))).toEqual([
+      "first",
+      "second",
+      "third",
+    ]);
+    expect(responses).toEqual(["\x1b[?2;3;0S"]);
+  });
+
+  test("keeps standard CSI S scrolling behavior", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write("first\r\nsecond\r\nthird");
+
+    parser.write("\x1b[2S");
+
+    expect(parser.getBuffer().map((_, row) => visibleRowText(parser, row))).toEqual([
+      "third",
+      "",
+      "",
+    ]);
+  });
+
   test("preserves colon SGR subparameters without treating underline style as italic", () => {
     const parser = new AnsiParser(20, 3);
 
