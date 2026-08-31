@@ -2978,7 +2978,10 @@
         }
         const pending = pendingCommitKey;
         pendingCommitKey = null;
-        if (pending) queueWrite(pending.data);
+        if (pending) {
+          hangulComposer.breakWord();
+          queueWrite(pending.data);
+        }
         // WebKit may also deliver the committing space as a plain input
         // event after compositionend; drop that duplicate.
         suppressPlainSpace = pending?.suppressPlainSpace ?? false;
