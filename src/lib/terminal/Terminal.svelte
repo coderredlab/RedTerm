@@ -19,6 +19,7 @@
     sshUploadClipboardImage,
     sshUploadClipboardImageFromLocalPath,
     readClipboardImage,
+    readClipboardText,
     sshCheckHostKey,
     sshTrustHostKey,
     localShellGetOutput,
@@ -174,6 +175,12 @@
   const TERMINAL_HORIZONTAL_PADDING_PX = 8;
   let charWidth = $state(8.4);
   let charHeight = $state(Math.round(settingsStore.fontSize * LINE_HEIGHT_MULTIPLIER));
+
+  function compositionInputStyle(): string {
+    const left = TERMINAL_HORIZONTAL_PADDING_PX + cursorPos.x * charWidth;
+    const top = cursorPos.y * charHeight - viewportTop;
+    return `left: calc(var(--terminal-horizontal-padding, 4px) + ${left}px); top: ${top}px; height: ${charHeight}px; font-size: ${settingsStore.fontSize}px; line-height: ${charHeight}px;`;
+  }
 
   const encoder = new TextEncoder();
   const sshOutputDecoder = new SshOutputDecoder();
@@ -717,8 +724,10 @@
     }
   }
 
-  async function uploadClipboardImageFromLocalPath(localPath: string) {
-    const targetSessionId = sessionId;
+  async function uploadClipboardImageFromLocalPath(
+    localPath: string,
+    targetSessionId: string | null = sessionId
+  ) {
     if (!targetSessionId || kind === "local") return;
     const generation = connectionGeneration;
 
@@ -750,6 +759,7 @@
 
   async function handlePaste(e: ClipboardEvent) {
     if (!sessionId) return;
+    const targetSessionId = sessionId;
     const clipboardData = e.clipboardData;
 
     // 웹 클립보드 API에서 이미지 확인 (데스크톱)
@@ -780,12 +790,13 @@
       }
     }
 
-    // Android fallback: 시스템 클립보드에서 이미지 확인
+    // Native clipboard fallback for desktop/mobile WebViews that omit image items.
+    if (kind === "local") return;
     try {
       const result = await readClipboardImage();
       if (result.found && result.localPath) {
         e.preventDefault();
-        await uploadClipboardImageFromLocalPath(result.localPath);
+        await uploadClipboardImageFromLocalPath(result.localPath, targetSessionId);
       }
     } catch {
       // readClipboardImage 실패 시 무시 (데스크톱에서는 no-op)
@@ -981,13 +992,13 @@
     androidImagePasteHandler = (event: Event) => {
       const customEvent = event as CustomEvent<{ localPath?: string }>;
 
-      if (!sessionId || tabsStore.activeTab?.sessionId !== sessionId) return;
+      const targetSessionId = sessionId;
+      if (!targetSessionId || tabsStore.activeTab?.sessionId !== targetSessionId) return;
 
       const localPath = customEvent.detail?.localPath;
       if (!localPath) return;
 
-
-      void uploadClipboardImageFromLocalPath(localPath);
+      void uploadClipboardImageFromLocalPath(localPath, targetSessionId);
     };
     window.addEventListener("redterm:android-image-paste", androidImagePasteHandler);
 
@@ -1153,7 +1164,7 @@
 
   let updatePending = false;
   let redrawPending = false;
-  let isComposing = false;
+  let isComposing = $state(false);
   let immediateCompositionText = "";
   let compositionTimeout: number | null = null;
   const hangulComposer = new HangulComposer();
@@ -2906,9 +2917,9 @@
           if (remaining) {
             writeComposed(hangulComposer.feed(remaining));
           } else if (!data) {
-            // Empty data means the IME canceled the composition: erase
-            // whatever was already shown.
-            writeComposed(hangulComposer.flushReset());
+            // Pure Hangul composition is local-only until compositionend,
+            // so cancellation resets state without deleting committed text.
+            hangulComposer.breakWord();
           }
         } else if (immediateCompositionText.startsWith(data)) {
           // Composition shrank below the ASCII already sent.
@@ -2969,12 +2980,13 @@
     // Samsung keyboard clipboard panel image paste: comes as insertFromPaste input event
     if (inputEvent.inputType === "insertFromPaste") {
       target.value = "";
+      const targetSessionId = sessionId;
       // Try reading image from clipboard via Android plugin
       void (async () => {
         try {
           const result = await readClipboardImage();
           if (result.found && result.localPath) {
-            await uploadClipboardImageFromLocalPath(result.localPath);
+            await uploadClipboardImageFromLocalPath(result.localPath, targetSessionId);
             return;
           }
         } catch {
@@ -3521,9 +3533,30 @@
     focusInput();
   }
 
-  /// Paste clipboard text into the PTY (keyboard paste shortcut path).
-  export function pasteText(text: string) {
-    if (text) sendPastedText(text);
+  /// Paste clipboard image or text into the active terminal. Desktop shortcuts
+  /// use this because intercepting Ctrl/Cmd+V prevents the native paste event.
+  export async function pasteFromClipboard() {
+    if (!sessionId) return;
+    const targetSessionId = sessionId;
+
+    if (kind !== "local") {
+      try {
+        const result = await readClipboardImage();
+        if (result.found && result.localPath) {
+          await uploadClipboardImageFromLocalPath(result.localPath, targetSessionId);
+          return;
+        }
+      } catch (error) {
+        console.error("[Terminal] clipboard image read failed:", error);
+      }
+    }
+
+    try {
+      const text = await readClipboardText();
+      if (text) sendPastedText(text);
+    } catch (error) {
+      console.error("[Terminal] clipboard text read failed:", error);
+    }
   }
 
   /// Persist the current screen so a caller moving this terminal between
@@ -3625,12 +3658,15 @@
   <textarea
     bind:this={hiddenInput}
     class="hidden-input"
+    class:composing={isDesktopTarget && isComposing}
+    style={compositionInputStyle()}
     inputmode="none"
     autocomplete="off"
     autocapitalize="off"
     data-autocorrect="off"
     spellcheck="false"
     enterkeyhint="send"
+    wrap="off"
   ></textarea>
 
   <!-- Status message -->
@@ -3918,10 +3954,7 @@
 
   .hidden-input {
     position: absolute;
-    top: 0;
-    left: 0;
     width: 1px;
-    height: 1px;
     opacity: 0;
     background: transparent;
     border: none;
@@ -3932,6 +3965,21 @@
     z-index: -1;
     pointer-events: none;
     -webkit-tap-highlight-color: transparent;
+  }
+
+  .hidden-input.composing {
+    right: var(--terminal-horizontal-padding, 4px);
+    width: auto;
+    opacity: 1;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    color: var(--terminal-fg, #f5f5f5);
+    caret-color: var(--terminal-cursor, #f5f5f5);
+    background: var(--terminal-bg, #1a0f0f);
+    font-family: "Sarasa Term K Nerd", "JetBrains Mono", "Fira Code", monospace;
+    white-space: pre;
+    z-index: 1;
   }
 
   .status-overlay {

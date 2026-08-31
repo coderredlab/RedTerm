@@ -2,7 +2,7 @@ import { getContext, setContext } from "svelte";
 
 export interface WorkspaceApi {
   registerTerminal(paneId: string, terminal: unknown): void;
-  unregisterTerminal(paneId: string): void;
+  unregisterTerminal(paneId: string, terminal: unknown): void;
   paneConnected(tabId: string, paneId: string, sessionId: string): void;
   paneDisconnected(tabId: string, paneId: string): void;
   paneRetrying(tabId: string, paneId: string): void;

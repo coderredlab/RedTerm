@@ -35,9 +35,10 @@
   $effect(() => {
     if (node.type !== "leaf" || !term) return;
     const paneId = node.paneId;
-    workspace.registerTerminal(paneId, term);
+    const terminal = term;
+    workspace.registerTerminal(paneId, terminal);
     return () => {
-      workspace.unregisterTerminal(paneId);
+      workspace.unregisterTerminal(paneId, terminal);
     };
   });
 

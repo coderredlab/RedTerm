@@ -39,7 +39,8 @@ thiserror = "2"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 keyring = "4.1.6"
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gdk = "0.18.2"

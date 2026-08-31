@@ -335,15 +335,6 @@ export class HangulComposer {
     return this.raw.length > 0;
   }
 
-  /**
-   * Drop the current word and report erasing whatever was already sent
-   * (the IME canceled or reverted the composition).
-   */
-  flushReset(): HangulFeedResult {
-    const result = { erase: [...this.emitted].length, send: "" };
-    this.reset();
-    return result;
-  }
 
   feed(text: string): HangulFeedResult {
     let erase = 0;
@@ -404,6 +395,7 @@ export class HangulComposer {
             runParts.length > lastParts.length &&
             lastParts.every((part, index) => runParts[index] === part);
           const isShrink =
+            previousTailFromJamo &&
             runParts.length > 1 &&
             lastParts.length > runParts.length &&
             runParts.every((part, index) => lastParts[index] === part);

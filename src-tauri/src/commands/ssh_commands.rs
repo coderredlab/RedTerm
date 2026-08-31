@@ -18,9 +18,10 @@ use crate::ssh::known_hosts::{
 };
 use crate::ssh::{AuthConfig, AuthMethod, SftpDirEntry, SshConnection, SshError, SshSession};
 use crate::storage::{load_saved_password_for_connection, resolve_uploaded_key_for_auth};
+#[cfg(target_os = "android")]
+use tauri_plugin_redterm_android_paste::read_clipboard_image as read_native_clipboard_image;
 #[cfg(not(target_os = "ios"))]
 use tauri_plugin_redterm_android_paste::{
-    read_clipboard_image as read_native_clipboard_image,
     set_keep_screen_on as set_native_keep_screen_on,
     set_keyboard_visible as set_native_keyboard_visible,
     ClipboardImageResult as NativeClipboardImageResult,
@@ -240,6 +241,7 @@ fn known_hosts_path(app: &AppHandle) -> Result<PathBuf, String> {
 const SSH_DATA_CHANNEL_CAPACITY: usize = 64;
 const MAX_SSH_EVENT_BYTES: usize = 64 * 1024;
 const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_CLIPBOARD_IMAGE_PIXELS: usize = 32 * 1024 * 1024;
 const MAX_RECENT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RECENT_CHUNK_COUNT: usize = 4096;
 const SSH_EVENT_BATCH_WINDOW: Duration = Duration::from_millis(4);
@@ -348,8 +350,7 @@ fn ensure_local_clipboard_image_path(app: &AppHandle, local_path: &str) -> Resul
     Ok(canonical_candidate)
 }
 
-#[cfg(target_os = "ios")]
-fn clipboard_image_staging_directory(app: &AppHandle) -> Result<String, String> {
+fn clipboard_image_staging_directory(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
         .app_cache_dir()
@@ -357,7 +358,90 @@ fn clipboard_image_staging_directory(app: &AppHandle) -> Result<String, String> 
         .join("clipboard-paste");
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("Failed to prepare clipboard cache dir: {error}"))?;
-    Ok(directory.to_string_lossy().into_owned())
+    Ok(directory)
+}
+
+struct ClipboardPngWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+impl std::io::Write for ClipboardPngWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if buffer.len() > remaining {
+            return Err(std::io::Error::other("Clipboard image exceeds 10 MiB"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn encode_clipboard_rgba_as_png(
+    width: usize,
+    height: usize,
+    rgba: &[u8],
+) -> Result<Vec<u8>, String> {
+    use image::ImageEncoder;
+
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| "Clipboard image dimensions are too large".to_string())?;
+    if width == 0 || height == 0 {
+        return Err("Clipboard image has invalid RGBA data".to_string());
+    }
+    if pixel_count > MAX_CLIPBOARD_IMAGE_PIXELS {
+        return Err("Clipboard image dimensions exceed the 32-megapixel limit".to_string());
+    }
+    let expected_len = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| "Clipboard image dimensions are too large".to_string())?;
+    if rgba.len() != expected_len {
+        return Err("Clipboard image has invalid RGBA data".to_string());
+    }
+    let width =
+        u32::try_from(width).map_err(|_| "Clipboard image width is too large".to_string())?;
+    let height =
+        u32::try_from(height).map_err(|_| "Clipboard image height is too large".to_string())?;
+    let mut png = ClipboardPngWriter {
+        bytes: Vec::new(),
+        limit: MAX_CLIPBOARD_IMAGE_BYTES as usize,
+    };
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(rgba, width, height, image::ColorType::Rgba8.into())
+        .map_err(|error| format!("Failed to encode clipboard image: {error}"))?;
+    Ok(png.bytes)
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn read_desktop_clipboard_image(app: &AppHandle) -> Result<NativeClipboardImageResult, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("Failed to open clipboard: {error}"))?;
+    let image = match clipboard.get_image() {
+        Ok(image) => image,
+        Err(arboard::Error::ContentNotAvailable) => {
+            return Ok(NativeClipboardImageResult {
+                found: false,
+                local_path: None,
+            });
+        }
+        Err(error) => return Err(format!("Failed to read clipboard image: {error}")),
+    };
+    let png = encode_clipboard_rgba_as_png(image.width, image.height, image.bytes.as_ref())?;
+    let path =
+        clipboard_image_staging_directory(app)?.join(format!("clipboard-{}.png", Uuid::new_v4()));
+    std::fs::write(&path, png)
+        .map_err(|error| format!("Failed to stage clipboard image: {error}"))?;
+    Ok(NativeClipboardImageResult {
+        found: true,
+        local_path: Some(path.to_string_lossy().into_owned()),
+    })
 }
 
 #[tauri::command]
@@ -882,16 +966,18 @@ pub async fn ssh_upload_clipboard_image_from_local_path(
     local_path: String,
 ) -> Result<SshImageUploadResult, String> {
     let safe_local_path = ensure_local_clipboard_image_path(&app, &local_path)?;
-    let metadata = std::fs::metadata(&safe_local_path)
-        .map_err(|e| format!("Failed to inspect pasted image file: {}", e))?;
-    if metadata.len() > MAX_CLIPBOARD_IMAGE_BYTES {
-        return Err("Clipboard image exceeds 10 MiB".to_string());
-    }
-
-    let data = std::fs::read(&safe_local_path)
-        .map_err(|e| format!("Failed to read pasted image file: {}", e))?;
+    let data = (|| {
+        let metadata = std::fs::metadata(&safe_local_path)
+            .map_err(|e| format!("Failed to inspect pasted image file: {}", e))?;
+        if metadata.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            return Err("Clipboard image exceeds 10 MiB".to_string());
+        }
+        std::fs::read(&safe_local_path)
+            .map_err(|e| format!("Failed to read pasted image file: {}", e))
+    })();
     std::fs::remove_file(&safe_local_path)
         .map_err(|e| format!("Failed to remove pasted image cache file: {}", e))?;
+    let data = data?;
 
     if data.is_empty() {
         return Err("No image data provided".to_string());
@@ -911,11 +997,15 @@ pub async fn ssh_upload_clipboard_image_from_local_path(
 pub async fn read_clipboard_image(app: AppHandle) -> Result<NativeClipboardImageResult, String> {
     #[cfg(target_os = "ios")]
     {
-        return read_native_clipboard_image(&app, clipboard_image_staging_directory(&app)?);
+        let directory = clipboard_image_staging_directory(&app)?;
+        return read_native_clipboard_image(&app, directory.to_string_lossy().into_owned());
     }
 
-    #[cfg(not(target_os = "ios"))]
-    read_native_clipboard_image(&app)
+    #[cfg(target_os = "android")]
+    return read_native_clipboard_image(&app);
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    read_desktop_clipboard_image(&app)
 }
 
 #[tauri::command]
@@ -1339,5 +1429,27 @@ mod tests {
         assert_eq!(detect_image_extension(b"GIF89a"), Some("gif"));
         assert_eq!(detect_image_extension(b"RIFF0000WEBP"), Some("webp"));
         assert_eq!(detect_image_extension(b"not-an-image"), None);
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn desktop_clipboard_rgba_is_encoded_as_valid_png() {
+        use std::io::Write;
+
+        let png = encode_clipboard_rgba_as_png(1, 1, &[255, 0, 0, 255])
+            .expect("RGBA clipboard pixel should encode");
+        assert_eq!(detect_image_extension(&png), Some("png"));
+        assert!(encode_clipboard_rgba_as_png(2, 1, &[255, 0, 0, 255]).is_err());
+
+        let oversized_dimensions =
+            encode_clipboard_rgba_as_png(MAX_CLIPBOARD_IMAGE_PIXELS + 1, 1, &[])
+                .expect_err("oversized dimensions should be rejected before encoding");
+        assert!(oversized_dimensions.contains("32-megapixel"));
+
+        let mut limited_writer = ClipboardPngWriter {
+            bytes: Vec::new(),
+            limit: 4,
+        };
+        assert!(limited_writer.write_all(&[0; 5]).is_err());
+        assert!(limited_writer.bytes.is_empty());
     }
 }

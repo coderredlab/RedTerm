@@ -5,7 +5,6 @@
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import {
     localShellDisconnect,
-    readClipboardText,
     sshDisconnect,
     type SavedConnection,
   } from "$lib/tauri/commands";
@@ -431,8 +430,10 @@
     registerTerminal(paneId, terminal) {
       terminals.set(paneId, terminal as Terminal);
     },
-    unregisterTerminal(paneId) {
-      terminals.delete(paneId);
+    unregisterTerminal(paneId, terminal) {
+      if (terminals.get(paneId) === terminal) {
+        terminals.delete(paneId);
+      }
     },
     paneConnected(tabId, paneId, sessionId) {
       editPaneRequestGeneration += 1;
@@ -487,19 +488,11 @@
     }
   }
 
-  async function pasteFromClipboardToActivePane() {
+  function pasteFromClipboardToActivePane() {
     const tab = tabsStore.activeTab;
     const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
     const terminal = paneId ? terminals.get(paneId) : null;
-    if (!terminal) return;
-    try {
-      const text = await readClipboardText();
-      if (text) {
-        terminal.pasteText(text);
-      }
-    } catch (error) {
-      console.error("[Terminal] paste failed:", error);
-    }
+    if (terminal) void terminal.pasteFromClipboard();
   }
 
   function onKeydownCapture(event: KeyboardEvent) {

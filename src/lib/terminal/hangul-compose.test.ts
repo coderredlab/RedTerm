@@ -19,6 +19,10 @@ describe("HangulComposer", () => {
     expect(netText(["안", "녕", "하", "세", "요"])).toBe("안녕하세요");
   });
 
+  test("completed syllable commits do not rewrite earlier text", () => {
+    expect(netText(["분", "할", "하", "면"])).toBe("분할하면");
+  });
+
   test("same-initial composed syllables stay distinct", () => {
     expect(netText(["메", "모", "리"])).toBe("메모리");
   });
@@ -119,28 +123,22 @@ describe("HangulComposer", () => {
     expect(netText(["ls -la", "123"])).toBe("ls -la123");
   });
 
-  test("flushReset erases committed output on cancel", () => {
+  test("composition cancellation keeps completed text as a boundary", () => {
     const composer = new HangulComposer();
-    composer.feed("ㅎ");
-    composer.feed("ㅏ");
-    const r = composer.flushReset();
-    expect(r.erase).toBe(1);
-    expect(r.send).toBe("");
-  });
+    expect(composer.feed("한")).toEqual({ erase: 0, send: "한" });
+    expect(composer.feed("글")).toEqual({ erase: 0, send: "글" });
 
-  test("breakWord keeps committed text without erasing", () => {
-    const composer = new HangulComposer();
-    const r1 = composer.feed("한");
-    expect(r1).toEqual({ erase: 0, send: "한" });
     composer.breakWord();
-    const r2 = composer.feed("ㄱㅡㄹ");
-    expect(r2.send.startsWith("글") || r2.send === "ㄱ").toBe(true);
+
+    expect(composer.feed("입")).toEqual({ erase: 0, send: "입" });
   });
 
   test("erase count reflects characters, not code units", () => {
     const composer = new HangulComposer();
+    composer.feed("ㅎ");
+    composer.feed("하");
     composer.feed("한");
-    const r = composer.feed("하"); // resend shrink: replace 한 with 하
+    const r = composer.feed("하"); // jamo-led resend shrinks 한 back to 하
     expect(r.erase).toBe(1);
     expect(r.send).toBe("하");
   });
