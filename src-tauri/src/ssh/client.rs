@@ -1,8 +1,8 @@
 use russh::client::{self, Config, Handle, Msg};
 use russh::keys::{load_secret_key, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::ChannelMsg;
-use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, OpenFlags};
+use russh_sftp::client::{RawSftpSession, SftpSession};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, Packet, StatusCode};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
@@ -315,6 +315,52 @@ impl SshConnection {
             .map_err(|e| SshError::SessionError(e.to_string()))
     }
 
+    async fn posix_rename_via_sftp(&self, old_path: &str, new_path: &str) -> Result<(), SshError> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+
+        let session = RawSftpSession::new(channel.into_stream());
+        let version = session
+            .init()
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        if !version.extensions.contains_key("posix-rename@openssh.com") {
+            return Err(SshError::SessionError(
+                "The SFTP server does not support atomic file replacement".to_string(),
+            ));
+        }
+
+        let mut payload = Vec::with_capacity(old_path.len() + new_path.len() + 8);
+        for path in [old_path, new_path] {
+            let length = u32::try_from(path.len()).map_err(|_| {
+                SshError::SessionError("SFTP path is too long to rename".to_string())
+            })?;
+            payload.extend_from_slice(&length.to_be_bytes());
+            payload.extend_from_slice(path.as_bytes());
+        }
+        let response = session
+            .extended("posix-rename@openssh.com", payload)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        match response {
+            Packet::Status(status) if status.status_code == StatusCode::Ok => Ok(()),
+            Packet::Status(status) => Err(SshError::SessionError(format!(
+                "Atomic SFTP rename failed: {} ({})",
+                status.status_code, status.error_message
+            ))),
+            _ => Err(SshError::SessionError(
+                "Atomic SFTP rename returned an unexpected response".to_string(),
+            )),
+        }
+    }
+
     pub async fn upload_file_via_sftp(
         &self,
         extension: &str,
@@ -454,6 +500,117 @@ impl SshConnection {
         Ok(data)
     }
 
+    pub async fn write_file_via_sftp(
+        &self,
+        path: &str,
+        data: &[u8],
+        expected_data: &[u8],
+        max_bytes: u64,
+    ) -> Result<(), SshError> {
+        if data.len() as u64 > max_bytes || expected_data.len() as u64 > max_bytes {
+            return Err(SshError::SessionError(format!(
+                "File is too large to save ({} byte limit)",
+                max_bytes
+            )));
+        }
+        let _write_guard = crate::FILE_WRITE_LOCK.lock().await;
+        let sftp = self.open_sftp().await?;
+        let resolved_path = sftp
+            .canonicalize(path)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        let metadata = sftp
+            .metadata(&resolved_path)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        if !metadata.file_type().is_file() {
+            return Err(SshError::SessionError("Not a regular file".to_string()));
+        }
+        if self.read_file_via_sftp(&resolved_path, max_bytes).await? != expected_data {
+            return Err(SshError::SessionError(
+                "File changed since it was opened. Reload before saving.".to_string(),
+            ));
+        }
+
+        let parent = resolved_path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .ok_or_else(|| {
+                SshError::SessionError("Resolved SFTP path has no parent directory".to_string())
+            })?;
+        let temp_name = format!(".redterm-save-{}", uuid::Uuid::new_v4());
+        let temp_path = if parent.is_empty() {
+            format!("/{temp_name}")
+        } else {
+            format!("{parent}/{temp_name}")
+        };
+        let create_attributes = FileAttributes {
+            permissions: metadata.permissions,
+            ..FileAttributes::default()
+        };
+        let mut file = sftp
+            .open_with_flags_and_attributes(
+                &temp_path,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                create_attributes,
+            )
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        if let Err(error) = file.write_all(data).await {
+            drop(file);
+            let _ = sftp.remove_file(&temp_path).await;
+            return Err(SshError::SessionError(error.to_string()));
+        }
+        if let Err(error) = file.shutdown().await {
+            drop(file);
+            let _ = sftp.remove_file(&temp_path).await;
+            return Err(SshError::SessionError(error.to_string()));
+        }
+        drop(file);
+
+        let current_data = match self.read_file_via_sftp(&resolved_path, max_bytes).await {
+            Ok(data) => data,
+            Err(error) => {
+                let _ = sftp.remove_file(&temp_path).await;
+                return Err(error);
+            }
+        };
+        if current_data != expected_data {
+            let _ = sftp.remove_file(&temp_path).await;
+            return Err(SshError::SessionError(
+                "File changed since it was opened. Reload before saving.".to_string(),
+            ));
+        }
+        let latest_metadata = match sftp.metadata(&resolved_path).await {
+            Ok(metadata) if metadata.file_type().is_file() => metadata,
+            Ok(_) => {
+                let _ = sftp.remove_file(&temp_path).await;
+                return Err(SshError::SessionError("Not a regular file".to_string()));
+            }
+            Err(error) => {
+                let _ = sftp.remove_file(&temp_path).await;
+                return Err(SshError::SessionError(error.to_string()));
+            }
+        };
+        let preserved_attributes = FileAttributes {
+            uid: latest_metadata.uid,
+            gid: latest_metadata.gid,
+            permissions: latest_metadata.permissions,
+            ..FileAttributes::default()
+        };
+        if let Err(error) = sftp.set_metadata(&temp_path, preserved_attributes).await {
+            let _ = sftp.remove_file(&temp_path).await;
+            return Err(SshError::SessionError(format!(
+                "Failed to preserve file ownership and permissions: {}",
+                error
+            )));
+        }
+        if let Err(error) = self.posix_rename_via_sftp(&temp_path, &resolved_path).await {
+            let _ = sftp.remove_file(&temp_path).await;
+            return Err(error);
+        }
+        Ok(())
+    }
     pub async fn download_file_via_sftp(
         &self,
         remote_path: &str,

@@ -1,0 +1,23 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-local-shell",
+  "description": "Desktop-only local shell, local file access, and SFTP file writes",
+  "windows": ["main"],
+  "platforms": ["linux", "macOS", "windows"],
+  "permissions": [
+    "allow-local-shell-start",
+    "allow-local-shell-write",
+    "allow-local-shell-resize",
+    "allow-local-shell-disconnect",
+    "allow-local-shell-get-output",
+    "allow-local-home-dir",
+    "allow-local-list-dir",
+    "allow-local-read-file",
+    "allow-local-write-file",
+    "allow-local-download-file",
+    "allow-local-download-to-dir",
+    "allow-preview-cache-acquire",
+    "allow-preview-cache-release",
+    "allow-sftp-write-file"
+  ]
+}

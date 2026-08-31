@@ -1038,7 +1038,9 @@
             viewportTop = scrollContainer.scrollTop;
           }
 
-          cursorPos = { ...parser.getFullCursor() };
+          const nextCursor = { ...parser.getFullCursor() };
+          followCommittedHangulEcho(nextCursor);
+          cursorPos = nextCursor;
           parserCursorVisible = parser.isCursorVisible();
           buffer = buf;
 
@@ -1193,6 +1195,7 @@
   let compositionAnchorLost = $state(false);
   let immediateCompositionText = "";
   let compositionTimeout: number | null = null;
+  let pendingHangulEchoCells = 0;
   const hangulComposer = new HangulComposer();
   let pendingCommitKey: { data: string; suppressPlainSpace: boolean } | null = null;
   let suppressPlainSpace = false;
@@ -1453,7 +1456,9 @@
 
       const newBuffer = parser.getFullBuffer();
       buffer = newBuffer;
-      cursorPos = { ...parser.getFullCursor() };
+      const nextCursor = { ...parser.getFullCursor() };
+      followCommittedHangulEcho(nextCursor);
+      cursorPos = nextCursor;
       parserCursorVisible = parser.isCursorVisible();
 
 
@@ -2405,6 +2410,7 @@
       resetParser();
       hangulComposer.reset();
       pendingCommitKey = null;
+      pendingHangulEchoCells = 0;
       suppressPlainSpace = false;
 
       const reconnected = await connectNewSession(false, generation);
@@ -2675,9 +2681,12 @@
     if (statusMessage) return;
 
     if (e.pointerType === "mouse") {
+      // Rendered URLs take local precedence over remote TUI mouse reporting.
       const localSelectionOverride =
         e.button === 0 && e.shiftKey && shouldForwardTerminalMouseEvents();
-      if (shouldForwardTerminalMouseEvents() && !localSelectionOverride) {
+      const localUrlClick =
+        e.button === 0 && !!findUrlAtCell(buffer, pointerToCell(e));
+      if (shouldForwardTerminalMouseEvents() && !localSelectionOverride && !localUrlClick) {
         if (e.button < 0 || e.button > 2) return;
         e.preventDefault();
         suppressNextFocus = true;
@@ -2904,6 +2913,21 @@
     requestRedraw();
     if (parser?.isSynchronizedOutput()) scheduleSynchronizedOutputRender();
   }
+  function followCommittedHangulEcho(nextCursor: { x: number; y: number }) {
+    if (pendingHangulEchoCells === 0) return;
+    const advancedCells =
+      (nextCursor.y - cursorPos.y) * cols + (nextCursor.x - cursorPos.x);
+    if (advancedCells <= 0) return;
+    if (
+      isComposing &&
+      hasUsableCompositionAnchor() &&
+      compositionAnchor.x === cursorPos.x &&
+      compositionAnchor.y === cursorPos.y
+    ) {
+      compositionAnchor = { ...nextCursor };
+    }
+    pendingHangulEchoCells = Math.max(0, pendingHangulEchoCells - advancedCells);
+  }
 
   // Composition handlers for Korean/CJK input
   function handleCompositionStart() {
@@ -2961,7 +2985,7 @@
         if (data.startsWith(immediateCompositionText)) {
           const remaining = data.slice(immediateCompositionText.length);
           if (remaining) {
-            writeComposed(hangulComposer.feed(remaining));
+            writeComposed(hangulComposer.feed(remaining), true);
           } else if (!data) {
             // Pure Hangul composition is local-only until compositionend,
             // so cancellation resets state without deleting committed text.
@@ -2974,7 +2998,7 @@
         } else {
           // Composition replaced (e.g. candidate pick): erase, then send anew.
           queueWrite(getBackspaceInputCode().repeat(immediateCompositionText.length));
-          writeComposed(hangulComposer.feed(data));
+          writeComposed(hangulComposer.feed(data), true);
         }
         const pending = pendingCommitKey;
         pendingCommitKey = null;
@@ -3375,7 +3399,15 @@
   }
 
   // Apply on-screen modifier state to a single composed character and write.
-  function writeComposed(result: HangulFeedResult) {
+  function writeComposed(result: HangulFeedResult, trackCommittedHangulEcho = false) {
+    if (trackCommittedHangulEcho && result.erase === 0) {
+      const committedCells = [...result.send].reduce(
+        (cells, character) =>
+          /[ᄀ-ᇿ㄰-㆏가-힯]/u.test(character) ? cells + 2 : cells,
+        0,
+      );
+      pendingHangulEchoCells += committedCells;
+    }
     if (result.erase > 0) queueWrite(getBackspaceInputCode().repeat(result.erase));
     writeInputText(result.send);
   }
@@ -3473,6 +3505,7 @@
     }
     hangulComposer.reset();
     pendingCommitKey = null;
+    pendingHangulEchoCells = 0;
     if (deferredUpdateTimer) {
       clearTimeout(deferredUpdateTimer);
       deferredUpdateTimer = null;

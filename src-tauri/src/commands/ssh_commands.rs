@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, LazyLock, Mutex,
 };
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1082,7 +1082,7 @@ async fn sftp_connection_for_session(
         .ok_or_else(|| "Session not found".to_string())
 }
 
-pub(crate) fn ensure_local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
+fn local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base_dir = app
         .path()
         .app_cache_dir()
@@ -1091,19 +1091,33 @@ pub(crate) fn ensure_local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, 
 
     std::fs::create_dir_all(&base_dir)
         .map_err(|e| format!("Failed to prepare preview cache dir: {}", e))?;
+    Ok(base_dir)
+}
+
+pub(crate) fn ensure_local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let base_dir = local_sftp_preview_dir(app)?;
     prune_stale_sftp_previews(&base_dir);
     Ok(base_dir)
 }
 
 const SFTP_PREVIEW_PART_MAX_AGE_SECS: u64 = 60 * 60;
 const SFTP_PREVIEW_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+static ACTIVE_PREVIEW_CACHE_FILES: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn prune_stale_sftp_previews(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let active = ACTIVE_PREVIEW_CACHE_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
+        let path = entry.path();
+        if active.contains_key(&path) {
+            continue;
+        }
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
@@ -1122,11 +1136,57 @@ fn prune_stale_sftp_previews(dir: &Path) {
             .map(|secs| secs > SFTP_PREVIEW_MAX_AGE_SECS)
             .unwrap_or(false);
         if stale_part || stale {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(path);
         }
     }
 }
 
+#[tauri::command]
+pub fn preview_cache_acquire(app: AppHandle, local_path: String) -> Result<bool, String> {
+    let base_dir = ensure_local_sftp_preview_dir(&app)?;
+    let candidate = PathBuf::from(local_path);
+    if !candidate.starts_with(&base_dir) {
+        return Err("Preview cache path is outside the app cache".to_string());
+    }
+    let mut active = ACTIVE_PREVIEW_CACHE_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let canonical_base = std::fs::canonicalize(&base_dir)
+        .map_err(|e| format!("Failed to access preview cache: {}", e))?;
+    let canonical_candidate = match std::fs::canonicalize(&candidate) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Failed to access preview cache file: {}", error)),
+    };
+    if !canonical_candidate.starts_with(canonical_base) {
+        return Err("Preview cache path is outside the app cache".to_string());
+    }
+    if !canonical_candidate.is_file() {
+        return Ok(false);
+    }
+    *active.entry(candidate).or_insert(0) += 1;
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn preview_cache_release(app: AppHandle, local_path: String) -> Result<(), String> {
+    let base_dir = local_sftp_preview_dir(&app)?;
+    let candidate = PathBuf::from(local_path);
+    if !candidate.starts_with(&base_dir) {
+        return Err("Preview cache path is outside the app cache".to_string());
+    }
+    let mut active = ACTIVE_PREVIEW_CACHE_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(count) = active.get_mut(&candidate) {
+        if *count > 1 {
+            *count -= 1;
+        } else {
+            active.remove(&candidate);
+        }
+    }
+    Ok(())
+}
 #[tauri::command]
 pub async fn sftp_list_dir(
     session_manager: State<'_, Arc<SessionManager>>,
@@ -1159,6 +1219,26 @@ pub async fn sftp_read_file(
         content_base64: base64::engine::general_purpose::STANDARD.encode(&data),
         size,
     })
+}
+
+#[tauri::command]
+pub async fn sftp_write_file(
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    path: String,
+    content: String,
+    expected_content: String,
+) -> Result<(), String> {
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+    connection
+        .write_file_via_sftp(
+            &path,
+            content.as_bytes(),
+            expected_content.as_bytes(),
+            MAX_SFTP_PREVIEW_READ_BYTES,
+        )
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -1451,5 +1531,32 @@ mod tests {
         };
         assert!(limited_writer.write_all(&[0; 5]).is_err());
         assert!(limited_writer.bytes.is_empty());
+    }
+    #[test]
+    fn stale_preview_pruning_keeps_leased_files_until_release() {
+        let dir =
+            std::env::temp_dir().join(format!("redterm-preview-cache-lease-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("preview test dir should be created");
+        let path = dir.join("active-preview.pdf");
+        let file = std::fs::File::create(&path).expect("preview test file should be created");
+        file.set_times(std::fs::FileTimes::new().set_modified(
+            std::time::SystemTime::now() - Duration::from_secs(SFTP_PREVIEW_MAX_AGE_SECS + 1),
+        ))
+        .expect("preview test file should become stale");
+
+        ACTIVE_PREVIEW_CACHE_FILES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.clone(), 1);
+        prune_stale_sftp_previews(&dir);
+        assert!(path.exists());
+
+        ACTIVE_PREVIEW_CACHE_FILES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&path);
+        prune_stale_sftp_previews(&dir);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir).expect("preview test dir should be removed");
     }
 }

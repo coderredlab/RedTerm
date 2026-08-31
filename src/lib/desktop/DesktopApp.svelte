@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount, tick } from "svelte";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import ConnectionDialog from "$lib/components/ConnectionDialog.svelte";
-  import { tabsStore, type Pane } from "$lib/stores/tabs.svelte";
+  import { tabsStore, type Pane, type PaneNode } from "$lib/stores/tabs.svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import {
     localShellDisconnect,
@@ -23,7 +24,6 @@
   import PaneView from "./workspace/PaneView.svelte";
   import TabStrip from "./workspace/TabStrip.svelte";
   import SettingsModal from "./workspace/SettingsModal.svelte";
-  import FileViewer from "./workspace/FileViewer.svelte";
   import { desktopPrefsStore } from "./workspace/desktop-prefs.svelte";
   import {
     dragTargets,
@@ -44,18 +44,36 @@
   let connectionsViewRequest = $state(0);
 
   const terminals = new Map<string, Terminal>();
+  const closingTabIds = new Set<string>();
+  const closingPaneIds = new Set<string>();
+
+  function tabIsClosing(tabId: string): boolean {
+    return (
+      closingTabIds.has(tabId) ||
+      (tabsStore.getTab(tabId)?.panes.some((pane) => closingPaneIds.has(pane.id)) ?? false)
+    );
+  }
+
+  function paneIsClosing(tabId: string, paneId: string): boolean {
+    return closingPaneIds.has(paneId) || tabIsClosing(tabId);
+  }
+  let windowCloseConfirmed = false;
+
+  function paneShowsDocument(node: PaneNode, paneId: string): boolean {
+    if (node.type === "leaf") {
+      return node.paneIds.includes(paneId) && node.activeItem.kind === "document";
+    }
+    return (
+      paneShowsDocument(node.children[0], paneId) ||
+      paneShowsDocument(node.children[1], paneId)
+    );
+  }
 
   const sidebarColumn = $derived(
     desktopPrefsStore.prefs.sidebarCollapsed
       ? "0px"
       : `${desktopPrefsStore.prefs.sidebarWidth}px`
   );
-
-  let previewEntry = $state<{
-    name: string;
-    path: string;
-    size: number;
-  } | null>(null);
 
   const activePane = $derived(tabsStore.getActivePane());
   const explorerKind = $derived<"ssh" | "local" | null>(
@@ -81,8 +99,13 @@
     const tab = tabsStore.activeTab;
     const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
     const overlayFree =
-      !showDialog && !settingsOpen && !previewEntry && sessionsReconciled;
-    if (!tab || !paneId || !overlayFree) return;
+      !showDialog && !settingsOpen && sessionsReconciled;
+    if (
+      !tab ||
+      !paneId ||
+      !overlayFree ||
+      paneShowsDocument(tab.layout, paneId)
+    ) return;
 
     void (async () => {
       // Let newly mounted panes register their terminal first.
@@ -97,6 +120,38 @@
   onMount(() => {
     void reconcilePersistedSessions();
     void retryPendingManagedKeyCleanup();
+
+    let disposed = false;
+    let unlistenCloseRequested: (() => void) | undefined;
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (windowCloseConfirmed || (!hasDirtyDocuments() && !hasSavingDocuments())) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+
+    if ("__TAURI_INTERNALS__" in window) {
+      void getCurrentWindow()
+        .onCloseRequested((event) => {
+          if (windowCloseConfirmed || (!hasDirtyDocuments() && !hasSavingDocuments())) return;
+          if (confirmDiscardAllDocuments()) {
+            windowCloseConfirmed = true;
+          } else {
+            event.preventDefault();
+          }
+        })
+        .then((unlisten) => {
+          if (disposed) unlisten();
+          else unlistenCloseRequested = unlisten;
+        })
+        .catch((error) => console.error("Window close listener error:", error));
+    }
+
+    return () => {
+      disposed = true;
+      unlistenCloseRequested?.();
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+    };
   });
 
   async function disconnectTerminal(paneId: string) {
@@ -181,6 +236,7 @@
   }
 
   async function handleEditPaneConnection(tabId: string, paneId: string) {
+    if (paneIsClosing(tabId, paneId)) return;
     const requestGeneration = ++editPaneRequestGeneration;
     let pane = tabsStore.getPane(tabId, paneId);
     if (!pane || pane.kind === "local") return;
@@ -225,23 +281,92 @@
     editPaneRequestGeneration += 1;
     settingsOpen = true;
   }
-  async function closeTabById(tabId: string) {
-    const paneIds = tabsStore.getTab(tabId)?.panes.map((pane) => pane.id);
-    if (!paneIds) return;
 
-    const removedPanes: Pane[] = [];
-    await serializeLayoutSnapshotOperation(async () => {
-      for (const paneId of paneIds) {
-        await disconnectTerminal(paneId);
-        const current = findPaneLocation(paneId);
-        if (!current) continue;
-        const removedPane = await tabsStore.closePane(current.tabId, paneId);
-        if (removedPane) removedPanes.push(removedPane);
-      }
-    });
-    await cleanupUnreferencedManagedKeys(
-      transientManagedKeyIds(removedPanes)
+  function hasDirtyDocuments(): boolean {
+    return tabsStore.tabs.some((tab) =>
+      tab.documents.some((document) => document.dirty)
     );
+  }
+
+  function hasSavingDocuments(): boolean {
+    return tabsStore.tabs.some((tab) =>
+      tab.documents.some((document) => document.saveState === "saving")
+    );
+  }
+  function confirmDiscardAllDocuments(): boolean {
+    const savingDocuments = tabsStore.tabs.flatMap((tab) =>
+      tab.documents.filter((document) => document.saveState === "saving")
+    );
+    if (savingDocuments.length > 0) {
+      const label =
+        savingDocuments.length === 1
+          ? `"${savingDocuments[0]!.name}"`
+          : `${savingDocuments.length} documents`;
+      window.alert(`Please wait for ${label} to finish saving before closing RedTerm.`);
+      return false;
+    }
+    const dirtyDocuments = tabsStore.tabs.flatMap((tab) =>
+      tab.documents.filter((document) => document.dirty)
+    );
+    if (dirtyDocuments.length === 0) return true;
+    const label =
+      dirtyDocuments.length === 1
+        ? `"${dirtyDocuments[0]!.name}"`
+        : `${dirtyDocuments.length} documents`;
+    return window.confirm(
+      `Discard unsaved changes in ${label} and close RedTerm?`
+    );
+  }
+
+  function confirmDiscardDocuments(tabId: string, sourcePaneId?: string): boolean {
+    const documents = (tabsStore.getTab(tabId)?.documents ?? []).filter(
+      (document) =>
+        sourcePaneId === undefined || document.sourcePaneId === sourcePaneId
+    );
+    const savingDocuments = documents.filter(
+      (document) => document.saveState === "saving"
+    );
+    if (savingDocuments.length > 0) {
+      const label =
+        savingDocuments.length === 1
+          ? `"${savingDocuments[0]!.name}"`
+          : `${savingDocuments.length} documents`;
+      window.alert(`Please wait for ${label} to finish saving before closing.`);
+      return false;
+    }
+    const dirtyDocuments = documents.filter((document) => document.dirty);
+    if (dirtyDocuments.length === 0) return true;
+    const label =
+      dirtyDocuments.length === 1
+        ? `"${dirtyDocuments[0]!.name}"`
+        : `${dirtyDocuments.length} documents`;
+    return window.confirm(`Discard unsaved changes in ${label}?`);
+  }
+  async function closeTabById(tabId: string) {
+    const tab = tabsStore.getTab(tabId);
+    if (!tab || tabIsClosing(tabId) || !confirmDiscardDocuments(tabId)) return;
+    const paneIds = tab.panes.map((pane) => pane.id);
+    closingTabIds.add(tabId);
+    for (const paneId of paneIds) closingPaneIds.add(paneId);
+    try {
+      tabsStore.closeDocuments(tabId);
+      const removedPanes: Pane[] = [];
+      await serializeLayoutSnapshotOperation(async () => {
+        for (const paneId of paneIds) {
+          await disconnectTerminal(paneId);
+          const current = findPaneLocation(paneId);
+          if (!current) continue;
+          const removedPane = await tabsStore.closePane(current.tabId, paneId);
+          if (removedPane) removedPanes.push(removedPane);
+        }
+      });
+      await cleanupUnreferencedManagedKeys(
+        transientManagedKeyIds(removedPanes)
+      );
+    } finally {
+      closingTabIds.delete(tabId);
+      for (const paneId of paneIds) closingPaneIds.delete(paneId);
+    }
   }
 
   function closeActivePane() {
@@ -301,10 +426,28 @@
     paneId: string,
     dir: "row" | "col"
   ): Promise<void> {
+    if (paneIsClosing(tabId, paneId)) return;
     return serializeLayoutSnapshotOperation(async () => {
       await storeTabSnapshots([tabId]);
+      if (paneIsClosing(tabId, paneId)) return;
       await tick();
       await tabsStore.splitPane(tabId, paneId, dir);
+      for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {
+        terminals.get(pane.id)?.syncSize();
+      }
+    });
+  }
+
+  async function addPaneTabWithSnapshot(
+    tabId: string,
+    paneId: string
+  ): Promise<void> {
+    if (paneIsClosing(tabId, paneId)) return;
+    return serializeLayoutSnapshotOperation(async () => {
+      await storeTabSnapshots([tabId]);
+      if (paneIsClosing(tabId, paneId)) return;
+      await tick();
+      await tabsStore.addPaneTab(tabId, paneId);
       for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {
         terminals.get(pane.id)?.syncSize();
       }
@@ -380,15 +523,19 @@
     sourceTabId: string,
     zone: DropZone
   ) {
+    if (tabIsClosing(sourceTabId)) return;
     const targetTabId = tabsStore.activeTabId;
     if (!targetTabId || targetTabId === sourceTabId) return;
+    if (tabIsClosing(targetTabId)) return;
     const source = tabsStore.getTab(sourceTabId);
     if (!source) return;
 
     const dir = zone === "left" || zone === "right" ? "row" : "col";
     const side = zone === "left" || zone === "top" ? "before" : "after";
+    if (tabIsClosing(sourceTabId) || tabIsClosing(targetTabId)) return;
     await serializeLayoutSnapshotOperation(async () => {
       await storeTabSnapshots([sourceTabId, targetTabId]);
+      if (tabIsClosing(sourceTabId) || tabIsClosing(targetTabId)) return;
       await tick();
       await tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
       for (const pane of tabsStore.getTab(targetTabId)?.panes ?? []) {
@@ -398,6 +545,7 @@
   }
 
   async function handlePaneDrop(tabId: string, paneId: string) {
+    if (paneIsClosing(tabId, paneId)) return;
     if (!workspaceEl) return;
     const hit = document.elementFromPoint(
       tabDrag.pointerX,
@@ -405,6 +553,7 @@
     )?.closest<HTMLElement>("[data-pane-id]");
     const targetPaneId = hit?.dataset.paneId;
     if (!targetPaneId || targetPaneId === paneId) return;
+    if (paneIsClosing(tabId, targetPaneId)) return;
 
     // Direction comes from the hovered pane's own rect so the split happens
     // where the pointer actually is, not relative to the whole workspace.
@@ -419,6 +568,7 @@
     await serializeLayoutSnapshotOperation(async () => {
       await storeTabSnapshots([tabId]);
       await tick();
+      if (paneIsClosing(tabId, paneId) || paneIsClosing(tabId, targetPaneId)) return;
       await tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side);
       for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {
         terminals.get(pane.id)?.syncSize();
@@ -452,27 +602,44 @@
       void closeTabById(tabId);
     },
     closePane(_tabId, paneId) {
-      void serializeLayoutSnapshotOperation(async () => {
-        const initial = findPaneLocation(paneId);
-        if (!initial) return;
-        await storeTabSnapshots([initial.tabId]);
-        await disconnectTerminal(paneId);
-        const current = findPaneLocation(paneId);
-        if (!current) return;
-        const removedPane = await tabsStore.closePane(current.tabId, paneId);
-        const keyIds = transientManagedKeyIds(removedPane ? [removedPane] : []);
-        await cleanupUnreferencedManagedKeys(keyIds);
-        await tick();
-        for (const pane of tabsStore.getTab(current.tabId)?.panes ?? []) {
-          terminals.get(pane.id)?.syncSize();
+      if (paneIsClosing(_tabId, paneId) || !confirmDiscardDocuments(_tabId, paneId)) return;
+      closingPaneIds.add(paneId);
+      void (async () => {
+        try {
+          tabsStore.closeDocuments(_tabId, paneId);
+          await serializeLayoutSnapshotOperation(async () => {
+            const initial = findPaneLocation(paneId);
+            if (!initial) return;
+            await storeTabSnapshots([initial.tabId]);
+            await disconnectTerminal(paneId);
+            const current = findPaneLocation(paneId);
+            if (!current) return;
+            const removedPane = await tabsStore.closePane(current.tabId, paneId);
+            const keyIds = transientManagedKeyIds(removedPane ? [removedPane] : []);
+            await cleanupUnreferencedManagedKeys(keyIds);
+            await tick();
+            for (const pane of tabsStore.getTab(current.tabId)?.panes ?? []) {
+              terminals.get(pane.id)?.syncSize();
+            }
+          });
+        } finally {
+          closingPaneIds.delete(paneId);
         }
-      });
+      })();
     },
     splitPane(tabId, paneId, dir) {
       void splitPaneWithSnapshot(tabId, paneId, dir);
     },
+    addPaneTab(tabId, paneId) {
+      void addPaneTabWithSnapshot(tabId, paneId);
+    },
     activatePane(tabId, paneId) {
-      tabsStore.setActivePane(tabId, paneId);
+      void tabsStore.setActivePane(tabId, paneId).then(() => {
+        terminals.get(paneId)?.syncSize();
+      });
+    },
+    activateDocument(tabId, documentId) {
+      void tabsStore.setActiveDocument(tabId, documentId);
     },
     paneDragDropped(tabId, paneId) {
       void handlePaneDrop(tabId, paneId);
@@ -515,7 +682,7 @@
         pasteFromClipboard: () => void pasteFromClipboardToActivePane(),
         openSettings: handleOpenSettings,
       },
-      () => !showDialog && !settingsOpen && !previewEntry && sessionsReconciled,
+      () => !showDialog && !settingsOpen && sessionsReconciled,
       terminalTarget
     );
     if (consumed) {
@@ -549,8 +716,11 @@
     onNewConnection={handleNewConnection}
     onOpenLocal={() => void tabsStore.addLocalTab()}
     onPreview={(entry) => {
-      editPaneRequestGeneration += 1;
-      previewEntry = entry;
+      const tab = tabsStore.activeTab;
+      const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
+      if (tab && paneId && !paneIsClosing(tab.id, paneId)) {
+        void tabsStore.openDocument(tab.id, paneId, entry);
+      }
     }}
   />
 
@@ -595,9 +765,9 @@
             <PaneView
               tabId={tab.id}
               node={tab.layout}
-              interactive={!showDialog &&
+              interactive={
+                !showDialog &&
                 !settingsOpen &&
-                !previewEntry &&
                 tab.id === tabsStore.activeTabId}
               activePaneId={tab.activePaneId}
             />
@@ -625,12 +795,6 @@
 
   <SettingsModal open={settingsOpen} onClose={() => (settingsOpen = false)} />
 
-  <FileViewer
-    entry={previewEntry}
-    sessionId={activeSessionId}
-    kind={explorerKind ?? "ssh"}
-    onClose={() => (previewEntry = null)}
-  />
 
   {#if tabDrag.active}
     <div

@@ -459,6 +459,136 @@ pub async fn local_read_file(path: String) -> Result<SftpFileContent, String> {
     })
 }
 
+async fn read_local_file_for_save(path: &Path) -> Result<Vec<u8>, String> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| format!("Failed to read file before saving: {}", e))?;
+    let mut data = Vec::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|e| format!("Failed to read file before saving: {}", e))?;
+        if read == 0 {
+            break;
+        }
+        if data.len() as u64 + read as u64 > MAX_LOCAL_PREVIEW_READ_BYTES {
+            return Err(format!(
+                "File exceeded the {} byte save limit while checking for changes",
+                MAX_LOCAL_PREVIEW_READ_BYTES
+            ));
+        }
+        data.extend_from_slice(&buffer[..read]);
+    }
+    Ok(data)
+}
+
+#[tauri::command]
+pub async fn local_write_file(
+    path: String,
+    content: String,
+    expected_content: String,
+) -> Result<(), String> {
+    let scoped = ensure_within_home(Path::new(&path))?;
+    let _write_guard = crate::FILE_WRITE_LOCK.lock().await;
+    let metadata = tokio::fs::metadata(&scoped)
+        .await
+        .map_err(|e| format!("Failed to read file metadata: {}", e))?;
+    if !metadata.file_type().is_file() {
+        return Err("Not a regular file".to_string());
+    }
+    if content.len() as u64 > MAX_LOCAL_PREVIEW_READ_BYTES
+        || expected_content.len() as u64 > MAX_LOCAL_PREVIEW_READ_BYTES
+    {
+        return Err(format!(
+            "File is too large to save ({} byte limit)",
+            MAX_LOCAL_PREVIEW_READ_BYTES
+        ));
+    }
+    let expected_bytes = expected_content.as_bytes();
+    if read_local_file_for_save(&scoped).await? != expected_bytes {
+        return Err("File changed since it was opened. Reload before saving.".to_string());
+    }
+
+    let parent = scoped
+        .parent()
+        .ok_or_else(|| "File has no parent directory".to_string())?;
+    let temp_path = parent.join(format!(".redterm-save-{}.tmp", uuid::Uuid::new_v4()));
+    let mut temp_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .await
+        .map_err(|e| format!("Failed to create temporary save file: {}", e))?;
+    let write_result = async {
+        temp_file.write_all(content.as_bytes()).await?;
+        temp_file.flush().await?;
+        temp_file.sync_all().await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    drop(temp_file);
+    if let Err(error) = write_result {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(format!("Failed to write temporary save file: {}", error));
+    }
+
+    let current_content = match read_local_file_for_save(&scoped).await {
+        Ok(content) => content,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(error);
+        }
+    };
+    if current_content != expected_bytes {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err("File changed since it was opened. Reload before saving.".to_string());
+    }
+    let latest_metadata = match tokio::fs::metadata(&scoped).await {
+        Ok(metadata) if metadata.file_type().is_file() => metadata,
+        Ok(_) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err("Not a regular file".to_string());
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(format!(
+                "Failed to read file metadata before saving: {}",
+                error
+            ));
+        }
+    };
+    let preserve_result = async {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let temp_metadata = tokio::fs::metadata(&temp_path).await?;
+            let uid =
+                (temp_metadata.uid() != latest_metadata.uid()).then_some(latest_metadata.uid());
+            let gid =
+                (temp_metadata.gid() != latest_metadata.gid()).then_some(latest_metadata.gid());
+            if uid.is_some() || gid.is_some() {
+                let owner_path = temp_path.clone();
+                tokio::task::spawn_blocking(move || std::os::unix::fs::chown(owner_path, uid, gid))
+                    .await
+                    .map_err(std::io::Error::other)??;
+            }
+        }
+        tokio::fs::set_permissions(&temp_path, latest_metadata.permissions()).await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await;
+    if let Err(error) = preserve_result {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(format!("Failed to preserve file metadata: {}", error));
+    }
+    if let Err(error) = tokio::fs::rename(&temp_path, &scoped).await {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(format!("Failed to replace file atomically: {}", error));
+    }
+    Ok(())
+}
 async fn copy_with_progress(
     from: &Path,
     to: &Path,
@@ -694,5 +824,79 @@ mod tests {
         assert_eq!(replay[0].data, first.data);
         assert_eq!(replay[1].seq, second.seq);
         assert_eq!(replay[1].data, second.data);
+    }
+    #[tokio::test]
+    async fn local_write_rejects_stale_content_without_overwriting() {
+        let home = local_home_dir_path().expect("test home directory");
+        let path = home.join(format!(
+            ".redterm-save-conflict-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::write(&path, b"original")
+            .await
+            .expect("create test file");
+        let path_text = path.to_string_lossy().to_string();
+
+        let error = local_write_file(path_text.clone(), "mine".to_string(), "stale".to_string())
+            .await
+            .expect_err("stale save must fail");
+        assert_eq!(
+            error,
+            "File changed since it was opened. Reload before saving."
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read unchanged file"),
+            b"original"
+        );
+
+        local_write_file(path_text, "mine".to_string(), "original".to_string())
+            .await
+            .expect("save unchanged file");
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read saved file"),
+            b"mine"
+        );
+        tokio::fs::remove_file(&path)
+            .await
+            .expect("remove test file");
+    }
+    #[tokio::test]
+    async fn concurrent_local_writes_allow_only_one_shared_baseline() {
+        let home = local_home_dir_path().expect("test home directory");
+        let path = home.join(format!(
+            ".redterm-concurrent-save-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::write(&path, b"original")
+            .await
+            .expect("create test file");
+        let path_text = path.to_string_lossy().to_string();
+
+        let first = local_write_file(
+            path_text.clone(),
+            "first".to_string(),
+            "original".to_string(),
+        );
+        let second = local_write_file(path_text, "second".to_string(), "original".to_string());
+        let (first_result, second_result) = tokio::join!(first, second);
+
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let expected: &[u8] = if first_result.is_ok() {
+            b"first"
+        } else {
+            b"second"
+        };
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read winning save"),
+            expected
+        );
+        let conflict = first_result.err().or_else(|| second_result.err());
+        assert_eq!(
+            conflict.as_deref(),
+            Some("File changed since it was opened. Reload before saving.")
+        );
+        tokio::fs::remove_file(&path)
+            .await
+            .expect("remove test file");
     }
 }

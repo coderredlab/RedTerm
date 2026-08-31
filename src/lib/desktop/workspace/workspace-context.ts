@@ -10,7 +10,9 @@ export interface WorkspaceApi {
   closeTab(tabId: string): void;
   closePane(tabId: string, paneId: string): void;
   splitPane(tabId: string, paneId: string, dir: "row" | "col"): void;
+  addPaneTab(tabId: string, paneId: string): void;
   activatePane(tabId: string, paneId: string): void;
+  activateDocument(tabId: string, documentId: string): void;
   /** Commit a pane drag that ended over the workspace. */
   paneDragDropped(tabId: string, paneId: string): void;
 }

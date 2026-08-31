@@ -52,13 +52,13 @@ export function handleDesktopShortcuts(
   if (shellReserved) return false;
 
   // Copy selection: the Shift variant keeps plain Ctrl/Cmd+C for the shell.
-  if (mod && shift && (key === "c" || key === "C")) {
+  if (terminalTarget && mod && shift && (key === "c" || key === "C")) {
     handlers.copySelection();
     return true;
   }
 
   // Paste: the Shift variant keeps plain Ctrl/Cmd+V for the shell.
-  if (mod && shift && (key === "v" || key === "V")) {
+  if (terminalTarget && mod && shift && (key === "v" || key === "V")) {
     handlers.pasteFromClipboard();
     return true;
   }

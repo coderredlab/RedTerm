@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-preview-cache-release"
+description = "Enables the preview_cache_release command without any pre-configured scope."
+commands.allow = ["preview_cache_release"]
+
+[[permission]]
+identifier = "deny-preview-cache-release"
+description = "Denies the preview_cache_release command without any pre-configured scope."
+commands.deny = ["preview_cache_release"]

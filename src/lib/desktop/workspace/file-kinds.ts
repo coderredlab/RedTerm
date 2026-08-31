@@ -5,6 +5,7 @@ export type FilePreviewKind =
   | "image"
   | "audio"
   | "video"
+  | "pdf"
   | "unknown";
 
 const IMAGE_EXTENSIONS = new Set([
@@ -53,60 +54,23 @@ const TEXT_EXTENSIONS = new Set([
   "tsv",
 ]);
 
-/** highlight.js language ids for extensions we can highlight. */
-const CODE_EXTENSIONS: Record<string, string> = {
-  ts: "typescript",
-  mts: "typescript",
-  cts: "typescript",
-  js: "javascript",
-  mjs: "javascript",
-  cjs: "javascript",
-  jsx: "javascript",
-  tsx: "typescript",
-  rs: "rust",
-  py: "python",
-  go: "go",
-  c: "c",
-  h: "c",
-  cpp: "cpp",
-  cc: "cpp",
-  hpp: "cpp",
-  java: "java",
-  kt: "kotlin",
-  rb: "ruby",
-  php: "php",
-  swift: "swift",
-  sh: "bash",
-  bash: "bash",
-  zsh: "bash",
-  fish: "bash",
-  sql: "sql",
-  json: "json",
-  yml: "yaml",
-  yaml: "yaml",
-  xml: "xml",
-  html: "xml",
-  htm: "xml",
-  css: "css",
-  scss: "scss",
-  less: "less",
-  lua: "lua",
-  pl: "perl",
-  r: "r",
-  dart: "dart",
-  vue: "xml",
-  proto: "protobuf",
-};
+const CODE_EXTENSIONS = new Set([
+  "ts", "mts", "cts", "js", "mjs", "cjs", "jsx", "tsx",
+  "rs", "py", "go", "c", "h", "cpp", "cc", "hpp", "java",
+  "kt", "rb", "php", "swift", "sh", "bash", "zsh", "fish",
+  "sql", "json", "yml", "yaml", "xml", "html", "htm", "css",
+  "scss", "less", "lua", "pl", "r", "dart", "vue", "proto",
+]);
 
-const SPECIAL_TEXT_NAMES: Record<string, string> = {
-  dockerfile: "dockerfile",
-  makefile: "makefile",
-  "cmakelists.txt": "cmake",
-  ".gitignore": "bash",
-  ".bashrc": "bash",
-  ".zshrc": "bash",
-  ".editorconfig": "ini",
-};
+const SPECIAL_TEXT_NAMES = new Set([
+  "dockerfile",
+  "makefile",
+  "cmakelists.txt",
+  ".gitignore",
+  ".bashrc",
+  ".zshrc",
+  ".editorconfig",
+]);
 
 const MIME_BY_EXTENSION: Record<string, string> = {
   png: "image/png",
@@ -117,6 +81,7 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   svg: "image/svg+xml",
   bmp: "image/bmp",
   ico: "image/x-icon",
+  pdf: "application/pdf",
   avif: "image/avif",
   mp3: "audio/mpeg",
   wav: "audio/wav",
@@ -142,10 +107,11 @@ export function extensionOf(name: string): string {
 
 export function previewKindOf(name: string): FilePreviewKind {
   const lower = name.toLowerCase();
-  if (SPECIAL_TEXT_NAMES[lower] !== undefined) return "code";
+  if (SPECIAL_TEXT_NAMES.has(lower)) return "code";
   const ext = extensionOf(name);
+  if (ext === "pdf") return "pdf";
   if (MARKDOWN_EXTENSIONS.has(ext)) return "markdown";
-  if (ext in CODE_EXTENSIONS) return "code";
+  if (CODE_EXTENSIONS.has(ext)) return "code";
   if (IMAGE_EXTENSIONS.has(ext)) return "image";
   if (AUDIO_EXTENSIONS.has(ext)) return "audio";
   if (VIDEO_EXTENSIONS.has(ext)) return "video";
@@ -154,12 +120,6 @@ export function previewKindOf(name: string): FilePreviewKind {
   return "unknown";
 }
 
-export function highlightLanguageOf(name: string): string | null {
-  const lower = name.toLowerCase();
-  if (SPECIAL_TEXT_NAMES[lower] !== undefined) return SPECIAL_TEXT_NAMES[lower];
-  const ext = extensionOf(name);
-  return CODE_EXTENSIONS[ext] ?? null;
-}
 
 export function mimeOf(name: string): string {
   return MIME_BY_EXTENSION[extensionOf(name)] ?? "application/octet-stream";

@@ -304,6 +304,14 @@ export interface SftpDownloadedFile {
 export const MAX_SFTP_READ_BYTES = 2 * 1024 * 1024;
 export const MAX_SFTP_DOWNLOAD_BYTES = 200 * 1024 * 1024;
 
+export async function previewCacheAcquire(localPath: string): Promise<boolean> {
+  return invoke<boolean>("preview_cache_acquire", { localPath });
+}
+
+export async function previewCacheRelease(localPath: string): Promise<void> {
+  return invoke("preview_cache_release", { localPath });
+}
+
 export async function sftpListDir(
   sessionId: string,
   path: string
@@ -318,6 +326,14 @@ export async function sftpReadFile(
   return invoke<SftpFileContent>("sftp_read_file", { sessionId, path });
 }
 
+export async function sftpWriteFile(
+  sessionId: string,
+  path: string,
+  content: string,
+  expectedContent: string
+): Promise<void> {
+  return invoke<void>("sftp_write_file", { sessionId, path, content, expectedContent });
+}
 export async function sftpDownloadFile(
   sessionId: string,
   remotePath: string
@@ -354,6 +370,14 @@ export async function localListDir(path: string): Promise<SftpDirEntry[]> {
 
 export async function localReadFile(path: string): Promise<SftpFileContent> {
   return invoke<SftpFileContent>("local_read_file", { path });
+}
+
+export async function localWriteFile(
+  path: string,
+  content: string,
+  expectedContent: string
+): Promise<void> {
+  return invoke<void>("local_write_file", { path, content, expectedContent });
 }
 
 /** System clipboard plain text for the terminal paste shortcut. */

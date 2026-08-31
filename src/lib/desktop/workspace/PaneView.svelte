@@ -1,6 +1,10 @@
 <script lang="ts">
   import Terminal from "$lib/terminal/Terminal.svelte";
-  import { tabsStore, type PaneNode } from "$lib/stores/tabs.svelte";
+  import {
+    tabsStore,
+    type PaneDocument,
+    type PaneNode,
+  } from "$lib/stores/tabs.svelte";
   import {
     dragTargets,
     resetTabDrag,
@@ -8,6 +12,7 @@
     zoneFromPoint,
   } from "./drag-state.svelte";
   import { getWorkspaceApi } from "./workspace-context";
+  import PaneDocumentView from "./PaneDocumentView.svelte";
   import Self from "./PaneView.svelte";
 
   interface Props {
@@ -23,7 +28,7 @@
   const workspace = getWorkspaceApi();
   let splitEl: HTMLDivElement | null = $state(null);
   let liveRatio = $state(0.5);
-  let term: Terminal | null = $state(null);
+  let terminalRefs = $state<Record<string, Terminal | undefined>>({});
   let resizePointerId: number | null = null;
 
   $effect(() => {
@@ -33,12 +38,18 @@
   });
 
   $effect(() => {
-    if (node.type !== "leaf" || !term) return;
-    const paneId = node.paneId;
-    const terminal = term;
-    workspace.registerTerminal(paneId, terminal);
+    if (node.type !== "leaf") return;
+    const registered = node.paneIds.flatMap((paneId) => {
+      const terminal = terminalRefs[paneId];
+      return terminal ? [{ paneId, terminal }] : [];
+    });
+    for (const { paneId, terminal } of registered) {
+      workspace.registerTerminal(paneId, terminal);
+    }
     return () => {
-      workspace.unregisterTerminal(paneId, terminal);
+      for (const { paneId, terminal } of registered) {
+        workspace.unregisterTerminal(paneId, terminal);
+      }
     };
   });
 
@@ -164,6 +175,20 @@
     window.addEventListener("pointercancel", windowCancel, true);
     header.setPointerCapture(event.pointerId);
   }
+
+  function closeDocument(document: PaneDocument) {
+    if (document.saveState === "saving") {
+      window.alert(`Please wait for "${document.name}" to finish saving before closing it.`);
+      return;
+    }
+    if (
+      document.dirty &&
+      !window.confirm(`Discard unsaved changes to "${document.name}"?`)
+    ) {
+      return;
+    }
+    void tabsStore.closeDocument(tabId, document.id);
+  }
 </script>
 
 {#if node.type === "split"}
@@ -192,87 +217,169 @@
   {@const pane = tabsStore.getPane(tabId, node.paneId)}
   {@const focused = interactive && activePaneId === node.paneId}
   {#if pane}
-    {#key node.paneId}
       <section
         class="pane"
         class:focused
         data-pane-id={node.paneId}
-        onpointerdowncapture={() => workspace.activatePane(tabId, node.paneId)}
       >
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <header
-        class="pane-header"
-        onpointerdown={(event) => startPaneDrag(event, node.paneId, pane.title)}
-      >
-        <span
-          class="pane-state"
-          class:connected={pane.connected}
-          aria-hidden="true"
-        ></span>
-        <span class="pane-title">{pane.title}</span>
-        <button
-          class="pane-action"
-          title="Split right"
-          aria-label="Split right"
-          onpointerdown={(event) => event.stopPropagation()}
-          onclick={() => workspace.splitPane(tabId, node.paneId, "row")}
-        >
-          <svg viewBox="0 0 14 14" aria-hidden="true">
-            <rect x="1" y="2" width="12" height="10" rx="1" />
-            <line x1="7" y1="2" x2="7" y2="12" />
-          </svg>
-        </button>
-        <button
-          class="pane-action"
-          title="Split down"
-          aria-label="Split down"
-          onpointerdown={(event) => event.stopPropagation()}
-          onclick={() => workspace.splitPane(tabId, node.paneId, "col")}
-        >
-          <svg viewBox="0 0 14 14" aria-hidden="true">
-            <rect x="1" y="2" width="12" height="10" rx="1" />
-            <line x1="1" y1="7" x2="13" y2="7" />
-          </svg>
-        </button>
-        <button
-          class="pane-action pane-close"
-          title="Close pane"
-          aria-label="Close pane"
-          onpointerdown={(event) => event.stopPropagation()}
-          onclick={() => workspace.closePane(tabId, node.paneId)}
-        >
-          ×
-        </button>
-      </header>
-      <div class="pane-terminal">
-        {#key pane.connection}
-        <Terminal
-          host={pane.connection.host}
-          port={pane.connection.port}
-          auth={pane.connection.auth}
-          existingSessionId={pane.sessionId}
-          connectionId={pane.connection.connectionId}
-          startupScript={pane.connection.startupScript}
-          startupScriptReadyText={pane.connection.startupScriptReadyText}
-          interactive={focused}
-          refocusOnBlur={activePaneId === node.paneId}
-          disconnectOnDestroy={!pane.preserveSessionOnMove}
-          kind={pane.kind ?? "ssh"}
-          onConnected={(sessionId) =>
-            workspace.paneConnected(tabId, node.paneId, sessionId)}
-          onRetryConnection={() => workspace.paneRetrying(tabId, node.paneId)}
-          onEditConnection={pane.kind === "local"
-            ? undefined
-            : () => workspace.editPaneConnection(tabId, node.paneId)}
-          onCloseTab={() => workspace.closeTab(tabId)}
-          onDisconnected={() => workspace.paneDisconnected(tabId, node.paneId)}
-          bind:this={term}
-          onTitleChange={(title) => tabsStore.setPaneTitle(tabId, node.paneId, title)}
-        />
-        {/key}
-      </div>
+        <header class="pane-header">
+          <div class="pane-tabs" role="tablist" aria-label="Pane tabs">
+            {#each node.paneIds as paneId}
+              {@const tabPane = tabsStore.getPane(tabId, paneId)}
+              {#if tabPane}
+                <div
+                  class="terminal-tab"
+                  class:active={node.activeItem.kind === "terminal" && node.activeItem.id === paneId}
+                >
+                  <button
+                    class="terminal-tab-main"
+                    role="tab"
+                    aria-selected={node.activeItem.kind === "terminal" && node.activeItem.id === paneId}
+                    title={tabPane.title}
+                    onpointerdown={(event) => startPaneDrag(event, paneId, tabPane.title)}
+                    onclick={() => workspace.activatePane(tabId, paneId)}
+                  >
+                    <span
+                      class="pane-state"
+                      class:connected={tabPane.connected}
+                      aria-hidden="true"
+                    ></span>
+                    <span class="pane-title">{tabPane.title}</span>
+                  </button>
+                  <button
+                    class="terminal-tab-close"
+                    title="Close terminal tab"
+                    aria-label={`Close ${tabPane.title}`}
+                    onpointerdown={(event) => event.stopPropagation()}
+                    onclick={() => workspace.closePane(tabId, paneId)}
+                  >×</button>
+                </div>
+              {/if}
+            {/each}
+            {#each node.documentIds as documentId}
+              {@const document = tabsStore.getDocument(tabId, documentId)}
+              {#if document}
+                <div
+                  class="terminal-tab document-tab"
+                  class:active={node.activeItem.kind === "document" && node.activeItem.id === documentId}
+                >
+                  <button
+                    class="terminal-tab-main"
+                    role="tab"
+                    aria-selected={node.activeItem.kind === "document" && node.activeItem.id === documentId}
+                    title={document.path}
+                    onclick={() => workspace.activateDocument(tabId, documentId)}
+                  >
+                    <span class="document-icon" aria-hidden="true">F</span>
+                    <span class="pane-title">{document.name}</span>
+                    {#if document.dirty}
+                      <span class="dirty-indicator" aria-label="Unsaved changes"></span>
+                    {/if}
+                  </button>
+                  <button
+                    class="terminal-tab-close"
+                    title="Close document tab"
+                    aria-label={`Close ${document.name}`}
+                    disabled={document.saveState === "saving"}
+                    onclick={() => closeDocument(document)}
+                  >×</button>
+                </div>
+              {/if}
+            {/each}
+          </div>
+          <div class="pane-tools">
+            <button
+              class="pane-action"
+              title="New terminal tab"
+              aria-label="New terminal tab"
+              onclick={() => workspace.addPaneTab(tabId, node.paneId)}
+            >+</button>
+            <button
+              class="pane-action"
+              title="Split right"
+              aria-label="Split right"
+              onclick={() => workspace.splitPane(tabId, node.paneId, "row")}
+            >
+              <svg viewBox="0 0 14 14" aria-hidden="true">
+                <rect x="1" y="2" width="12" height="10" rx="1" />
+                <line x1="7" y1="2" x2="7" y2="12" />
+              </svg>
+            </button>
+            <button
+              class="pane-action"
+              title="Split down"
+              aria-label="Split down"
+              onclick={() => workspace.splitPane(tabId, node.paneId, "col")}
+            >
+              <svg viewBox="0 0 14 14" aria-hidden="true">
+                <rect x="1" y="2" width="12" height="10" rx="1" />
+                <line x1="1" y1="7" x2="13" y2="7" />
+              </svg>
+            </button>
+          </div>
+        </header>
+        <div class="pane-content">
+          {#each node.paneIds as terminalPaneId (terminalPaneId)}
+            {@const terminalPane = tabsStore.getPane(tabId, terminalPaneId)}
+            {#if terminalPane}
+              <div
+                class="pane-terminal"
+                class:active={node.activeItem.kind === "terminal" && node.activeItem.id === terminalPaneId}
+                aria-hidden={node.activeItem.kind !== "terminal" || node.activeItem.id !== terminalPaneId}
+                onpointerdowncapture={() => workspace.activatePane(tabId, terminalPaneId)}
+              >
+                {#key terminalPane.connection}
+                  <Terminal
+                    host={terminalPane.connection.host}
+                    port={terminalPane.connection.port}
+                    auth={terminalPane.connection.auth}
+                    existingSessionId={terminalPane.sessionId}
+                    connectionId={terminalPane.connection.connectionId}
+                    startupScript={terminalPane.connection.startupScript}
+                    startupScriptReadyText={terminalPane.connection.startupScriptReadyText}
+                    interactive={focused && node.activeItem.kind === "terminal" && node.activeItem.id === terminalPaneId}
+                    refocusOnBlur={focused && node.activeItem.kind === "terminal" && node.activeItem.id === terminalPaneId}
+                    disconnectOnDestroy={!terminalPane.preserveSessionOnMove}
+                    kind={terminalPane.kind ?? "ssh"}
+                    onConnected={(sessionId) =>
+                      workspace.paneConnected(tabId, terminalPaneId, sessionId)}
+                    onRetryConnection={() => workspace.paneRetrying(tabId, terminalPaneId)}
+                    onEditConnection={terminalPane.kind === "local"
+                      ? undefined
+                      : () => workspace.editPaneConnection(tabId, terminalPaneId)}
+                    onCloseTab={() => workspace.closePane(tabId, terminalPaneId)}
+                    onDisconnected={() => workspace.paneDisconnected(tabId, terminalPaneId)}
+                    bind:this={terminalRefs[terminalPaneId]}
+                    onTitleChange={(title) => tabsStore.setPaneTitle(tabId, terminalPaneId, title)}
+                  />
+                {/key}
+              </div>
+            {/if}
+          {/each}
+          {#if node.activeItem.kind === "document"}
+            {@const activeDocument = tabsStore.getDocument(tabId, node.activeItem.id)}
+            {#if activeDocument}
+              <div
+                class="pane-document"
+                onpointerdowncapture={() => {
+                  if (!focused) workspace.activateDocument(tabId, activeDocument.id);
+                }}
+                onfocusin={() => {
+                  if (!focused) workspace.activateDocument(tabId, activeDocument.id);
+                }}
+              >
+                {#key activeDocument.id}
+                  <PaneDocumentView
+                    {tabId}
+                    document={activeDocument}
+                    active={focused}
+                  />
+                {/key}
+              </div>
+            {/if}
+          {/if}
+        </div>
       </section>
-    {/key}
   {/if}
 {/if}
 
@@ -334,7 +441,6 @@
   }
 
   .pane.focused .pane-header {
-    color: var(--text-primary);
     border-bottom-color: color-mix(
       in srgb,
       var(--accent-primary) 55%,
@@ -346,18 +452,78 @@
     height: 30px;
     flex: 0 0 auto;
     display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 0 6px 0 12px;
+    align-items: stretch;
+    gap: 4px;
+    padding: 0 4px;
     border-bottom: 1px solid var(--border-primary);
     background: color-mix(in srgb, var(--bg-secondary) 72%, var(--bg-primary));
     color: var(--text-muted);
     user-select: none;
+  }
+
+  .pane-tabs {
+    min-width: 0;
+    flex: 1;
+    display: flex;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .terminal-tab {
+    min-width: 112px;
+    max-width: 220px;
+    flex: 0 1 180px;
+    display: flex;
+    align-items: stretch;
+    border-left: 1px solid transparent;
+    border-right: 1px solid var(--border-primary);
+  }
+
+  .terminal-tab.active {
+    border-left-color: var(--border-primary);
+    background: var(--terminal-bg);
+    color: var(--text-primary);
+  }
+
+  .terminal-tab-main,
+  .terminal-tab-close {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  .terminal-tab-main {
+    min-width: 0;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 0 4px 0 10px;
     cursor: grab;
   }
 
-  .pane-header:active {
-    cursor: grabbing;
+  .terminal-tab-close {
+    width: 24px;
+    flex: 0 0 24px;
+    opacity: 0;
+    font-size: 15px;
+  }
+
+  .terminal-tab:hover .terminal-tab-close,
+  .terminal-tab.active .terminal-tab-close {
+    opacity: 1;
+  }
+
+  .terminal-tab-close:hover {
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+  }
+
+  .pane-tools {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
   }
 
   .pane-state {
@@ -410,13 +576,50 @@
     stroke-width: 1.2;
   }
 
-  .pane-close {
-    font-size: 16px;
+
+  .document-icon {
+    width: 14px;
+    height: 16px;
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    border: 1px solid currentColor;
+    border-radius: 2px;
+    font-size: 8px;
   }
 
+  .dirty-indicator {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background: var(--accent-primary);
+  }
+
+  .pane-content,
   .pane-terminal {
     position: relative;
     flex: 1;
+    width: 100%;
     min-height: 0;
+    min-width: 0;
+  }
+
+
+  .pane-terminal {
+    display: none;
+  }
+
+  .pane-terminal.active {
+    display: block;
+  }
+
+  .pane-document {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+  }
+  .pane-content {
+    display: flex;
   }
 </style>

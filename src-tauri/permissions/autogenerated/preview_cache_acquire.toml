@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-preview-cache-acquire"
+description = "Enables the preview_cache_acquire command without any pre-configured scope."
+commands.allow = ["preview_cache_acquire"]
+
+[[permission]]
+identifier = "deny-preview-cache-acquire"
+description = "Denies the preview_cache_acquire command without any pre-configured scope."
+commands.deny = ["preview_cache_acquire"]
