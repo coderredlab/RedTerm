@@ -850,15 +850,16 @@
     renderer.drawVisibleRowText(buf, startRow, endRow);
     renderer.drawImages(images, startRow, endRow, 'above');
 
+    drawSelectionIfActive(startRow);
+
     // 커서
-    if (connected && cursorVisible && parserCursorVisible) {
+    if (connected && cursorVisible && parserCursorVisible && !(isDesktopTarget && isComposing)) {
       const cursorScreenY = cursorPos.y - startRow;
       if (cursorScreenY >= 0 && cursorScreenY < rows + 2) {
-        renderer.drawCursor(cursorPos.x, cursorScreenY);
+        renderer.drawCursor(cursorPos.x, cursorScreenY, isDesktopTarget);
       }
     }
 
-    drawSelectionIfActive(startRow);
     renderer.endDraw();
   }
 
@@ -1056,10 +1057,10 @@
           renderer.drawImages(images, startRow, endRow, 'below');
           renderer.drawVisibleRowText(buf, startRow, endRow);
           renderer.drawImages(images, startRow, endRow, 'above');
-          if (connected && cursorVisible && parserCursorVisible) {
+          if (connected && cursorVisible && parserCursorVisible && !(isDesktopTarget && isComposing)) {
             const cursorScreenY = cursorPos.y - startRow;
             if (cursorScreenY >= 0 && cursorScreenY < rows + 2) {
-              renderer.drawCursor(cursorPos.x, cursorScreenY);
+              renderer.drawCursor(cursorPos.x, cursorScreenY, isDesktopTarget);
             }
           }
           renderer.endDraw();
@@ -1491,15 +1492,16 @@
 
       prevCursorY = cursorPos.y;
 
+      drawSelectionIfActive(startRow);
+
       // 커서 그리기
       const cursorScreenY = cursorPos.y - startRow;
-      if (connected && cursorVisible && parserCursorVisible) {
+      if (connected && cursorVisible && parserCursorVisible && !(isDesktopTarget && isComposing)) {
         if (cursorScreenY >= 0 && cursorScreenY < rows + 2) {
-          renderer.drawCursor(cursorPos.x, cursorScreenY);
+          renderer.drawCursor(cursorPos.x, cursorScreenY, isDesktopTarget);
         }
       }
 
-      drawSelectionIfActive(startRow);
       renderer.endDraw();
       parser.clearDirtyRows();
       scheduleImageAnimation();
@@ -2897,6 +2899,12 @@
       parser?.getKittyKeyboardFlags() ?? 0,
     ) ?? "\x7f";
   }
+  function redrawDesktopCursorAfterComposition() {
+    if (!isDesktopTarget) return;
+    requestRedraw();
+    if (parser?.isSynchronizedOutput()) scheduleSynchronizedOutputRender();
+  }
+
   // Composition handlers for Korean/CJK input
   function handleCompositionStart() {
     compositionAnchor = { ...cursorPos };
@@ -2905,6 +2913,7 @@
     isComposing = true;
     compositionText = "";
     immediateCompositionText = "";
+    if (isDesktopTarget) renderer?.hideCursor();
     // 3초 stuck 타이머는 모바일(안드로이드 WebView)용 — compositionend가
     // 없을 때 플래그를 풀어 입력 막힘을 방지한다. 데스크탑 IME는
     // compositionend를 확실히 주므로 플래그를 임의로 끄지 않는다.
@@ -2925,6 +2934,7 @@
         isComposing = false;
         compositionText = "";
         compositionTimeout = null;
+        redrawDesktopCursorAfterComposition();
       }, 30000);
     }
   }
@@ -2988,6 +2998,7 @@
     if (hiddenInput) {
       hiddenInput.value = "";
     }
+    redrawDesktopCursorAfterComposition();
   }
 
   // Handle textarea input (main input method for mobile)

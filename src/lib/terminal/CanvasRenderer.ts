@@ -52,6 +52,7 @@ export class CanvasRenderer {
   private animatedImageTimer: ReturnType<typeof setInterval> | null = null;
   private animatedImageSeenThisFrame = false;
   private animationsEnabled = true;
+  private cursorSnapshot: { x: number; y: number; pixels: ImageData } | null = null;
 
 
   charWidth = 0;
@@ -119,6 +120,7 @@ export class CanvasRenderer {
     // 오프스크린도 동일 크기
     this.offscreen.width = pw;
     this.offscreen.height = ph;
+    this.cursorSnapshot = null;
 
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.ctx.font = `${this.config.fontSize}px ${this.config.fontFamily}`;
@@ -131,6 +133,7 @@ export class CanvasRenderer {
   }
 
   clear() {
+    this.cursorSnapshot = null;
     const w = this.canvas.width / this.dpr;
     const h = this.canvas.height / this.dpr;
     // clearRect로 pixel buffer를 완전 리셋 후, fillRect로 배경 채우기 (Android WebView 잔상 방지)
@@ -236,15 +239,35 @@ export class CanvasRenderer {
     this.ctx.textAlign = 'start';
   }
 
-  drawCursor(cursorX: number, screenY: number) {
+  drawCursor(cursorX: number, screenY: number, captureSnapshot = false) {
     const x = this.config.horizontalPadding + cursorX * this.charWidth;
     const y = screenY * this.charHeight;
+    const width = Math.max(1, this.charWidth);
+    if (captureSnapshot) {
+      const transform = this.ctx.getTransform();
+      const left = Math.max(0, Math.floor(x * transform.a + transform.e));
+      const top = Math.max(0, Math.floor(y * transform.d + transform.f));
+      const right = Math.min(this.offscreen.width, Math.ceil((x + width) * transform.a + transform.e));
+      const bottom = Math.min(this.offscreen.height, Math.ceil((y + this.charHeight) * transform.d + transform.f));
+      this.cursorSnapshot = right > left && bottom > top
+        ? { x: left, y: top, pixels: this.ctx.getImageData(left, top, right - left, bottom - top) }
+        : null;
+    } else {
+      this.cursorSnapshot = null;
+    }
     this.ctx.fillStyle = this.config.cursorColor;
     this.ctx.globalAlpha = 0.95;
-    this.ctx.fillRect(x, y, Math.max(1, this.charWidth), this.charHeight);
+    this.ctx.fillRect(x, y, width, this.charHeight);
     this.ctx.globalAlpha = 1.0;
   }
 
+  hideCursor() {
+    const snapshot = this.cursorSnapshot;
+    if (!snapshot) return;
+    this.ctx.putImageData(snapshot.pixels, snapshot.x, snapshot.y);
+    this.visibleCtx.putImageData(snapshot.pixels, snapshot.x, snapshot.y);
+    this.cursorSnapshot = null;
+  }
   drawSelection(startRow: number, startCol: number, endRow: number, endCol: number, viewStartRow: number) {
     this.ctx.fillStyle = 'rgba(255, 107, 107, 0.3)';
 
