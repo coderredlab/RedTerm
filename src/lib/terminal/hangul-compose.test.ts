@@ -14,6 +14,17 @@ function netText(deliveries: string[]): string {
   return out;
 }
 
+function netCompositions(compositions: Array<{ initial: string; committed: string }>): string {
+  const composer = new HangulComposer();
+  let out = "";
+  for (const { initial, committed } of compositions) {
+    composer.beginComposition(initial);
+    const result = composer.feed(committed);
+    out = out.slice(0, out.length - result.erase) + result.send;
+  }
+  return out;
+}
+
 describe("HangulComposer", () => {
   test("per-syllable composed commits append", () => {
     expect(netText(["안", "녕", "하", "세", "요"])).toBe("안녕하세요");
@@ -25,6 +36,17 @@ describe("HangulComposer", () => {
 
   test("same-initial composed syllables stay distinct", () => {
     expect(netText(["메", "모", "리"])).toBe("메모리");
+  });
+
+  test("new Windows compositions do not replace a matching previous syllable", () => {
+    expect(
+      netCompositions([
+        { initial: "ㄱ", committed: "같" },
+        { initial: "ㅇ", committed: "이" },
+        { initial: "ㅇ", committed: "있" },
+        { initial: "ㅇ", committed: "음" },
+      ])
+    ).toBe("같이있음");
   });
 
   test("jamo deltas preserve syllable boundaries", () => {

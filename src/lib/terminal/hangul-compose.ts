@@ -341,8 +341,17 @@ export class HangulComposer {
     return this.raw.length > 0;
   }
 
-  /** Preserve a committed standalone onset when the next composition starts with the same jamo. */
+  /**
+   * Start a new marked composition without losing Windows compatibility-jamo
+   * streams that arrive as one composition per jamo.
+   */
   beginComposition(initialText: string): void {
+    if (!this.raw) return;
+    if (!this.tailFromJamo) {
+      this.breakWord();
+      return;
+    }
+
     const rawChars = [...this.raw];
     if (rawChars.length !== 1) return;
     const rawParts = decomposeChar(rawChars[0]);
