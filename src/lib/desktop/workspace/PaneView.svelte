@@ -12,7 +12,6 @@
     zoneFromPoint,
   } from "./drag-state.svelte";
   import { getWorkspaceApi } from "./workspace-context";
-  import PaneDocumentView from "./PaneDocumentView.svelte";
   import Self from "./PaneView.svelte";
 
   interface Props {
@@ -368,13 +367,15 @@
                   if (!focused) workspace.activateDocument(tabId, activeDocument.id);
                 }}
               >
-                {#key activeDocument.id}
-                  <PaneDocumentView
-                    {tabId}
-                    document={activeDocument}
-                    active={focused}
-                  />
-                {/key}
+                {#await import("./PaneDocumentView.svelte") then { default: PaneDocumentView }}
+                  {#key activeDocument.id}
+                    <PaneDocumentView
+                      {tabId}
+                      document={activeDocument}
+                      active={focused}
+                    />
+                  {/key}
+                {/await}
               </div>
             {/if}
           {/if}
