@@ -320,13 +320,16 @@
 
   async function downloadCopy() {
     const sessionId = document.sourceSessionId;
-    if (downloading || (boundKind === "ssh" && !sessionId)) return;
+    const cachedPath = boundKind === "ssh" ? document.cachedLocalPath : null;
+    if (downloading || (boundKind === "ssh" && !sessionId && !cachedPath)) return;
     const directory = await chooseDownloadDirectory();
     if (!directory) return;
     downloading = true;
     actionError = "";
     try {
-      if (boundKind === "local") {
+      if (cachedPath) {
+        await localDownloadToDir(cachedPath, directory, document.name);
+      } else if (boundKind === "local") {
         await localDownloadToDir(boundPath, directory);
       } else {
         await sftpDownloadToDir(sessionId!, boundPath, directory);
@@ -509,7 +512,7 @@
     {:else if fileKind === "audio" && mediaUrl}
       <div class="media-wrap"><audio controls src={mediaUrl} onerror={recoverCachedMedia}></audio></div>
     {:else if fileKind === "video" && mediaUrl}
-      <div class="media-wrap">
+      <div class="media-wrap video-wrap">
         <!-- svelte-ignore a11y_media_has_caption -- arbitrary remote media has no caption track -->
         <video controls src={mediaUrl} onerror={recoverCachedMedia}></video>
       </div>
@@ -694,11 +697,20 @@
     overflow: auto;
   }
 
+  .video-wrap {
+    grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+  }
+
   .image-wrap img,
   .media-wrap video {
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
+  }
+
+  .video-wrap video {
+    min-width: 0;
+    min-height: 0;
   }
 
   .media-wrap audio {

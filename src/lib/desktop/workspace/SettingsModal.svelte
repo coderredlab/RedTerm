@@ -13,7 +13,7 @@
   const SHORTCUTS: Array<{ keys: string; action: string }> = [
     { keys: "Ctrl/Cmd+T", action: "New connection" },
     { keys: "Ctrl/Cmd+Shift+C", action: "Copy selection" },
-    { keys: "Cmd/Ctrl+V", action: "Paste (native)" },
+    { keys: "Ctrl/Cmd+Shift+V", action: "Paste from clipboard" },
     { keys: "Ctrl/Cmd+W", action: "Close pane" },
     { keys: "Ctrl/Cmd+Shift+W", action: "Close tab" },
     { keys: "Ctrl/Cmd+Tab", action: "Next tab" },

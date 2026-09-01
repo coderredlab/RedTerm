@@ -9,7 +9,8 @@ use tokio::sync::{mpsc, RwLock};
 
 use super::ssh_commands::{
     claim_download_destination, ensure_local_sftp_preview_dir, make_download_progress_emitter,
-    sanitize_file_name, SftpDownloadedFile, SftpFileContent, MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
+    resolve_sftp_preview_cache_file, sanitize_file_name, SftpDownloadedFile, SftpFileContent,
+    MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
 };
 use crate::ssh::SftpDirEntry;
 
@@ -745,14 +746,31 @@ pub async fn local_download_file(
     })
 }
 
-/// Copy a local file into a user-chosen directory (defaults to Downloads).
+fn download_file_name(source: &Path, requested: Option<&str>) -> String {
+    match requested {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => source
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "download".to_string()),
+    }
+}
+
+/// Copy a local file or an app-owned preview cache file into a user-chosen
+/// directory (defaults to Downloads).
 #[tauri::command]
 pub async fn local_download_to_dir(
     app: AppHandle,
     path: String,
     destination_dir: Option<String>,
+    file_name: Option<String>,
 ) -> Result<SftpDownloadedFile, String> {
-    let scoped = ensure_within_home(Path::new(&path))?;
+    let source = Path::new(&path);
+    let scoped = match ensure_within_home(source) {
+        Ok(path) => path,
+        Err(_) => resolve_sftp_preview_cache_file(&app, source)?
+            .ok_or_else(|| "File not found".to_string())?,
+    };
     if !scoped.is_file() {
         return Err("File not found".to_string());
     }
@@ -766,10 +784,7 @@ pub async fn local_download_to_dir(
     std::fs::create_dir_all(&downloads_dir)
         .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
 
-    let file_name = scoped
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".to_string());
+    let file_name = download_file_name(&scoped, file_name.as_deref());
     let destination = claim_download_destination(&downloads_dir, &sanitize_file_name(&file_name))?;
     let scoped_label = path.clone();
 
@@ -779,6 +794,16 @@ pub async fn local_download_to_dir(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_download_file_name_preserves_whitespace() {
+        let source = Path::new("/tmp/cache-preview");
+        assert_eq!(
+            download_file_name(source, Some(" report.txt ")),
+            " report.txt "
+        );
+        assert_eq!(download_file_name(source, None), "cache-preview");
+    }
 
     #[test]
     fn local_shell_sets_supported_terminal_type() {

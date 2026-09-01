@@ -395,11 +395,13 @@ export async function localDownloadFile(path: string): Promise<SftpDownloadedFil
 
 export async function localDownloadToDir(
   path: string,
-  destinationDir?: string | null
+  destinationDir?: string | null,
+  fileName?: string | null
 ): Promise<SftpDownloadedFile> {
   return invoke<SftpDownloadedFile>("local_download_to_dir", {
     path,
     destinationDir: destinationDir ?? null,
+    fileName: fileName ?? null,
   });
 }
 

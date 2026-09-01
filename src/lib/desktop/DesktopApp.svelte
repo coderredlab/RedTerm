@@ -82,6 +82,7 @@
   const activeSessionId = $derived(
     explorerKind === "local" ? null : (activePane?.sessionId ?? null)
   );
+  const explorerId = $derived(activePane?.id ?? null);
 
   $effect(() => {
     dragTargets.workspace = workspaceEl;
@@ -712,6 +713,7 @@
     collapsed={desktopPrefsStore.prefs.sidebarCollapsed}
     activeSessionId={activeSessionId}
     explorerKind={explorerKind}
+    explorerId={explorerId}
     connectionsViewRequest={connectionsViewRequest}
     onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
     onEdit={handleEdit}

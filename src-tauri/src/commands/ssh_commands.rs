@@ -1263,6 +1263,34 @@ pub(crate) fn ensure_local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, 
     Ok(base_dir)
 }
 
+fn resolve_existing_file_within(
+    base_dir: &Path,
+    candidate: &Path,
+) -> Result<Option<PathBuf>, String> {
+    if !candidate.starts_with(base_dir) {
+        return Err("Preview cache path is outside the app cache".to_string());
+    }
+    let canonical_base = std::fs::canonicalize(base_dir)
+        .map_err(|e| format!("Failed to access preview cache: {}", e))?;
+    let canonical_candidate = match std::fs::canonicalize(candidate) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Failed to access preview cache file: {}", error)),
+    };
+    if !canonical_candidate.starts_with(canonical_base) {
+        return Err("Preview cache path is outside the app cache".to_string());
+    }
+    Ok(canonical_candidate.is_file().then_some(canonical_candidate))
+}
+
+pub(crate) fn resolve_sftp_preview_cache_file(
+    app: &AppHandle,
+    candidate: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let base_dir = ensure_local_sftp_preview_dir(app)?;
+    resolve_existing_file_within(&base_dir, candidate)
+}
+
 const SFTP_PREVIEW_PART_MAX_AGE_SECS: u64 = 60 * 60;
 const SFTP_PREVIEW_MAX_AGE_SECS: u64 = 24 * 60 * 60;
 static ACTIVE_PREVIEW_CACHE_FILES: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
@@ -1306,27 +1334,13 @@ fn prune_stale_sftp_previews(dir: &Path) {
 
 #[tauri::command]
 pub fn preview_cache_acquire(app: AppHandle, local_path: String) -> Result<bool, String> {
-    let base_dir = ensure_local_sftp_preview_dir(&app)?;
     let candidate = PathBuf::from(local_path);
-    if !candidate.starts_with(&base_dir) {
-        return Err("Preview cache path is outside the app cache".to_string());
+    if resolve_sftp_preview_cache_file(&app, &candidate)?.is_none() {
+        return Ok(false);
     }
     let mut active = ACTIVE_PREVIEW_CACHE_FILES
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let canonical_base = std::fs::canonicalize(&base_dir)
-        .map_err(|e| format!("Failed to access preview cache: {}", e))?;
-    let canonical_candidate = match std::fs::canonicalize(&candidate) {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(format!("Failed to access preview cache file: {}", error)),
-    };
-    if !canonical_candidate.starts_with(canonical_base) {
-        return Err("Preview cache path is outside the app cache".to_string());
-    }
-    if !canonical_candidate.is_file() {
-        return Ok(false);
-    }
     *active.entry(candidate).or_insert(0) += 1;
     Ok(true)
 }
@@ -1644,6 +1658,26 @@ pub async fn sftp_download_to_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preview_cache_scope_accepts_only_files_inside_base() {
+        let root =
+            std::env::temp_dir().join(format!("redterm-preview-cache-scope-{}", Uuid::new_v4()));
+        let base = root.join("cache");
+        std::fs::create_dir_all(&base).expect("preview cache test dir should be created");
+        let inside = base.join("preview.mp4");
+        let outside = root.join("outside.mp4");
+        std::fs::write(&inside, b"inside").expect("inside file should be created");
+        std::fs::write(&outside, b"outside").expect("outside file should be created");
+
+        let resolved = resolve_existing_file_within(&base, &inside)
+            .expect("inside cache file should be accepted")
+            .expect("inside cache file should exist");
+        assert_eq!(resolved, std::fs::canonicalize(&inside).unwrap());
+        assert!(resolve_existing_file_within(&base, &outside).is_err());
+
+        std::fs::remove_dir_all(root).expect("preview cache test dir should be removed");
+    }
 
     #[test]
     fn recent_ssh_output_is_pruned_by_count_and_bytes() {

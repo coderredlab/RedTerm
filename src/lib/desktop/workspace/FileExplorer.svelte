@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy, untrack } from "svelte";
   import {
     listenDownloadProgress,
     chooseDownloadDirectory,
@@ -25,10 +26,12 @@
   interface Props {
     kind: "ssh" | "local" | null;
     sessionId: string | null;
+    initialPath: string | null;
+    onPathChange: (path: string) => void;
     onPreview: (entry: { name: string; path: string; size: number }) => void;
   }
 
-  let { kind, sessionId, onPreview }: Props = $props();
+  let { kind, sessionId, initialPath, onPathChange, onPreview }: Props = $props();
 
   let path = $state("/");
   let entries = $state<SftpDirEntry[] | null>(null);
@@ -40,10 +43,17 @@
   let downloadingPaths = $state<string[]>([]);
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
   let downloads = $state<Record<string, { transferred: number; total: number | null }>>({});
+  let breadcrumbViewport: HTMLDivElement | undefined;
+  let destroyed = false;
 
   const canBrowse = $derived(kind === "local" || Boolean(sessionId));
   // Local browsing is scoped to home: no navigation above it.
   const atLocalHome = $derived(kind === "local" && homePath !== null && path === homePath);
+
+  onDestroy(() => {
+    destroyed = true;
+    loadToken += 1;
+  });
 
   $effect(() => {
     let unlisten: (() => void) | null = null;
@@ -72,6 +82,21 @@
     };
   });
 
+  $effect(() => {
+    path;
+    const viewport = breadcrumbViewport;
+    if (!viewport) return;
+
+    const scrollToEnd = () => {
+      viewport.scrollLeft = viewport.scrollWidth;
+    };
+    scrollToEnd();
+
+    const observer = new ResizeObserver(scrollToEnd);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  });
+
   function showStatus(message: string) {
     statusMessage = message;
     if (statusTimer !== null) clearTimeout(statusTimer);
@@ -86,7 +111,7 @@
   }
 
   $effect(() => {
-    // Restart browsing whenever the active session changes; start at home.
+    // Restart browsing whenever the active session changes, restoring this pane's path.
     if (!canBrowse) {
       loadToken += 1;
       entries = null;
@@ -97,10 +122,10 @@
       return;
     }
     homePath = null;
-    void openHome();
+    void openHome(untrack(() => initialPath));
   });
 
-  async function openHome() {
+  async function openHome(restoredPath: string | null = null) {
     const token = ++loadToken;
     loading = true;
     errorMessage = "";
@@ -111,11 +136,18 @@
           : sessionId
             ? await sftpHomeDir(sessionId)
             : "/";
-      if (token !== loadToken) return;
+      if (destroyed || token !== loadToken) return;
       homePath = home || "/";
-      await navigate(homePath);
+      const target =
+        restoredPath &&
+        (kind !== "local" ||
+          restoredPath === homePath ||
+          restoredPath.startsWith(`${homePath}/`))
+          ? restoredPath
+          : homePath;
+      await navigate(target);
     } catch (error) {
-      if (token !== loadToken) return;
+      if (destroyed || token !== loadToken) return;
       if (kind === "local") {
         homePath = null;
         loading = false;
@@ -128,7 +160,7 @@
   }
 
   async function navigate(target: string) {
-    if (!canBrowse) return;
+    if (destroyed || !canBrowse) return;
     const token = ++loadToken;
     loading = true;
     errorMessage = "";
@@ -137,15 +169,16 @@
         kind === "local"
           ? await localListDir(target)
           : await sftpListDir(sessionId!, target);
-      if (token !== loadToken) return;
+      if (destroyed || token !== loadToken) return;
       entries = result;
       path = target;
+      onPathChange(target);
     } catch (error) {
-      if (token !== loadToken) return;
+      if (destroyed || token !== loadToken) return;
       entries = null;
       errorMessage = error instanceof Error ? error.message : String(error);
     } finally {
-      if (token === loadToken) {
+      if (!destroyed && token === loadToken) {
         loading = false;
       }
     }
@@ -210,7 +243,7 @@
       disabled={loading || isRootPath(path) || atLocalHome}
       onclick={() => void navigate(parentPath(path))}
     >↑</button>
-    <div class="path-breadcrumbs">
+    <div class="path-breadcrumbs" bind:this={breadcrumbViewport}>
       {#each breadcrumbSegments(path) as segment (segment.path)}
         {#if kind !== "local" || homePath === null || segment.path === homePath || segment.path.startsWith(`${homePath}/`)}
           <button
@@ -290,11 +323,13 @@
               {fileIconOf(entry.name, entry.is_dir)}
             </span>
             <span class="entry-name" title={entry.name}>{entry.name}</span>
-            <span class="entry-size">
-              {entry.is_dir ? "" : formatBytes(entry.size)}
-            </span>
-            <span class="entry-mtime">
-              {entry.is_dir ? "" : formatTimestamp(entry.mtime)}
+            <span class="entry-meta">
+              <span class="entry-size">
+                {entry.is_dir ? "" : formatBytes(entry.size)}
+              </span>
+              <span class="entry-mtime">
+                {entry.is_dir ? "" : formatTimestamp(entry.mtime)}
+              </span>
             </span>
           </button>
           {#if !entry.is_dir}
@@ -327,6 +362,7 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+    container-type: inline-size;
   }
 
   .path-bar {
@@ -496,7 +532,7 @@
     flex: 1;
     min-width: 0;
     display: grid;
-    grid-template-columns: 18px minmax(0, 1fr) auto auto;
+    grid-template-columns: 18px minmax(0, 1fr) auto;
     align-items: center;
     gap: 8px;
     border: 0;
@@ -537,6 +573,12 @@
     white-space: nowrap;
   }
 
+  .entry-meta {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
   .entry-size,
   .entry-mtime {
     color: var(--text-muted);
@@ -545,9 +587,10 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .entry-mtime {
-    min-width: 78px;
-    text-align: right;
+  @container (max-width: 250px) {
+    .entry-mtime {
+      display: none;
+    }
   }
 
   .entry-download {

@@ -13,6 +13,7 @@
     collapsed: boolean;
     activeSessionId: string | null;
     explorerKind: "ssh" | "local" | null;
+    explorerId: string | null;
     connectionsViewRequest: number;
     onWidthChange: (width: number) => void;
     onEdit: (connection: SavedConnection) => void;
@@ -26,6 +27,7 @@
     collapsed,
     activeSessionId,
     explorerKind,
+    explorerId,
     connectionsViewRequest,
     onWidthChange,
     onEdit,
@@ -35,6 +37,7 @@
   }: Props = $props();
 
   let view = $state<"connections" | "files">("connections");
+  let explorerPaths = $state<Record<string, string>>({});
 
   $effect(() => {
     if (connectionsViewRequest > 0) {
@@ -43,6 +46,12 @@
   });
 
   let panelEl: HTMLElement | null = $state(null);
+
+  function rememberExplorerPath(explorerId: string) {
+    return (path: string) => {
+      explorerPaths[explorerId] = path;
+    };
+  }
 
   function startResize(event: PointerEvent) {
     const handle = event.currentTarget as HTMLElement | null;
@@ -129,8 +138,16 @@
 
   {#if view === "connections"}
     <ConnectionList onEdit={onEdit} {onNewConnection} {onOpenLocal} />
-  {:else if explorerKind}
-    <FileExplorer kind={explorerKind} sessionId={activeSessionId} {onPreview} />
+  {:else if explorerKind && explorerId}
+    {#key explorerId}
+      <FileExplorer
+        kind={explorerKind}
+        sessionId={activeSessionId}
+        initialPath={explorerPaths[explorerId] ?? null}
+        onPathChange={rememberExplorerPath(explorerId)}
+        {onPreview}
+      />
+    {/key}
   {:else}
     <div class="files-empty">
       <strong>No session available</strong>

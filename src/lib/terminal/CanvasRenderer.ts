@@ -23,8 +23,6 @@ const DEFAULT_CONFIG: CanvasRendererConfig = {
 
 const MAX_IMAGE_CACHE_ENTRIES = 64;
 const MAX_IMAGE_CACHE_PIXELS = 8 * 1024 * 1024;
-const MAX_GLYPH_SCALE_CACHE_ENTRIES = 2048;
-const GLYPH_CELL_INSET_PX = 1;
 const KITTY_Z_INDEX_BELOW_CELL_BACKGROUNDS = -0x40000000;
 
 export function compareTerminalImageOrder(left: TerminalImage, right: TerminalImage): number {
@@ -55,7 +53,6 @@ export class CanvasRenderer {
   private animatedImageSeenThisFrame = false;
   private animationsEnabled = true;
   private cursorSnapshot: { x: number; y: number; pixels: ImageData } | null = null;
-  private glyphScaleCache = new Map<string, { scale: number; centerOffset: number }>();
 
 
   charWidth = 0;
@@ -105,7 +102,6 @@ export class CanvasRenderer {
     this.charWidth = result.m;
     this.charHeight = Math.round(fontSize * lineHeightMultiplier);
     this.ctx.font = `${fontSize}px ${appliedFamily}`;
-    this.glyphScaleCache.clear();
   }
 
   resize(widthCss: number, heightCss: number, cols: number, rows: number) {
@@ -134,7 +130,6 @@ export class CanvasRenderer {
   /** 런타임에 config 업데이트 (폰트 크기, 색상 등). 호출 후 measureFont()→resize() 필요. */
   updateConfig(newConfig: Partial<CanvasRendererConfig>) {
     this.config = { ...this.config, ...newConfig };
-    this.glyphScaleCache.clear();
   }
 
   clear() {
@@ -230,18 +225,7 @@ export class CanvasRenderer {
           currentFont = targetFont;
         }
         const textX = x + cellWidth / 2;
-        const glyphFit = this.shouldFitPrivateUseChar(cell.char)
-          ? this.getGlyphHorizontalFit(cell.char, targetFont, cellWidth)
-          : null;
-        if (glyphFit && (glyphFit.scale < 1 || Math.abs(glyphFit.centerOffset) > 0.01)) {
-          this.ctx.save();
-          this.ctx.translate(textX, textY);
-          this.ctx.scale(glyphFit.scale, 1);
-          this.ctx.fillText(cell.char, -glyphFit.centerOffset, 0);
-          this.ctx.restore();
-        } else {
-          this.ctx.fillText(cell.char, textX, textY);
-        }
+        this.ctx.fillText(cell.char, textX, textY);
       }
       if (style.underline && !cell.imagePlaceholder) {
         this.ctx.fillStyle = this.resolveFg(style);
@@ -582,44 +566,6 @@ export class CanvasRenderer {
 
   private wideCharCache = new Map<string, boolean>();
 
-  private shouldFitPrivateUseChar(char: string): boolean {
-    const code = char.codePointAt(0)!;
-    const isPrivateUse =
-      (code >= 0xE000 && code <= 0xF8FF) ||
-      (code >= 0xF0000 && code <= 0xFFFFD) ||
-      (code >= 0x100000 && code <= 0x10FFFD);
-    const isPowerline = code >= 0xE0A0 && code <= 0xE0D4;
-    return isPrivateUse && !isPowerline;
-  }
-
-  private getGlyphHorizontalFit(
-    char: string,
-    font: string,
-    cellWidth: number,
-  ): { scale: number; centerOffset: number } {
-    const cacheKey = font + '\0' + cellWidth + '\0' + char;
-    const cached = this.glyphScaleCache.get(cacheKey);
-    if (cached !== undefined) return cached;
-
-    const metrics = this.ctx.measureText(char);
-    const inkWidth = Math.max(
-      metrics.width,
-      metrics.actualBoundingBoxLeft + metrics.actualBoundingBoxRight,
-    );
-    const availableWidth = Math.max(1, cellWidth - GLYPH_CELL_INSET_PX);
-    const fit = {
-      scale: inkWidth > cellWidth ? availableWidth / inkWidth : 1,
-      centerOffset: (metrics.actualBoundingBoxRight - metrics.actualBoundingBoxLeft) / 2,
-    };
-
-    if (this.glyphScaleCache.size >= MAX_GLYPH_SCALE_CACHE_ENTRIES) {
-      const first = this.glyphScaleCache.keys().next().value;
-      if (first !== undefined) this.glyphScaleCache.delete(first);
-    }
-    this.glyphScaleCache.set(cacheKey, fit);
-    return fit;
-  }
-
   private isWideChar(char: string): boolean {
     const cached = this.wideCharCache.get(char);
     if (cached !== undefined) return cached;
@@ -664,6 +610,5 @@ export class CanvasRenderer {
     this.resetImageCache();
     this.colorCache.clear();
     this.wideCharCache.clear();
-    this.glyphScaleCache.clear();
   }
 }

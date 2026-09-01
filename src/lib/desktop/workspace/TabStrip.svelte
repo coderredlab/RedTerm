@@ -34,6 +34,14 @@
   let startX = 0;
   let startY = 0;
 
+  function preventContextMenu(node: HTMLElement) {
+    const handleContextMenu = (event: MouseEvent) => event.preventDefault();
+    node.addEventListener("contextmenu", handleContextMenu);
+    return {
+      destroy: () => node.removeEventListener("contextmenu", handleContextMenu),
+    };
+  }
+
   function findTabIndex(id: string): number {
     return tabsStore.tabs.findIndex((tab) => tab.id === id);
   }
@@ -195,7 +203,7 @@
   }
 </script>
 
-<div class="tabstrip" bind:this={stripEl}>
+<div class="tabstrip" bind:this={stripEl} use:preventContextMenu>
   <button
     class="strip-action sidebar-toggle"
     title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
