@@ -6,6 +6,8 @@
 
 RedTerm is an SSH terminal and remote-file workspace built with Tauri, Svelte, and Rust. It uses a custom canvas terminal renderer rather than embedding xterm.js, and keeps separate desktop and mobile shells around the same SSH, terminal, and storage core.
 
+**The terminal is not an xterm.js wrapper.** RedTerm implements its own ANSI/VT parser, canvas renderer, keyboard protocol handling, selection model, hyperlinks, and inline graphics path.
+
 The desktop app combines SSH sessions, local shells, split panes, an SFTP file browser, editable text previews, and media previews in one workspace. The mobile app focuses on SSH access with native credential storage, keyboard handling, voice input, and clipboard integration.
 
 ## Download
@@ -143,12 +145,6 @@ bun run android:build
 | `src-tauri/src/storage/` | Saved connections and credential-service integration |
 | `src-tauri/plugins/` | Android and iOS native plugins |
 | `src-tauri/gen/` | Generated Android and Apple projects |
-
-## Releases
-
-Pull requests and pushes to `main` run the frontend and Rust checks. A `desktop-vX.Y.Z` tag matching `src-tauri/tauri.desktop.conf.json` builds all desktop packages, verifies the complete installer set, and publishes a GitHub Release.
-
-Release notes describe user-visible behavior and installation constraints. The full installer matrix must complete before a tagged release is published.
 
 ## License
 
