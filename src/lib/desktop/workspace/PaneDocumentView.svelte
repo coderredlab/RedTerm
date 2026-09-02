@@ -74,7 +74,7 @@
   let renderedMarkdown = $state("");
   let mediaUrl = $state("");
   let editorHost: HTMLDivElement | null = $state(null);
-  let editorView: EditorView | null = null;
+  let editorView = $state.raw<EditorView | null>(null);
   const editorThemeCompartment = new Compartment();
   let appliedEditorDarkTheme: boolean | null = null;
   let mode = $state<"edit" | "preview">("edit");
@@ -89,17 +89,20 @@
 
   const boundKind = untrack(() => document.sourceKind);
   const boundPath = untrack(() => document.path);
-  const fileKind = untrack(
-    () => previewKindOf(document.name) as FilePreviewKind
+  let fileKind = $state<FilePreviewKind>(
+    untrack(() => previewKindOf(document.name))
   );
-  const editable = fileKind === "code" || fileKind === "text" || fileKind === "markdown";
+  const editable = $derived(
+    fileKind === "code" || fileKind === "text" || fileKind === "markdown"
+  );
   const editorUsesDarkTheme = $derived(
     !isLightTheme(getThemeById(settingsStore.theme) ?? THEMES[0]!)
   );
-  const needsExplicitDownload =
+  const needsExplicitDownload = $derived(
     fileKind === "audio" ||
     fileKind === "video" ||
-    (fileKind === "image" && untrack(() => document.size) > MAX_SFTP_READ_BYTES);
+    (fileKind === "image" && document.size > MAX_SFTP_READ_BYTES)
+  );
   const markdownTags = [
     "p", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6",
     "blockquote", "pre", "code", "ul", "ol", "li", "strong", "em",
@@ -227,10 +230,11 @@
     revokeMediaUrl();
 
     if (
-      editable &&
+      (editable || fileKind === "unknown") &&
       document.content !== null &&
       document.savedContent !== null
     ) {
+      if (fileKind === "unknown") fileKind = "text";
       currentContent = document.content;
       loadState = "ready";
       return;
@@ -261,10 +265,6 @@
       errorMessage = "The SSH session for this file is no longer available.";
       return;
     }
-    if (fileKind === "unknown") {
-      loadState = "ready";
-      return;
-    }
     if (needsExplicitDownload) {
       loadState = "idle";
       return;
@@ -287,7 +287,17 @@
           bytes[0] === 0xef &&
           bytes[1] === 0xbb &&
           bytes[2] === 0xbf;
-        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        let decoded: string;
+        try {
+          decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        } catch (error) {
+          if (fileKind === "unknown") {
+            loadState = "ready";
+            return;
+          }
+          throw error;
+        }
+        if (fileKind === "unknown") fileKind = "text";
         currentContent = decoded;
         tabsStore.setDocumentLoaded(tabId, document.id, decoded, hasUtf8Bom);
       }
@@ -573,6 +583,17 @@
         });
       }
     });
+  });
+
+  $effect(() => {
+    const host = editorHost;
+    if (!host) return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (!entry || entry.contentRect.width === 0 || entry.contentRect.height === 0) return;
+      editorView?.requestMeasure();
+    });
+    observer.observe(host);
+    return () => observer.disconnect();
   });
 
   $effect(() => {

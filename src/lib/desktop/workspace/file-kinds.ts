@@ -59,7 +59,7 @@ const CODE_EXTENSIONS = new Set([
   "rs", "py", "go", "c", "h", "cpp", "cc", "hpp", "java",
   "kt", "rb", "php", "swift", "sh", "bash", "zsh", "fish",
   "sql", "json", "yml", "yaml", "xml", "html", "htm", "css",
-  "scss", "less", "lua", "pl", "r", "dart", "vue", "proto",
+  "scss", "less", "lua", "pl", "r", "dart", "vue", "svelte", "proto",
 ]);
 
 const SPECIAL_TEXT_NAMES = new Set([

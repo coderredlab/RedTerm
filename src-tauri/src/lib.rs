@@ -229,7 +229,7 @@ mod tests {
         let mobile: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
             .expect("mobile Tauri config must be valid JSON");
 
-        assert_eq!(desktop["version"], "1.7.6");
+        assert_eq!(desktop["version"], "1.7.7");
         assert_eq!(mobile["version"], "1.7.4");
     }
 
