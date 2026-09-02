@@ -135,8 +135,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          shopt -s nullglob
-          ASSETS=(release-assets/*)
+          ASSETS=()
+          while IFS= read -r CANDIDATE; do
+            ASSETS+=("$CANDIDATE")
+          done < <(find release-assets -type f)
           if [[ ${#ASSETS[@]} -ne 5 ]]; then
             echo "Expected 5 installer assets, found ${#ASSETS[@]}"
             exit 1
