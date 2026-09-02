@@ -2,6 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { confirm as confirmNative, message as messageNative, open } from "@tauri-apps/plugin-dialog";
+import { check, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import type { TerminalSnapshot } from "$lib/terminal/ansi-parser";
 import type {
   VoiceInputEvent,
@@ -15,6 +17,47 @@ export const MAX_SSH_KEY_BYTES = 1024 * 1024;
 
 export async function getAppVersion(): Promise<string> {
   return getVersion();
+}
+
+export interface DesktopUpdateInfo {
+  version: string;
+  notes: string | null;
+}
+
+/** Update object retained between check and download so callers stay free of plugin types. */
+let pendingDesktopUpdate: Update | null = null;
+
+export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
+  pendingDesktopUpdate = await check();
+  return pendingDesktopUpdate
+    ? { version: pendingDesktopUpdate.version, notes: pendingDesktopUpdate.body ?? null }
+    : null;
+}
+
+export async function installDesktopUpdate(
+  onProgress?: (downloaded: number, total: number | null) => void
+): Promise<void> {
+  const update = pendingDesktopUpdate;
+  if (!update) {
+    throw new Error("No pending desktop update. Run checkDesktopUpdate first.");
+  }
+  let downloaded = 0;
+  let total: number | null = null;
+  await update.downloadAndInstall((event) => {
+    if (event.event === "Started") {
+      total = event.data.contentLength ?? null;
+      onProgress?.(0, total);
+    } else if (event.event === "Progress") {
+      downloaded += event.data.chunkLength;
+      onProgress?.(downloaded, total);
+    }
+  });
+  pendingDesktopUpdate = null;
+}
+
+/** Restart the app so an installed desktop update takes effect. */
+export async function relaunchDesktopApp(): Promise<void> {
+  await relaunch();
 }
 
 export async function listSystemFonts(): Promise<string[]> {

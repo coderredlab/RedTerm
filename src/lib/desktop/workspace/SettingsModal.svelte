@@ -4,6 +4,7 @@
   import { settingsStore, terminalFontStack } from "$lib/stores/settings.svelte";
   import { isLightTheme, THEMES } from "$lib/styles/themes";
   import { getAppVersion, listSystemFonts } from "$lib/tauri/commands";
+  import { desktopUpdateStore } from "./desktop-update.svelte";
   import { modalFocus } from "./modal-focus";
 
   interface Props {
@@ -268,6 +269,39 @@
   $effect(() => {
     if (!open && fontMenuOpen) closeFontMenu();
   });
+
+  let updatePhase = $derived(desktopUpdateStore.phase);
+
+  let updateProgressPercent = $derived.by(() => {
+    if (updatePhase.kind !== "downloading" || !updatePhase.total) return 0;
+    return Math.min(
+      100,
+      Math.round((updatePhase.downloaded / updatePhase.total) * 100),
+    );
+  });
+
+  let updateStatusText = $derived.by(() => {
+    switch (updatePhase.kind) {
+      case "idle":
+        return "Desktop updates are delivered through GitHub Releases.";
+      case "checking":
+        return "Checking for updates…";
+      case "upToDate":
+        return appVersion
+          ? `RedTerm ${appVersion} is up to date.`
+          : "RedTerm is up to date.";
+      case "available":
+        return `Version ${updatePhase.update.version} is available.`;
+      case "downloading":
+        return updatePhase.total
+          ? `Downloading update… ${updateProgressPercent}%`
+          : `Downloading update… ${(updatePhase.downloaded / (1024 * 1024)).toFixed(1)} MB downloaded`;
+      case "ready":
+        return `Version ${updatePhase.update.version} is installed. Restart RedTerm to finish the update.`;
+      case "error":
+        return updatePhase.message;
+    }
+  });
 </script>
 
 {#if open}
@@ -471,6 +505,52 @@
             On Linux and Windows, Ctrl+T / Ctrl+W / Ctrl+\\ keep their shell
             meaning while a terminal has focus.
           </p>
+        </section>
+
+        <section class="settings-section">
+          <div class="section-label">Updates</div>
+          <div class="update-controls">
+            <p
+              class="update-status"
+              class:error={updatePhase.kind === "error"}
+              role="status"
+            >
+              {updateStatusText}
+            </p>
+            {#if updatePhase.kind === "downloading"}
+              <div
+                class="update-progress"
+                role="progressbar"
+                aria-label="Downloading update"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow={updateProgressPercent}
+              >
+                <div
+                  class="update-progress-fill"
+                  style:width="{updateProgressPercent}%"
+                ></div>
+              </div>
+            {:else if updatePhase.kind === "available"}
+              <button
+                type="button"
+                class="update-button"
+                onclick={() => void desktopUpdateStore.install()}
+              >Download and install</button>
+            {:else if updatePhase.kind === "ready"}
+              <button
+                type="button"
+                class="update-button"
+                onclick={() => void desktopUpdateStore.restart()}
+              >Restart RedTerm</button>
+            {:else if updatePhase.kind !== "checking"}
+              <button
+                type="button"
+                class="update-button"
+                onclick={() => void desktopUpdateStore.check()}
+              >{updatePhase.kind === "error" ? "Retry" : "Check for updates"}</button>
+            {/if}
+          </div>
         </section>
       </div>
 
@@ -872,6 +952,54 @@
     height: 18px;
     border-radius: 3px;
     border: 1px solid rgba(255, 255, 255, 0.12);
+  }
+  .update-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .update-status {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  .update-status.error {
+    color: var(--status-error);
+  }
+
+  .update-progress {
+    height: 4px;
+    border-radius: 2px;
+    background: var(--bg-tertiary);
+    overflow: hidden;
+  }
+
+  .update-progress-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: var(--accent-primary);
+    transition: width 200ms ease;
+  }
+
+  .update-button {
+    align-self: flex-start;
+    padding: 6px 14px;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .update-button:hover {
+    background: var(--bg-secondary);
+  }
+
+  .update-button:active {
+    background: var(--accent-muted);
   }
 
   .theme-name {

@@ -119,7 +119,10 @@ pub fn run() {
     let builder = builder.plugin(tauri_plugin_redterm_ios_native::init());
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let builder = builder.manage(DesktopClipboardState::default());
+    let builder = builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .manage(DesktopClipboardState::default());
 
     builder
         .setup(|app| {

@@ -5,6 +5,7 @@
   import { tabsStore, type Pane, type PaneNode } from "$lib/stores/tabs.svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import {
+    confirmAction,
     exitApplication,
     listenAppExitRequested,
     localShellDisconnect,
@@ -29,6 +30,7 @@
   import SettingsModal from "./workspace/SettingsModal.svelte";
   import CloseConfirmationModal from "./workspace/CloseConfirmationModal.svelte";
   import { desktopPrefsStore } from "./workspace/desktop-prefs.svelte";
+  import { desktopUpdateStore } from "./workspace/desktop-update.svelte";
   import {
     dragTargets,
     tabDrag,
@@ -151,9 +153,29 @@
     })();
   });
 
+  const UPDATE_CHECK_DELAY_MS = 3000;
+
+  async function autoCheckForUpdates() {
+    const update = await desktopUpdateStore.checkQuietly();
+    if (!update) return;
+    const installAccepted = await confirmAction(
+      `RedTerm Desktop ${update.version} is available. Download and install it now?`
+    );
+    if (!installAccepted) return;
+    await desktopUpdateStore.install();
+    if (desktopUpdateStore.phase.kind !== "ready") return;
+    const restartAccepted = await confirmAction(
+      "The update has been installed. Restart RedTerm now? Active sessions will be closed."
+    );
+    if (restartAccepted) await desktopUpdateStore.restart();
+  }
   onMount(() => {
     void reconcilePersistedSessions();
     void retryPendingManagedKeyCleanup();
+
+    const updateCheckTimer = setTimeout(() => {
+      void autoCheckForUpdates();
+    }, UPDATE_CHECK_DELAY_MS);
 
     let disposed = false;
     let unlistenAppExitRequested: (() => void) | undefined;
@@ -190,6 +212,7 @@
 
     return () => {
       disposed = true;
+      clearTimeout(updateCheckTimer);
       unlistenAppExitRequested?.();
       unlistenCloseRequested?.();
       window.removeEventListener("beforeunload", handleBeforeUnload);
