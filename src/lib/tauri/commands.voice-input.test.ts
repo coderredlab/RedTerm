@@ -6,6 +6,12 @@ const tauriListenMock = mock(async () => () => undefined);
 
 mock.module("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 mock.module("@tauri-apps/api/event", () => ({ listen: tauriListenMock }));
+mock.module("@tauri-apps/api/app", () => ({ getVersion: mock(async () => "test") }));
+mock.module("@tauri-apps/plugin-dialog", () => ({
+  confirm: mock(async () => false),
+  message: mock(async () => undefined),
+  open: mock(async () => null),
+}));
 
 // Static import would evaluate before Bun mock.module registrations, so this test intentionally loads commands after mocks.
 const commands = await import("./commands");

@@ -62,15 +62,38 @@ const CODE_EXTENSIONS = new Set([
   "scss", "less", "lua", "pl", "r", "dart", "vue", "svelte", "proto",
 ]);
 
-const SPECIAL_TEXT_NAMES = new Set([
+const SPECIAL_CODE_NAMES = new Set([
   "dockerfile",
   "makefile",
   "cmakelists.txt",
   ".gitignore",
   ".bashrc",
+  ".bash_profile",
+  ".bash_login",
+  ".bash_logout",
+  ".profile",
   ".zshrc",
+  ".zprofile",
+  ".zshenv",
+  ".zlogin",
+  ".zlogout",
+  ".tcshrc",
+  ".cshrc",
+  ".gitconfig",
+  ".vimrc",
+  ".gvimrc",
+  ".inputrc",
   ".editorconfig",
 ]);
+
+const SPECIAL_TEXT_NAMES = new Set([
+  ".cfusertextencoding",
+  ".zsh_history",
+  ".bash_history",
+  ".lmstudio-home-pointer",
+]);
+
+const SPECIAL_CODE_PREFIXES = [".zcompdump-", ".zshrc.", ".bashrc."];
 
 const MIME_BY_EXTENSION: Record<string, string> = {
   png: "image/png",
@@ -107,7 +130,13 @@ export function extensionOf(name: string): string {
 
 export function previewKindOf(name: string): FilePreviewKind {
   const lower = name.toLowerCase();
-  if (SPECIAL_TEXT_NAMES.has(lower)) return "code";
+  if (
+    SPECIAL_CODE_NAMES.has(lower) ||
+    SPECIAL_CODE_PREFIXES.some((prefix) => lower.startsWith(prefix))
+  ) {
+    return "code";
+  }
+  if (SPECIAL_TEXT_NAMES.has(lower)) return "text";
   const ext = extensionOf(name);
   if (ext === "pdf") return "pdf";
   if (MARKDOWN_EXTENSIONS.has(ext)) return "markdown";

@@ -520,6 +520,9 @@
       parent: host,
       extensions: [
         basicSetup,
+        EditorView.cspNonce.of(
+          window.document.querySelector<HTMLElement>("style[nonce], script[nonce]")?.nonce ?? ""
+        ),
         EditorState.lineSeparator.of(lineSeparatorOf(content)),
         editorTheme,
         editorThemeCompartment.of(editorThemeType(darkTheme)),

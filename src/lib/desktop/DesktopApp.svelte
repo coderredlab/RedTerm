@@ -5,7 +5,6 @@
   import { tabsStore, type Pane, type PaneNode } from "$lib/stores/tabs.svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import {
-    confirmAction,
     exitApplication,
     listenAppExitRequested,
     localShellDisconnect,
@@ -48,7 +47,7 @@
   let editPaneRequestGeneration = 0;
   let connectionsViewRequest = $state(0);
 
-  interface ApplicationClosePrompt {
+  interface ClosePrompt {
     title: string;
     message: string;
     detail: string;
@@ -56,14 +55,15 @@
     destructive: boolean;
   }
 
-  let applicationClosePrompt = $state<ApplicationClosePrompt | null>(null);
-  let resolveApplicationClosePrompt: ((confirmed: boolean) => void) | null = null;
+  let closePrompt = $state<ClosePrompt | null>(null);
+  let resolveClosePrompt: ((confirmed: boolean) => void) | null = null;
 
   const terminals = new Map<string, Terminal>();
   const confirmingTabIds = new Set<string>();
   const confirmingPaneIds = new Set<string>();
   const closingTabIds = new Set<string>();
   const closingPaneIds = new Set<string>();
+  const closingDocumentIds = new Set<string>();
 
   function tabIsClosing(tabId: string): boolean {
     return (
@@ -81,14 +81,14 @@
   let windowCloseConfirmed = false;
   let windowCloseConfirmationPending = false;
 
-  function paneShowsDocument(node: PaneNode, paneId: string): boolean {
+  function activeDocumentIdForPane(node: PaneNode, paneId: string): string | null {
     if (node.type === "leaf") {
-      return node.paneIds.includes(paneId) && node.activeItem.kind === "document";
+      return node.paneIds.includes(paneId) && node.activeItem.kind === "document"
+        ? node.activeItem.id
+        : null;
     }
-    return (
-      paneShowsDocument(node.children[0], paneId) ||
-      paneShowsDocument(node.children[1], paneId)
-    );
+    return activeDocumentIdForPane(node.children[0], paneId)
+      ?? activeDocumentIdForPane(node.children[1], paneId);
   }
 
   const sidebarColumn = $derived(
@@ -132,13 +132,13 @@
     const overlayFree =
       !showDialog &&
       !settingsOpen &&
-      applicationClosePrompt === null &&
+      closePrompt === null &&
       sessionsReconciled;
     if (
       !tab ||
       !paneId ||
       !overlayFree ||
-      paneShowsDocument(tab.layout, paneId)
+      activeDocumentIdForPane(tab.layout, paneId)
     ) return;
 
     void (async () => {
@@ -193,7 +193,7 @@
       unlistenAppExitRequested?.();
       unlistenCloseRequested?.();
       window.removeEventListener("beforeunload", handleBeforeUnload);
-      settleApplicationClosePrompt(false);
+      settleClosePrompt(false);
     };
   });
 
@@ -325,18 +325,19 @@
     settingsOpen = true;
   }
 
-  function requestApplicationClosePrompt(prompt: ApplicationClosePrompt): Promise<boolean> {
+  function requestClosePrompt(prompt: ClosePrompt): Promise<boolean> {
+    if (closePrompt !== null) return Promise.resolve(false);
     return new Promise((resolve) => {
-      applicationClosePrompt = prompt;
-      resolveApplicationClosePrompt = resolve;
+      closePrompt = prompt;
+      resolveClosePrompt = resolve;
     });
   }
 
-  function settleApplicationClosePrompt(confirmed: boolean) {
-    const resolve = resolveApplicationClosePrompt;
+  function settleClosePrompt(confirmed: boolean) {
+    const resolve = resolveClosePrompt;
     if (!resolve) return;
-    resolveApplicationClosePrompt = null;
-    applicationClosePrompt = null;
+    resolveClosePrompt = null;
+    closePrompt = null;
     resolve(confirmed);
   }
 
@@ -371,7 +372,7 @@
       tab.documents.filter((document) => document.dirty)
     );
     if (dirtyDocuments.length === 0) {
-      return requestApplicationClosePrompt({
+      return requestClosePrompt({
         title: "Close RedTerm?",
         message: "Your active terminal sessions will be disconnected.",
         detail: "You can reconnect when you open RedTerm again.",
@@ -383,13 +384,39 @@
       dirtyDocuments.length === 1
         ? `"${dirtyDocuments[0]!.name}"`
         : `${dirtyDocuments.length} documents`;
-    return requestApplicationClosePrompt({
+    return requestClosePrompt({
       title: "Discard unsaved changes?",
       message: `Unsaved changes in ${label} will be lost.`,
       detail: "This action cannot be undone.",
       confirmLabel: "Discard & Close",
       destructive: true,
     });
+  }
+
+  function requestDirtyDocumentClosePrompt(name: string): Promise<boolean> {
+    return requestClosePrompt({
+      title: "Discard unsaved changes?",
+      message: `Unsaved changes to "${name}" will be lost.`,
+      detail: "This action cannot be undone.",
+      confirmLabel: "Discard & Close",
+      destructive: true,
+    });
+  }
+
+  async function closeDocumentById(tabId: string, documentId: string) {
+    const document = tabsStore.getDocument(tabId, documentId);
+    if (!document || closingDocumentIds.has(documentId)) return;
+    closingDocumentIds.add(documentId);
+    try {
+      if (document.saveState === "saving") {
+        await showWarning(`Please wait for "${document.name}" to finish saving before closing it.`);
+        return;
+      }
+      if (document.dirty && !await requestDirtyDocumentClosePrompt(document.name)) return;
+      await tabsStore.closeDocument(tabId, documentId);
+    } finally {
+      closingDocumentIds.delete(documentId);
+    }
   }
 
   async function confirmCloseDocuments(tabId: string, sourcePaneId?: string): Promise<boolean> {
@@ -409,14 +436,27 @@
       return false;
     }
     const dirtyDocuments = documents.filter((document) => document.dirty);
+    const target = sourcePaneId === undefined ? "tab" : "pane";
     if (dirtyDocuments.length === 0) {
-      return confirmAction(sourcePaneId === undefined ? "Close this tab?" : "Close this pane?");
+      return requestClosePrompt({
+        title: `Close ${target}?`,
+        message: `The terminal ${target === "tab" ? "sessions in this tab" : "session in this pane"} will be disconnected.`,
+        detail: "You can reconnect from the connection list.",
+        confirmLabel: target === "tab" ? "Close Tab" : "Close Pane",
+        destructive: false,
+      });
     }
     const label =
       dirtyDocuments.length === 1
         ? `"${dirtyDocuments[0]!.name}"`
         : `${dirtyDocuments.length} documents`;
-    return confirmAction(`Discard unsaved changes in ${label}?`);
+    return requestClosePrompt({
+      title: "Discard unsaved changes?",
+      message: `Unsaved changes in ${label} will be lost.`,
+      detail: `The ${target} will close after the changes are discarded.`,
+      confirmLabel: "Discard & Close",
+      destructive: true,
+    });
   }
   async function closeTabById(tabId: string) {
     const tab = tabsStore.getTab(tabId);
@@ -451,11 +491,17 @@
     }
   }
 
-  function closeActivePane() {
+  function closeActiveItem() {
     const tab = tabsStore.activeTab;
     if (!tab) return;
     const paneId = tab.activePaneId ?? tab.panes[0]?.id;
-    if (paneId) void workspaceApi.closePane(tab.id, paneId);
+    if (!paneId) return;
+    const documentId = activeDocumentIdForPane(tab.layout, paneId);
+    if (documentId) {
+      workspaceApi.closeDocument(tab.id, documentId);
+      return;
+    }
+    workspaceApi.closePane(tab.id, paneId);
   }
 
   function closeActiveTab() {
@@ -689,6 +735,9 @@
     closeTab(tabId) {
       void closeTabById(tabId);
     },
+    closeDocument(tabId, documentId) {
+      void closeDocumentById(tabId, documentId);
+    },
     closePane(_tabId, paneId) {
       if (paneIsClosing(_tabId, paneId)) return;
       confirmingPaneIds.add(paneId);
@@ -741,7 +790,7 @@
   function activeTerminal(): Terminal | null {
     const tab = tabsStore.activeTab;
     const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
-    if (!tab || !paneId || paneShowsDocument(tab.layout, paneId)) return null;
+    if (!tab || !paneId || activeDocumentIdForPane(tab.layout, paneId)) return null;
     return terminals.get(paneId) ?? null;
   }
 
@@ -767,8 +816,9 @@
       event,
       {
         newConnection: handleNewConnection,
-        closePane: closeActivePane,
+        closeActiveItem,
         closeTab: closeActiveTab,
+        quitApplication: () => void confirmAndCloseApplication(exitApplication),
         nextTab: () => cycleTab(1),
         previousTab: () => cycleTab(-1),
         selectTab: selectTabByIndex,
@@ -782,7 +832,7 @@
       () =>
         !showDialog &&
         !settingsOpen &&
-        applicationClosePrompt === null &&
+        closePrompt === null &&
         sessionsReconciled,
       terminalTarget
     );
@@ -873,7 +923,7 @@
               interactive={
                 !showDialog &&
                 !settingsOpen &&
-                applicationClosePrompt === null &&
+                closePrompt === null &&
                 tab.id === tabsStore.activeTabId}
               activePaneId={tab.activePaneId}
             />
@@ -902,14 +952,14 @@
   <SettingsModal open={settingsOpen} onClose={() => (settingsOpen = false)} />
 
   <CloseConfirmationModal
-    open={applicationClosePrompt !== null}
-    title={applicationClosePrompt?.title ?? ""}
-    message={applicationClosePrompt?.message ?? ""}
-    detail={applicationClosePrompt?.detail ?? ""}
-    confirmLabel={applicationClosePrompt?.confirmLabel ?? ""}
-    destructive={applicationClosePrompt?.destructive ?? false}
-    onCancel={() => settleApplicationClosePrompt(false)}
-    onConfirm={() => settleApplicationClosePrompt(true)}
+    open={closePrompt !== null}
+    title={closePrompt?.title ?? ""}
+    message={closePrompt?.message ?? ""}
+    detail={closePrompt?.detail ?? ""}
+    confirmLabel={closePrompt?.confirmLabel ?? ""}
+    destructive={closePrompt?.destructive ?? false}
+    onCancel={() => settleClosePrompt(false)}
+    onConfirm={() => settleClosePrompt(true)}
   />
 
 

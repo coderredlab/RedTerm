@@ -1,4 +1,8 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+
+#[cfg(target_os = "macos")]
+use std::sync::atomic::Ordering;
 #[cfg(target_os = "macos")]
 use tauri::{Emitter, Manager};
 use uuid::Uuid;
@@ -8,14 +12,20 @@ mod ssh;
 mod storage;
 // Every editor backend shares this compare-and-replace critical section.
 pub(crate) static FILE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static EXIT_CONFIRMED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+const APP_EXIT_REQUESTED_EVENT: &str = "app-exit-requested";
+#[cfg(target_os = "macos")]
+const CONFIRM_QUIT_MENU_ID: &str = "redterm-confirm-quit";
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use commands::DesktopClipboardState;
 use commands::{
     cancel_voice_input, check_voice_input_permissions, delete_known_host, exit_application,
     get_keyboard_layout_map, get_runtime_instance_id, install_keyboard_layout_change_listener,
-    list_known_hosts, list_voice_input_languages, local_download_file, local_download_to_dir,
-    local_home_dir, local_list_dir, local_read_file, local_shell_disconnect,
+    list_known_hosts, list_system_fonts, list_voice_input_languages, local_download_file,
+    local_download_to_dir, local_home_dir, local_list_dir, local_read_file, local_shell_disconnect,
     local_shell_get_output, local_shell_resize, local_shell_start, local_shell_write,
     local_write_file, preview_cache_acquire, preview_cache_release, read_clipboard_image,
     read_clipboard_text, request_voice_input_permissions, set_keep_screen_on, set_keyboard_visible,
@@ -33,20 +43,29 @@ use storage::{
 };
 
 #[cfg(any(target_os = "macos", test))]
-fn should_confirm_app_exit(code: Option<i32>) -> bool {
-    code.is_none()
+fn should_confirm_app_exit(exit_confirmed: bool) -> bool {
+    !exit_confirmed
+}
+
+#[cfg(target_os = "macos")]
+fn request_app_exit_confirmation(app_handle: &tauri::AppHandle) {
+    if app_handle.get_webview_window("main").is_none() {
+        return;
+    }
+    if let Err(error) = app_handle.emit(APP_EXIT_REQUESTED_EVENT, ()) {
+        eprintln!("failed to request application exit confirmation: {error}");
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn handle_run_event(app_handle: &tauri::AppHandle, event: tauri::RunEvent) {
-    const APP_EXIT_REQUESTED_EVENT: &str = "app-exit-requested";
-
-    if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
-        if should_confirm_app_exit(code) && app_handle.get_webview_window("main").is_some() {
+    if let tauri::RunEvent::ExitRequested { api, .. } = event {
+        let exit_confirmed = EXIT_CONFIRMED.swap(false, Ordering::AcqRel);
+        if should_confirm_app_exit(exit_confirmed)
+            && app_handle.get_webview_window("main").is_some()
+        {
             api.prevent_exit();
-            if let Err(error) = app_handle.emit(APP_EXIT_REQUESTED_EVENT, ()) {
-                eprintln!("failed to request application exit confirmation: {error}");
-            }
+            request_app_exit_confirmation(app_handle);
         }
     }
 }
@@ -68,6 +87,34 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_redterm_android_paste::init());
 
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(|app| {
+            let menu = tauri::menu::Menu::default(app)?;
+            if let Some(tauri::menu::MenuItemKind::Submenu(app_menu)) =
+                menu.items()?.into_iter().next()
+            {
+                let item_count = app_menu.items()?.len();
+                if item_count > 0 {
+                    app_menu.remove_at(item_count - 1)?;
+                }
+                let quit_item = tauri::menu::MenuItem::with_id(
+                    app,
+                    CONFIRM_QUIT_MENU_ID,
+                    "Quit RedTerm",
+                    true,
+                    Some("Cmd+Q"),
+                )?;
+                app_menu.append(&quit_item)?;
+            }
+            Ok(menu)
+        })
+        .on_menu_event(|app, event| {
+            if event.id() == CONFIRM_QUIT_MENU_ID {
+                request_app_exit_confirmation(app);
+            }
+        });
+
     #[cfg(target_os = "ios")]
     let builder = builder.plugin(tauri_plugin_redterm_ios_native::init());
 
@@ -85,6 +132,7 @@ pub fn run() {
         .manage(host_key_challenges)
         .invoke_handler(tauri::generate_handler![
             exit_application,
+            list_system_fonts,
             get_runtime_instance_id,
             get_keyboard_layout_map,
             check_voice_input_permissions,
@@ -217,8 +265,8 @@ mod tests {
 
     #[test]
     fn native_exit_requires_confirmation_but_confirmed_exit_does_not() {
-        assert!(super::should_confirm_app_exit(None));
-        assert!(!super::should_confirm_app_exit(Some(0)));
+        assert!(super::should_confirm_app_exit(false));
+        assert!(!super::should_confirm_app_exit(true));
     }
 
     #[test]
@@ -229,7 +277,7 @@ mod tests {
         let mobile: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
             .expect("mobile Tauri config must be valid JSON");
 
-        assert_eq!(desktop["version"], "1.7.7");
+        assert_eq!(desktop["version"], "1.7.8");
         assert_eq!(mobile["version"], "1.7.4");
     }
 

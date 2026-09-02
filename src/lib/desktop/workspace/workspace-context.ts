@@ -9,6 +9,7 @@ export interface WorkspaceApi {
   editPaneConnection(tabId: string, paneId: string): void;
   closeTab(tabId: string): void;
   closePane(tabId: string, paneId: string): void;
+  closeDocument(tabId: string, documentId: string): void;
   splitPane(tabId: string, paneId: string, dir: "row" | "col"): void;
   addPaneTab(tabId: string, paneId: string): void;
   activatePane(tabId: string, paneId: string): void;

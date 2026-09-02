@@ -11,6 +11,7 @@
     "dialog:allow-open",
     "dialog:allow-message",
     "allow-exit-application",
+    "allow-list-system-fonts",
     "allow-get-runtime-instance-id",
     "allow-get-keyboard-layout-map",
     "allow-check-voice-input-permissions",

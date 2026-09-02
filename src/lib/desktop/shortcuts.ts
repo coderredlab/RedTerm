@@ -1,7 +1,8 @@
 export interface DesktopShortcutHandlers {
   newConnection(): void;
-  closePane(): void;
+  closeActiveItem(): void;
   closeTab(): void;
+  quitApplication(): void;
   nextTab(): void;
   previousTab(): void;
   selectTab(index: number): void;
@@ -44,8 +45,6 @@ export function handleDesktopShortcuts(
   isEnabled: () => boolean,
   terminalTarget = false
 ): boolean {
-  if (!isEnabled()) return false;
-
   const isMac = isMacPlatform();
   const mod = isMac ? event.metaKey : event.ctrlKey;
   // Non-shell-reserved combos also accept the other modifier on macOS so
@@ -57,8 +56,19 @@ export function handleDesktopShortcuts(
   const alt = event.altKey;
   const shift = event.shiftKey;
   const key = event.key;
+  const isCloseKey = event.code === "KeyW" || key === "w" || key === "W";
+  const isQuitKey = event.code === "KeyQ" || key === "q" || key === "Q";
   const isCopyKey = event.code === "KeyC" || key === "c" || key === "C";
   const isPasteKey = event.code === "KeyV" || key === "v" || key === "V";
+
+  // Consume Cmd+Q even while another overlay is open. Otherwise WebKit can
+  // forward it to macOS and terminate the process without the app prompt.
+  if (isMac && event.metaKey && !event.ctrlKey && !alt && !shift && isQuitKey) {
+    handlers.quitApplication();
+    return true;
+  }
+
+  if (!isEnabled()) return false;
   // Shells consume Ctrl+T/W/\ on Linux and Windows; leave those (and their
   // shifted variants, which the app also uses) for the terminal when the key
   // was pressed inside one.
@@ -89,11 +99,11 @@ export function handleDesktopShortcuts(
     return true;
   }
 
-  if (mod && (key === "w" || key === "W")) {
+  if (mod && isCloseKey) {
     if (shift) {
       handlers.closeTab();
     } else {
-      handlers.closePane();
+      handlers.closeActiveItem();
     }
     return true;
   }

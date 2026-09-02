@@ -8,12 +8,7 @@
 
 <script lang="ts">
   import Terminal from "$lib/terminal/Terminal.svelte";
-  import { confirmAction, showWarning } from "$lib/tauri/commands";
-  import {
-    tabsStore,
-    type PaneDocument,
-    type PaneNode,
-  } from "$lib/stores/tabs.svelte";
+  import { tabsStore, type PaneNode } from "$lib/stores/tabs.svelte";
   import {
     dragTargets,
     resetTabDrag,
@@ -40,7 +35,6 @@
   let liveRatio = $state(0.5);
   let terminalRefs = $state<Record<string, Terminal | undefined>>({});
   let resizePointerId: number | null = null;
-  const closingDocumentIds = new Set<string>();
 
   $effect(() => {
     if (node.type === "split") {
@@ -187,25 +181,6 @@
     header.setPointerCapture(event.pointerId);
   }
 
-  async function closeDocument(document: PaneDocument) {
-    if (closingDocumentIds.has(document.id)) return;
-    closingDocumentIds.add(document.id);
-    try {
-      if (document.saveState === "saving") {
-        await showWarning(`Please wait for "${document.name}" to finish saving before closing it.`);
-        return;
-      }
-      const confirmed = await confirmAction(
-        document.dirty
-          ? `Discard unsaved changes to "${document.name}"?`
-          : `Close "${document.name}"?`
-      );
-      if (!confirmed) return;
-      await tabsStore.closeDocument(tabId, document.id);
-    } finally {
-      closingDocumentIds.delete(document.id);
-    }
-  }
 </script>
 
 {#if node.type === "split"}
@@ -298,7 +273,7 @@
                     title="Close document tab"
                     aria-label={`Close ${document.name}`}
                     disabled={document.saveState === "saving"}
-                    onclick={() => closeDocument(document)}
+                    onclick={() => workspace.closeDocument(tabId, document.id)}
                   >×</button>
                 </div>
               {/if}

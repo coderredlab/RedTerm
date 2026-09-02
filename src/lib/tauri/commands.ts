@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
-import { confirm as confirmNative, message as messageNative, open } from "@tauri-apps/plugin-dialog";
-
+import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { confirm as confirmNative, message as messageNative, open } from "@tauri-apps/plugin-dialog";
 import type { TerminalSnapshot } from "$lib/terminal/ansi-parser";
 import type {
   VoiceInputEvent,
@@ -12,6 +12,14 @@ import { VOICE_INPUT_EVENT } from "$lib/voice/voice-input-controller";
 
 export const MAX_CLIPBOARD_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_SSH_KEY_BYTES = 1024 * 1024;
+
+export async function getAppVersion(): Promise<string> {
+  return getVersion();
+}
+
+export async function listSystemFonts(): Promise<string[]> {
+  return invoke<string[]>("list_system_fonts");
+}
 
 export async function confirmAction(message: string): Promise<boolean> {
   return confirmNative(message, { title: "RedTerm", kind: "warning" });

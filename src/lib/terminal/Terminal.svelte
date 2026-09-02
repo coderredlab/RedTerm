@@ -38,7 +38,7 @@
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import { terminalModesStore } from "$lib/stores/terminal-modes.svelte";
   import { ctrlKey, altKey, getArrowKeyCode } from "$lib/utils/key-mapper";
-  import { settingsStore } from "$lib/stores/settings.svelte";
+  import { settingsStore, terminalFontStack } from "$lib/stores/settings.svelte";
   import { createStartupScriptDispatcher, type StartupScriptDispatcher } from "./startup-script";
   import { findUrlAtCell, validateTerminalUrl, type SafeTerminalUrl } from "./terminal-links";
   import { extractTerminalSelection } from "./terminal-selection";
@@ -179,7 +179,6 @@
 
   // Font metrics
   const LINE_HEIGHT_MULTIPLIER = 1.4;
-  const FONT_FAMILY = '"Sarasa Term K Nerd", "JetBrains Mono", "Fira Code", monospace';
   const TERMINAL_HORIZONTAL_PADDING_PX = 8;
   let charWidth = $state(8.4);
   let charHeight = $state(Math.round(settingsStore.fontSize * LINE_HEIGHT_MULTIPLIER));
@@ -187,7 +186,7 @@
   function compositionInputStyle(position: { x: number; y: number } = cursorPos): string {
     const left = TERMINAL_HORIZONTAL_PADDING_PX + position.x * charWidth;
     const top = position.y * charHeight - viewportTop;
-    return `left: calc(var(--terminal-horizontal-padding, 4px) + ${left}px); top: ${top}px; height: ${charHeight}px; font-size: ${settingsStore.fontSize}px; line-height: ${charHeight}px;`;
+    return `left: calc(var(--terminal-horizontal-padding, 4px) + ${left}px); top: ${top}px; height: ${charHeight}px; font-size: ${settingsStore.fontSize}px; line-height: ${charHeight}px; font-family: ${terminalFontStack(settingsStore.terminalFontFamily)};`;
   }
 
   function hasUsableCompositionAnchor(): boolean {
@@ -920,7 +919,7 @@
       const theme = getThemeById(settingsStore.theme) ?? THEMES[0];
       renderer = new CanvasRenderer(canvasEl, {
         fontSize: settingsStore.fontSize,
-        fontFamily: FONT_FAMILY,
+        fontFamily: terminalFontStack(settingsStore.terminalFontFamily),
         lineHeightMultiplier: LINE_HEIGHT_MULTIPLIER,
         horizontalPadding: TERMINAL_HORIZONTAL_PADDING_PX,
         defaultFg: theme.colors.terminalFg,
@@ -2685,10 +2684,11 @@
   // 설정 변경 감지 — 폰트 크기
   $effect(() => {
     const fs = settingsStore.fontSize;
+    const fontFamily = terminalFontStack(settingsStore.terminalFontFamily);
     if (!renderer) return;
     renderer.updateConfig({
       fontSize: fs,
-      fontFamily: FONT_FAMILY,
+      fontFamily,
       lineHeightMultiplier: LINE_HEIGHT_MULTIPLIER,
     });
     measureFont();

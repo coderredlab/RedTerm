@@ -19,7 +19,7 @@
     "android:build": "tauri android build --target aarch64",
     "android:bundle:release": "tauri android build --aab --target aarch64"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "dependencies": {
     "@codemirror/language": "^6.12.4",
     "@codemirror/language-data": "^6.5.2",

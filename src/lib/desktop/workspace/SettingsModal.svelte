@@ -1,6 +1,9 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+
+  import { settingsStore, terminalFontStack } from "$lib/stores/settings.svelte";
   import { isLightTheme, THEMES } from "$lib/styles/themes";
-  import { settingsStore } from "$lib/stores/settings.svelte";
+  import { getAppVersion, listSystemFonts } from "$lib/tauri/commands";
   import { modalFocus } from "./modal-focus";
 
   interface Props {
@@ -9,12 +12,62 @@
   }
 
   let { open, onClose }: Props = $props();
+  let appVersion = $state("");
+  let systemFonts = $state<string[]>([]);
+  let fontListStatus = $state<"idle" | "loading" | "ready" | "error">("idle");
+  let fontPickerElement = $state<HTMLDivElement>();
+  let fontTriggerElement = $state<HTMLButtonElement>();
+  let fontListElement = $state<HTMLDivElement>();
+  let fontMenuOpen = $state(false);
+  let highlightedFontIndex = $state(0);
+  let fontTypeahead = "";
+  let fontTypeaheadTimer: ReturnType<typeof setTimeout> | null = null;
+  let fontOptions = $derived([
+    "",
+    ...(fontListStatus !== "ready" &&
+    settingsStore.terminalFontFamily &&
+    !systemFonts.includes(settingsStore.terminalFontFamily)
+      ? [settingsStore.terminalFontFamily]
+      : []),
+    ...systemFonts,
+  ]);
+
+  onMount(() => {
+    void getAppVersion().then((version) => {
+      appVersion = version;
+    });
+
+    const handleDocumentPointerDown = (event: PointerEvent) => {
+      if (
+        fontMenuOpen &&
+        event.target instanceof Node &&
+        !fontPickerElement?.contains(event.target)
+      ) {
+        fontMenuOpen = false;
+      }
+    };
+
+    const handleDocumentKeydown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || !fontMenuOpen) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      closeFontMenu(true);
+    };
+
+    document.addEventListener("pointerdown", handleDocumentPointerDown);
+    document.addEventListener("keydown", handleDocumentKeydown, true);
+    return () => {
+      document.removeEventListener("pointerdown", handleDocumentPointerDown);
+      document.removeEventListener("keydown", handleDocumentKeydown, true);
+      if (fontTypeaheadTimer !== null) clearTimeout(fontTypeaheadTimer);
+    };
+  });
 
   const SHORTCUTS: Array<{ keys: string; action: string }> = [
     { keys: "Ctrl/Cmd+T", action: "New connection" },
     { keys: "Ctrl/Cmd+Shift+C", action: "Copy selection" },
     { keys: "Ctrl/Cmd+Shift+V", action: "Paste from clipboard" },
-    { keys: "Ctrl/Cmd+W", action: "Close pane" },
+    { keys: "Ctrl/Cmd+W", action: "Close active document or pane" },
     { keys: "Ctrl/Cmd+Shift+W", action: "Close tab" },
     { keys: "Ctrl/Cmd+Tab", action: "Next tab" },
     { keys: "Ctrl/Cmd+Shift+Tab", action: "Previous tab" },
@@ -28,6 +81,159 @@
 
   function stepFontSize(delta: number) {
     settingsStore.setFontSize(settingsStore.fontSize + delta);
+  }
+
+  function fontLabel(fontFamily: string): string {
+    return fontFamily || "RedTerm Default";
+  }
+
+  function fontOptionId(index: number): string {
+    return `terminal-font-option-${index}`;
+  }
+
+  function scrollHighlightedFontIntoView() {
+    requestAnimationFrame(() => {
+      document
+        .getElementById(fontOptionId(highlightedFontIndex))
+        ?.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  function moveFontHighlight(delta: number) {
+    if (fontOptions.length === 0) return;
+    highlightedFontIndex =
+      (highlightedFontIndex + delta + fontOptions.length) % fontOptions.length;
+    scrollHighlightedFontIntoView();
+  }
+
+  function openFontMenu(initialDelta = 0) {
+    const selectedIndex = fontOptions.indexOf(settingsStore.terminalFontFamily);
+    highlightedFontIndex = Math.max(0, selectedIndex);
+    if (initialDelta !== 0) moveFontHighlight(initialDelta);
+    fontMenuOpen = true;
+    requestAnimationFrame(() => {
+      fontListElement?.focus();
+      scrollHighlightedFontIntoView();
+    });
+  }
+
+  function closeFontMenu(restoreFocus = false) {
+    fontMenuOpen = false;
+    fontTypeahead = "";
+    if (fontTypeaheadTimer !== null) {
+      clearTimeout(fontTypeaheadTimer);
+      fontTypeaheadTimer = null;
+    }
+    if (restoreFocus) requestAnimationFrame(() => fontTriggerElement?.focus());
+  }
+
+  function toggleFontMenu() {
+    if (fontMenuOpen) {
+      closeFontMenu(true);
+    } else {
+      openFontMenu();
+    }
+  }
+
+  function selectFontFamily(fontFamily: string) {
+    settingsStore.setTerminalFontFamily(fontFamily);
+    closeFontMenu(true);
+  }
+
+  function handleFontTriggerKeydown(event: KeyboardEvent) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      openFontMenu(event.key === "ArrowDown" ? 1 : -1);
+    }
+  }
+
+  function handleFontListKeydown(event: KeyboardEvent) {
+    if (event.key === "Tab") {
+      closeFontMenu();
+      return;
+    }
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeFontMenu(true);
+      return;
+    }
+
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      moveFontHighlight(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
+
+    if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      highlightedFontIndex = event.key === "Home" ? 0 : fontOptions.length - 1;
+      scrollHighlightedFontIntoView();
+      return;
+    }
+
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      const fontFamily = fontOptions[highlightedFontIndex];
+      if (fontFamily !== undefined) selectFontFamily(fontFamily);
+      return;
+    }
+
+    if (
+      event.key.length !== 1 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.altKey
+    ) return;
+
+    fontTypeahead += event.key.toLocaleLowerCase();
+    if (fontTypeaheadTimer !== null) clearTimeout(fontTypeaheadTimer);
+    fontTypeaheadTimer = setTimeout(() => {
+      fontTypeahead = "";
+      fontTypeaheadTimer = null;
+    }, 700);
+
+    const matchingIndex = fontOptions.findIndex((fontFamily) =>
+      fontLabel(fontFamily).toLocaleLowerCase().startsWith(fontTypeahead),
+    );
+    if (matchingIndex >= 0) {
+      highlightedFontIndex = matchingIndex;
+      scrollHighlightedFontIntoView();
+    }
+  }
+
+  function filterMonospacedFonts(fontFamilies: string[]): string[] {
+    const context = document.createElement("canvas").getContext("2d");
+    if (!context) return [];
+
+    return fontFamilies.filter((fontFamily) => {
+      const escapedFontFamily = fontFamily
+        .replaceAll("\\", "\\\\")
+        .replaceAll('"', '\\"');
+      context.font = `16px "${escapedFontFamily}"`;
+      const narrowWidth = context.measureText("iiiiiiii").width;
+      const wideWidth = context.measureText("MMMMMMMM").width;
+      return Math.abs(narrowWidth - wideWidth) < 0.5;
+    });
+  }
+
+  async function loadFonts() {
+    fontListStatus = "loading";
+    try {
+      const fontFamilies = await listSystemFonts();
+      await document.fonts.ready;
+      systemFonts = filterMonospacedFonts(fontFamilies);
+      fontListStatus = "ready";
+      if (
+        settingsStore.terminalFontFamily &&
+        !systemFonts.includes(settingsStore.terminalFontFamily)
+      ) {
+        settingsStore.setTerminalFontFamily("");
+      }
+    } catch {
+      fontListStatus = "error";
+    }
   }
 
   type ThemeGroup = "dark" | "light";
@@ -49,6 +255,18 @@
     if (open) {
       themeGroup = groupForTheme(settingsStore.theme);
     }
+  });
+
+  $effect(() => {
+    if (open && fontListStatus === "idle") {
+      void loadFonts();
+    } else if (!open && fontListStatus === "error") {
+      fontListStatus = "idle";
+    }
+  });
+
+  $effect(() => {
+    if (!open && fontMenuOpen) closeFontMenu();
   });
 </script>
 
@@ -76,19 +294,118 @@
 
       <div class="settings-body">
         <section class="settings-section">
-          <div class="section-label">Terminal font size</div>
-          <div class="font-stepper">
-            <button
-              title="Decrease font size"
-              aria-label="Decrease font size"
-              onclick={() => stepFontSize(-1)}
-            >−</button>
-            <span class="font-value">{settingsStore.fontSize}px</span>
-            <button
-              title="Increase font size"
-              aria-label="Increase font size"
-              onclick={() => stepFontSize(1)}
-            >+</button>
+          <div class="section-label">Terminal typography</div>
+          <div class="font-controls">
+            <div class="font-family-field">
+              <span class="control-label" id="terminal-font-family-label">Font family</span>
+              <div class="font-picker" bind:this={fontPickerElement}>
+                <button
+                  bind:this={fontTriggerElement}
+                  type="button"
+                  class="font-select-trigger"
+                  class:open={fontMenuOpen}
+                  aria-labelledby="terminal-font-family-label terminal-font-family-value"
+                  aria-haspopup="listbox"
+                  aria-expanded={fontMenuOpen}
+                  aria-controls="terminal-font-family-list"
+                  style:font-family={terminalFontStack(settingsStore.terminalFontFamily)}
+                  onclick={toggleFontMenu}
+                  onkeydown={handleFontTriggerKeydown}
+                >
+                  <span id="terminal-font-family-value" class="font-select-value">
+                    {fontLabel(settingsStore.terminalFontFamily)}
+                  </span>
+                  <svg
+                    class="font-select-chevron"
+                    class:open={fontMenuOpen}
+                    width="12"
+                    height="12"
+                    viewBox="0 0 12 12"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 4.5 6 7.5 9 4.5"></path>
+                  </svg>
+                </button>
+
+                {#if fontMenuOpen}
+                  <div
+                    bind:this={fontListElement}
+                    id="terminal-font-family-list"
+                    class="font-select-list"
+                    role="listbox"
+                    aria-labelledby="terminal-font-family-label"
+                    aria-activedescendant={fontOptionId(highlightedFontIndex)}
+                    tabindex="0"
+                    onkeydown={handleFontListKeydown}
+                  >
+                    {#each fontOptions as fontFamily, index (fontFamily)}
+                      <button
+                        id={fontOptionId(index)}
+                        type="button"
+                        class="font-select-option"
+                        class:highlighted={highlightedFontIndex === index}
+                        class:selected={settingsStore.terminalFontFamily === fontFamily}
+                        role="option"
+                        aria-selected={settingsStore.terminalFontFamily === fontFamily}
+                        tabindex="-1"
+                        style:font-family={terminalFontStack(fontFamily)}
+                        onpointerenter={() => (highlightedFontIndex = index)}
+                        onclick={() => selectFontFamily(fontFamily)}
+                      >
+                        <span>{fontLabel(fontFamily)}</span>
+                        {#if settingsStore.terminalFontFamily === fontFamily}
+                          <svg
+                            class="font-select-check"
+                            width="13"
+                            height="13"
+                            viewBox="0 0 13 13"
+                            aria-hidden="true"
+                          >
+                            <path d="m2.5 6.8 2.3 2.3 5.7-5.7"></path>
+                          </svg>
+                        {/if}
+                      </button>
+                    {/each}
+
+                    {#if fontListStatus === "loading"}
+                      <div class="font-select-status" role="status">
+                        Loading installed fonts…
+                      </div>
+                    {:else if fontListStatus === "error"}
+                      <div class="font-select-status error" role="status">
+                        System fonts could not be loaded.
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+              <span class="control-hint" class:error={fontListStatus === "error"}>
+                {#if fontListStatus === "loading"}
+                  Loading installed monospaced fonts…
+                {:else if fontListStatus === "error"}
+                  System fonts could not be loaded.
+                {:else}
+                  Installed monospaced fonts from this computer.
+                {/if}
+              </span>
+            </div>
+
+            <div class="font-size-field">
+              <span class="control-label">Font size</span>
+              <div class="font-stepper">
+                <button
+                  title="Decrease font size"
+                  aria-label="Decrease font size"
+                  onclick={() => stepFontSize(-1)}
+                >−</button>
+                <span class="font-value">{settingsStore.fontSize}px</span>
+                <button
+                  title="Increase font size"
+                  aria-label="Increase font size"
+                  onclick={() => stepFontSize(1)}
+                >+</button>
+              </div>
+            </div>
           </div>
         </section>
 
@@ -156,6 +473,15 @@
           </p>
         </section>
       </div>
+
+      <footer class="settings-footer">
+        <span class="settings-product">RedTerm</span>
+        {#if appVersion}
+          <span class="settings-version" aria-live="polite">
+            Version {appVersion}
+          </span>
+        {/if}
+      </footer>
     </div>
   </div>
 {/if}
@@ -240,6 +566,27 @@
     padding: 18px;
   }
 
+  .settings-footer {
+    height: 38px;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 18px;
+    border-top: 1px solid var(--border-primary);
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+
+  .settings-product {
+    font-weight: 700;
+    letter-spacing: 0.04em;
+  }
+
+  .settings-version {
+    font-variant-numeric: tabular-nums;
+  }
+
   .settings-section + .settings-section {
     margin-top: 22px;
   }
@@ -251,6 +598,166 @@
     font-weight: 700;
     letter-spacing: 0.14em;
     text-transform: uppercase;
+  }
+
+  .font-controls {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    gap: 16px;
+  }
+
+  .font-family-field,
+  .font-size-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .control-label {
+    color: var(--text-secondary);
+    font-size: 10px;
+    font-weight: 600;
+  }
+
+  .font-picker {
+    position: relative;
+    min-width: 0;
+  }
+
+  .font-select-trigger {
+    width: 100%;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 0 10px 0 12px;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 100ms ease, background 100ms ease, box-shadow 100ms ease;
+  }
+
+  .font-select-trigger:hover {
+    border-color: var(--border-secondary);
+    background: var(--bg-tertiary);
+  }
+
+  .font-select-trigger:focus-visible,
+  .font-select-trigger.open {
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-primary) 18%, transparent);
+  }
+
+  .font-select-value {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .font-select-chevron {
+    flex: 0 0 auto;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    color: var(--text-muted);
+    transition: transform 100ms ease;
+  }
+
+  .font-select-chevron.open {
+    transform: rotate(180deg);
+  }
+
+  .font-select-list {
+    position: absolute;
+    z-index: 6;
+    top: calc(100% + 6px);
+    left: 0;
+    right: 0;
+    max-height: 246px;
+    overflow-y: auto;
+    padding: 4px;
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    box-shadow: 0 14px 32px rgba(0, 0, 0, 0.38);
+    outline: none;
+    animation: font-list-in 90ms ease-out;
+  }
+
+  @keyframes font-list-in {
+    from {
+      opacity: 0;
+      transform: translateY(-3px);
+    }
+  }
+
+  .font-select-option {
+    width: 100%;
+    min-height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 8px;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.35;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .font-select-option.highlighted {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  .font-select-option.selected {
+    color: var(--accent-primary);
+  }
+
+  .font-select-check {
+    flex: 0 0 auto;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .font-select-status {
+    padding: 9px 8px 7px;
+    border-top: 1px solid var(--border-primary);
+    color: var(--text-muted);
+    font-family: inherit;
+    font-size: 10px;
+  }
+
+  .font-select-status.error {
+    color: var(--status-error);
+  }
+
+  .control-hint {
+    min-height: 14px;
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.4;
+  }
+
+  .control-hint.error {
+    color: var(--status-error);
   }
 
   .font-stepper {

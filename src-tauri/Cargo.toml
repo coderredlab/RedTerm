@@ -2,7 +2,7 @@
 name = "redterm"
 version = "1.7.4"
 description = "A cross-platform SSH terminal built with Tauri, Svelte, and Rust"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/coderredlab/RedTerm"
 edition = "2021"
 
@@ -41,6 +41,7 @@ thiserror = "2"
 keyring = "4.1.6"
 arboard = { version = "3", features = ["wayland-data-control"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+font-kit = "0.14.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gdk = "0.18.2"

@@ -22,8 +22,9 @@ function keyboardEvent(overrides: Partial<KeyboardEvent>): KeyboardEvent {
 function handlers(calls: string[]): DesktopShortcutHandlers {
   return {
     newConnection: () => calls.push("newConnection"),
-    closePane: () => calls.push("closePane"),
+    closeActiveItem: () => calls.push("closeActiveItem"),
     closeTab: () => calls.push("closeTab"),
+    quitApplication: () => calls.push("quitApplication"),
     nextTab: () => calls.push("nextTab"),
     previousTab: () => calls.push("previousTab"),
     selectTab: (index) => calls.push(`selectTab:${index}`),
@@ -76,6 +77,36 @@ function withShortcutTargets<T>(
 }
 
 describe("handleDesktopShortcuts", () => {
+  test("routes Cmd+W to the active workspace item", () => {
+    withNavigatorPlatform("MacIntel", () => {
+      const calls: string[] = [];
+
+      const consumed = handleDesktopShortcuts(
+        keyboardEvent({ code: "KeyW", key: "w", metaKey: true }),
+        handlers(calls),
+        () => true,
+      );
+
+      expect(consumed).toBe(true);
+      expect(calls).toEqual(["closeActiveItem"]);
+    });
+  });
+
+  test("intercepts Cmd+Q even while workspace shortcuts are disabled", () => {
+    withNavigatorPlatform("MacIntel", () => {
+      const calls: string[] = [];
+
+      const consumed = handleDesktopShortcuts(
+        keyboardEvent({ code: "KeyQ", key: "q", metaKey: true }),
+        handlers(calls),
+        () => false,
+      );
+
+      expect(consumed).toBe(true);
+      expect(calls).toEqual(["quitApplication"]);
+    });
+  });
+
   test("copies a terminal selection with Control+Shift+C on Windows", () => {
     withNavigatorPlatform("Win32", () => {
       const calls: string[] = [];

@@ -2,6 +2,9 @@ name: Desktop Installers
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - "desktop-v*"
 
 permissions:
   contents: read
@@ -11,7 +14,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  quality:
+    name: Validate release source
+    uses: ./.github/workflows/ci.yml
+
   build:
+    needs: quality
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +54,8 @@ jobs:
 
       - name: Install bun
         uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -87,3 +97,78 @@ jobs:
           path: ${{ matrix.paths }}
           if-no-files-found: error
           retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate desktop release tag
+        run: |
+          VERSION=$(bun -e 'const config = await Bun.file("src-tauri/tauri.desktop.conf.json").json(); process.stdout.write(config.version)')
+          if [[ "$GITHUB_REF_NAME" != "desktop-v$VERSION" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match desktop version $VERSION"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Stage release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          ASSETS=(release-assets/*)
+          if [[ ${#ASSETS[@]} -ne 5 ]]; then
+            echo "Expected 5 installer assets, found ${#ASSETS[@]}"
+            exit 1
+          fi
+          for ASSET in "${ASSETS[@]}"; do
+            if [[ ! -s "$ASSET" ]]; then
+              echo "Release asset $ASSET is empty"
+              exit 1
+            fi
+          done
+
+          if RELEASE_DRAFT=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq ".isDraft"); then
+            if [[ "$RELEASE_DRAFT" != "true" ]]; then
+              echo "Release $GITHUB_REF_NAME is already published"
+              exit 1
+            fi
+            gh release upload "$GITHUB_REF_NAME" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${ASSETS[@]}" --draft --generate-notes --verify-tag --title "RedTerm Desktop $VERSION"
+          fi
+
+      - name: Verify release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ASSET_COUNT=$(gh release view "$GITHUB_REF_NAME" --json assets --jq ".assets | length")
+          if [[ "$ASSET_COUNT" -ne 5 ]]; then
+            echo "Expected 5 uploaded assets, found $ASSET_COUNT"
+            exit 1
+          fi
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest
