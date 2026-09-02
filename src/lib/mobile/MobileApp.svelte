@@ -9,7 +9,7 @@
   import ConnectionDialog from "$lib/components/ConnectionDialog.svelte";
   import ConnectionList from "$lib/components/ConnectionList.svelte";
   import SettingsScreen from "$lib/components/SettingsScreen.svelte";
-  import { cancelVoiceInput, checkVoiceInputPermissions, listenVoiceInput, listVoiceInputLanguages, requestVoiceInputPermissions, setKeyboardVisible, sshDisconnect, sshWrite, startVoiceInput, stopVoiceInput } from "$lib/tauri/commands";
+  import { cancelVoiceInput, checkVoiceInputPermissions, confirmAction, listenVoiceInput, listVoiceInputLanguages, requestVoiceInputPermissions, setKeyboardVisible, sshDisconnect, sshWrite, startVoiceInput, stopVoiceInput } from "$lib/tauri/commands";
   import {
     cleanupUnreferencedManagedKeys,
     retryPendingManagedKeyCleanup,
@@ -26,6 +26,7 @@
   let showSettings = $state(false);
   let editingConnection = $state<SavedConnection | undefined>(undefined);
   let terminalRefs = $state<Record<string, Terminal | undefined>>({});
+  let closingTabIds = $state<string[]>([]);
   let editingPane = $state<{ tabId: string; paneId: string } | undefined>(undefined);
   // Show connection list when no tabs or when + button is pressed
   let showConnectionListManual = $state(false);
@@ -216,28 +217,34 @@
   }
 
   async function handleCloseTab(tabId: string) {
-    if (!window.confirm("Close this tab?")) return;
-    const terminal = terminalRefs[tabId];
-    const tab = tabsStore.getTab(tabId);
-    if (terminal?.disconnect) {
-      try {
-        await terminal.disconnect(tab?.sessionId ?? undefined);
-      } catch (e) {
-        console.error("Tab disconnect error:", e);
+    if (closingTabIds.includes(tabId)) return;
+    closingTabIds = [...closingTabIds, tabId];
+    try {
+      if (!await confirmAction("Close this tab?")) return;
+      const terminal = terminalRefs[tabId];
+      const tab = tabsStore.getTab(tabId);
+      if (terminal?.disconnect) {
+        try {
+          await terminal.disconnect(tab?.sessionId ?? undefined);
+        } catch (e) {
+          console.error("Tab disconnect error:", e);
+        }
+      } else if (tab?.sessionId) {
+        terminalModesStore.clearSession(tab.sessionId);
+        try {
+          await sshDisconnect(tab.sessionId);
+        } catch (e) {
+          console.error("Fallback tab disconnect error:", e);
+        }
       }
-    } else if (tab?.sessionId) {
-      terminalModesStore.clearSession(tab.sessionId);
-      try {
-        await sshDisconnect(tab.sessionId);
-      } catch (e) {
-        console.error("Fallback tab disconnect error:", e);
-      }
+      const closingTab = tabsStore.getTab(tabId);
+      const keyIds = transientManagedKeyIds(closingTab?.panes ?? []);
+      tabsStore.removeTab(tabId);
+      await cleanupUnreferencedManagedKeys(keyIds);
+      delete terminalRefs[tabId];
+    } finally {
+      closingTabIds = closingTabIds.filter((id) => id !== tabId);
     }
-    const closingTab = tabsStore.getTab(tabId);
-    const keyIds = transientManagedKeyIds(closingTab?.panes ?? []);
-    tabsStore.removeTab(tabId);
-    await cleanupUnreferencedManagedKeys(keyIds);
-    delete terminalRefs[tabId];
   }
 
   function getActiveTerminal() {
@@ -276,6 +283,7 @@
       onAddTab={handleAddTab}
       onSelectTab={handleSelectTab}
       onCloseTab={handleCloseTab}
+      isTabClosing={(tabId) => closingTabIds.includes(tabId)}
       onOpenSettings={handleOpenSettings}
     />
   </div>
@@ -311,6 +319,7 @@
               ? undefined
               : () => void handleEditFailedConnection(tab.id)}
             onCloseTab={() => void handleCloseTab(tab.id)}
+            closeTabPending={closingTabIds.includes(tab.id)}
             bind:this={terminalRefs[tab.id]}
             onTitleChange={(title) => handleTitleChanged(tab.id, title)}
           />

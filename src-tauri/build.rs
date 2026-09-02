@@ -1,6 +1,7 @@
 fn main() {
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(
         tauri_build::AppManifest::new().commands(&[
+            "exit_application",
             "get_runtime_instance_id",
             "get_keyboard_layout_map",
             "check_voice_input_permissions",

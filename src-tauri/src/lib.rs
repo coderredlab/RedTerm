@@ -190,9 +190,55 @@ mod tests {
         }
     }
     #[test]
+    fn native_confirmation_permissions_cover_desktop_close_paths() {
+        let default: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json"))
+                .expect("default capability must be valid JSON");
+        let default_permissions = default["permissions"]
+            .as_array()
+            .expect("default capability permissions must be an array");
+        assert!(default_permissions
+            .iter()
+            .any(|candidate| candidate == "dialog:allow-message"));
+        assert!(default_permissions
+            .iter()
+            .any(|candidate| candidate == "allow-exit-application"));
+
+        let desktop: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/desktop-local-shell.json"))
+                .expect("desktop capability must be valid JSON");
+        let desktop_permissions = desktop["permissions"]
+            .as_array()
+            .expect("desktop capability permissions must be an array");
+        assert!(desktop_permissions
+            .iter()
+            .any(|candidate| candidate == "core:window:allow-destroy"));
+    }
+
+    #[test]
     fn native_exit_requires_confirmation_but_confirmed_exit_does_not() {
         assert!(super::should_confirm_app_exit(None));
         assert!(!super::should_confirm_app_exit(Some(0)));
+    }
+
+    #[test]
+    fn desktop_version_is_independent_from_mobile_version() {
+        let desktop: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.desktop.conf.json"))
+                .expect("desktop Tauri config must be valid JSON");
+        let mobile: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("mobile Tauri config must be valid JSON");
+
+        assert_eq!(desktop["version"], "1.7.5");
+        assert_eq!(mobile["version"], "1.7.4");
+    }
+
+    #[test]
+    fn desktop_bundle_is_ad_hoc_signed_for_local_builds() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.desktop.conf.json"))
+                .expect("desktop Tauri config must be valid JSON");
+        assert_eq!(config["bundle"]["macOS"]["signingIdentity"], "-");
     }
 
     #[test]

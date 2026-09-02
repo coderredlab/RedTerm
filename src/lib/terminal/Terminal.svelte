@@ -103,6 +103,7 @@
     onRetryConnection?: () => void;
     onEditConnection?: () => void;
     onCloseTab?: () => void;
+    closeTabPending?: boolean;
     onTitleChange?: (title: string) => void;
   }
   type TerminalMouseModifiers = Pick<
@@ -128,6 +129,7 @@
     onRetryConnection,
     onEditConnection,
     onCloseTab,
+    closeTabPending = false,
     onTitleChange
   }: Props = $props();
 
@@ -1297,9 +1299,6 @@
       offset = end;
     }
     pendingDataCharacters += text.length;
-    if (kind !== "local" && pendingDataCharacters >= MAX_PENDING_OUTPUT_CHARACTERS) {
-      pauseSshDataSource();
-    }
   }
 
   function processPendingOutputSlice(force: boolean) {
@@ -1805,6 +1804,9 @@
       }
       if (parser) {
         enqueuePendingOutput(seq, text);
+        if (pendingDataCharacters >= MAX_PENDING_OUTPUT_CHARACTERS) {
+          processPendingOutputSlice(true);
+        }
         updateBuffer();
       }
     });
@@ -3830,6 +3832,7 @@
               <button
                 type="button"
                 class="status-action"
+                disabled={closeTabPending}
                 onclick={(event) => {
                   event.stopPropagation();
                   onCloseTab?.();

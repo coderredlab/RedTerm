@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm as confirmNative, message as messageNative, open } from "@tauri-apps/plugin-dialog";
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { TerminalSnapshot } from "$lib/terminal/ansi-parser";
@@ -12,6 +12,14 @@ import { VOICE_INPUT_EVENT } from "$lib/voice/voice-input-controller";
 
 export const MAX_CLIPBOARD_IMAGE_BYTES = 10 * 1024 * 1024;
 export const MAX_SSH_KEY_BYTES = 1024 * 1024;
+
+export async function confirmAction(message: string): Promise<boolean> {
+  return confirmNative(message, { title: "RedTerm", kind: "warning" });
+}
+
+export async function showWarning(message: string): Promise<void> {
+  await messageNative(message, { title: "RedTerm", kind: "warning" });
+}
 
 export interface AuthConfig {
   username: string;

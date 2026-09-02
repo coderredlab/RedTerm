@@ -5,9 +5,11 @@
   import { tabsStore, type Pane, type PaneNode } from "$lib/stores/tabs.svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import {
+    confirmAction,
     exitApplication,
     listenAppExitRequested,
     localShellDisconnect,
+    showWarning,
     sshDisconnect,
     type SavedConnection,
   } from "$lib/tauri/commands";
@@ -46,20 +48,26 @@
   let connectionsViewRequest = $state(0);
 
   const terminals = new Map<string, Terminal>();
+  const confirmingTabIds = new Set<string>();
+  const confirmingPaneIds = new Set<string>();
   const closingTabIds = new Set<string>();
   const closingPaneIds = new Set<string>();
 
   function tabIsClosing(tabId: string): boolean {
     return (
+      confirmingTabIds.has(tabId) ||
       closingTabIds.has(tabId) ||
-      (tabsStore.getTab(tabId)?.panes.some((pane) => closingPaneIds.has(pane.id)) ?? false)
+      (tabsStore.getTab(tabId)?.panes.some((pane) =>
+        confirmingPaneIds.has(pane.id) || closingPaneIds.has(pane.id)
+      ) ?? false)
     );
   }
 
   function paneIsClosing(tabId: string, paneId: string): boolean {
-    return closingPaneIds.has(paneId) || tabIsClosing(tabId);
+    return confirmingPaneIds.has(paneId) || closingPaneIds.has(paneId) || tabIsClosing(tabId);
   }
   let windowCloseConfirmed = false;
+  let windowCloseConfirmationPending = false;
 
   function paneShowsDocument(node: PaneNode, paneId: string): boolean {
     if (node.type === "leaf") {
@@ -136,12 +144,7 @@
 
     if ("__TAURI_INTERNALS__" in window) {
       void listenAppExitRequested(() => {
-        if (windowCloseConfirmed || !confirmCloseApplication()) return;
-        windowCloseConfirmed = true;
-        void exitApplication().catch((error) => {
-          windowCloseConfirmed = false;
-          console.error("Application exit error:", error);
-        });
+        void confirmAndCloseApplication(exitApplication);
       })
         .then((unlisten) => {
           if (disposed) unlisten();
@@ -152,11 +155,8 @@
       void getCurrentWindow()
         .onCloseRequested((event) => {
           if (windowCloseConfirmed) return;
-          if (confirmCloseApplication()) {
-            windowCloseConfirmed = true;
-          } else {
-            event.preventDefault();
-          }
+          event.preventDefault();
+          void confirmAndCloseApplication(() => getCurrentWindow().destroy());
         })
         .then((unlisten) => {
           if (disposed) unlisten();
@@ -301,7 +301,22 @@
     settingsOpen = true;
   }
 
-  function confirmCloseApplication(): boolean {
+  async function confirmAndCloseApplication(closeApplication: () => Promise<void>) {
+    if (windowCloseConfirmed || windowCloseConfirmationPending) return;
+    windowCloseConfirmationPending = true;
+    try {
+      if (!await confirmCloseApplication()) return;
+      windowCloseConfirmed = true;
+      await closeApplication();
+    } catch (error) {
+      windowCloseConfirmed = false;
+      console.error("Application close error:", error);
+    } finally {
+      windowCloseConfirmationPending = false;
+    }
+  }
+
+  async function confirmCloseApplication(): Promise<boolean> {
     const savingDocuments = tabsStore.tabs.flatMap((tab) =>
       tab.documents.filter((document) => document.saveState === "saving")
     );
@@ -310,23 +325,23 @@
         savingDocuments.length === 1
           ? `"${savingDocuments[0]!.name}"`
           : `${savingDocuments.length} documents`;
-      window.alert(`Please wait for ${label} to finish saving before closing RedTerm.`);
+      await showWarning(`Please wait for ${label} to finish saving before closing RedTerm.`);
       return false;
     }
     const dirtyDocuments = tabsStore.tabs.flatMap((tab) =>
       tab.documents.filter((document) => document.dirty)
     );
-    if (dirtyDocuments.length === 0) return window.confirm("Close RedTerm?");
+    if (dirtyDocuments.length === 0) return confirmAction("Close RedTerm?");
     const label =
       dirtyDocuments.length === 1
         ? `"${dirtyDocuments[0]!.name}"`
         : `${dirtyDocuments.length} documents`;
-    return window.confirm(
+    return confirmAction(
       `Discard unsaved changes in ${label} and close RedTerm?`
     );
   }
 
-  function confirmCloseDocuments(tabId: string, sourcePaneId?: string): boolean {
+  async function confirmCloseDocuments(tabId: string, sourcePaneId?: string): Promise<boolean> {
     const documents = (tabsStore.getTab(tabId)?.documents ?? []).filter(
       (document) =>
         sourcePaneId === undefined || document.sourcePaneId === sourcePaneId
@@ -339,22 +354,28 @@
         savingDocuments.length === 1
           ? `"${savingDocuments[0]!.name}"`
           : `${savingDocuments.length} documents`;
-      window.alert(`Please wait for ${label} to finish saving before closing.`);
+      await showWarning(`Please wait for ${label} to finish saving before closing.`);
       return false;
     }
     const dirtyDocuments = documents.filter((document) => document.dirty);
     if (dirtyDocuments.length === 0) {
-      return window.confirm(sourcePaneId === undefined ? "Close this tab?" : "Close this pane?");
+      return confirmAction(sourcePaneId === undefined ? "Close this tab?" : "Close this pane?");
     }
     const label =
       dirtyDocuments.length === 1
         ? `"${dirtyDocuments[0]!.name}"`
         : `${dirtyDocuments.length} documents`;
-    return window.confirm(`Discard unsaved changes in ${label}?`);
+    return confirmAction(`Discard unsaved changes in ${label}?`);
   }
   async function closeTabById(tabId: string) {
     const tab = tabsStore.getTab(tabId);
-    if (!tab || tabIsClosing(tabId) || !confirmCloseDocuments(tabId)) return;
+    if (!tab || tabIsClosing(tabId)) return;
+    confirmingTabIds.add(tabId);
+    try {
+      if (!await confirmCloseDocuments(tabId)) return;
+    } finally {
+      confirmingTabIds.delete(tabId);
+    }
     const paneIds = tab.panes.map((pane) => pane.id);
     closingTabIds.add(tabId);
     for (const paneId of paneIds) closingPaneIds.add(paneId);
@@ -612,10 +633,12 @@
       void closeTabById(tabId);
     },
     closePane(_tabId, paneId) {
-      if (paneIsClosing(_tabId, paneId) || !confirmCloseDocuments(_tabId, paneId)) return;
-      closingPaneIds.add(paneId);
+      if (paneIsClosing(_tabId, paneId)) return;
+      confirmingPaneIds.add(paneId);
       void (async () => {
         try {
+          if (!await confirmCloseDocuments(_tabId, paneId)) return;
+          closingPaneIds.add(paneId);
           tabsStore.closeDocuments(_tabId, paneId);
           await serializeLayoutSnapshotOperation(async () => {
             const initial = findPaneLocation(paneId);
@@ -633,6 +656,7 @@
             }
           });
         } finally {
+          confirmingPaneIds.delete(paneId);
           closingPaneIds.delete(paneId);
         }
       })();

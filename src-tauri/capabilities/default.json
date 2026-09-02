@@ -9,6 +9,8 @@
     "opener:allow-open-url",
     "opener:allow-default-urls",
     "dialog:allow-open",
+    "dialog:allow-message",
+    "allow-exit-application",
     "allow-get-runtime-instance-id",
     "allow-get-keyboard-layout-map",
     "allow-check-voice-input-permissions",

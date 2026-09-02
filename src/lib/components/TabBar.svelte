@@ -5,16 +5,18 @@
     onAddTab?: () => void;
     onSelectTab: (id: string) => void;
     onCloseTab: (id: string) => void | Promise<void>;
+    isTabClosing?: (id: string) => boolean;
     onOpenSettings?: () => void;
   }
 
-  let { onAddTab, onSelectTab, onCloseTab, onOpenSettings }: Props = $props();
+  let { onAddTab, onSelectTab, onCloseTab, isTabClosing, onOpenSettings }: Props = $props();
 
   function handleTabClick(id: string) {
     onSelectTab(id);
   }
   function handleCloseTab(e: MouseEvent, id: string) {
     e.stopPropagation();
+    if (isTabClosing?.(id)) return;
     void onCloseTab(id);
   }
 </script>
@@ -32,7 +34,11 @@
       >
         <span class="tab-status" class:connected={tab.connected}></span>
         <span class="tab-title">{tab.title}</span>
-        <button class="tab-close" onclick={(e) => handleCloseTab(e, tab.id)}>
+        <button
+          class="tab-close"
+          disabled={isTabClosing?.(tab.id) ?? false}
+          onclick={(e) => handleCloseTab(e, tab.id)}
+        >
           &times;
         </button>
       </div>

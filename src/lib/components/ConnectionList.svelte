@@ -2,7 +2,7 @@
   import { onMount } from "svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
-  import type { AuthConfig, SavedConnection } from "$lib/tauri/commands";
+  import { confirmAction, type AuthConfig, type SavedConnection } from "$lib/tauri/commands";
   import {
     cleanupUnreferencedManagedKeys,
     retryPendingManagedKeyCleanup,
@@ -74,30 +74,33 @@
 
 
   async function handleDelete(connection: SavedConnection) {
-    if (!confirm(`Delete "${connection.name}"?`)) return;
-
+    if (deletingId !== null) return;
     deletingId = connection.id;
-    let keyLease = connection.key_id
-      ? {
-          keyId: connection.key_id,
-          release: retainPendingManagedKey(connection.key_id),
-        }
-      : undefined;
+    let keyLease: { keyId: string; release: () => void } | undefined;
     try {
-      await connectionsStore.delete(connection.id);
-      tabsStore.detachSavedConnection(connection.id);
-      if (keyLease) {
-        keyLease.release();
+      if (!await confirmAction(`Delete "${connection.name}"?`)) return;
+      keyLease = connection.key_id
+        ? {
+            keyId: connection.key_id,
+            release: retainPendingManagedKey(connection.key_id),
+          }
+        : undefined;
+      try {
+        await connectionsStore.delete(connection.id);
+        tabsStore.detachSavedConnection(connection.id);
+        if (keyLease) {
+          keyLease.release();
+          keyLease = undefined;
+        }
+        if (connection.key_id) {
+          await cleanupUnreferencedManagedKeys([connection.key_id]);
+        }
+      } catch {
+        keyLease?.release();
         keyLease = undefined;
+        await retryPendingManagedKeyCleanup();
+        // The store exposes the backend error for the inline alert below.
       }
-      if (connection.key_id) {
-        await cleanupUnreferencedManagedKeys([connection.key_id]);
-      }
-    } catch {
-      keyLease?.release();
-      keyLease = undefined;
-      await retryPendingManagedKeyCleanup();
-      // The store exposes the backend error for the inline alert below.
     } finally {
       keyLease?.release();
       deletingId = null;
