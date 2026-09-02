@@ -22,7 +22,8 @@ const DEFAULT_CONFIG: CanvasRendererConfig = {
 };
 
 const MAX_IMAGE_CACHE_ENTRIES = 64;
-const MAX_IMAGE_CACHE_PIXELS = 8 * 1024 * 1024;
+const MAX_IMAGE_CACHE_PIXELS = 32 * 1024 * 1024;
+const MAX_ANIMATED_IMAGE_FRAME_PIXELS = 8 * 1024 * 1024;
 const KITTY_Z_INDEX_BELOW_CELL_BACKGROUNDS = -0x40000000;
 
 export function compareTerminalImageOrder(left: TerminalImage, right: TerminalImage): number {
@@ -49,6 +50,7 @@ export class CanvasRenderer {
   private dpr: number;
   private imageCache = new Map<number, ImageCacheEntry>();
   private imageCachePixels = 0;
+  private protectedImageCacheIds = new Set<number>();
   private animatedImageTimer: ReturnType<typeof setInterval> | null = null;
   private animatedImageSeenThisFrame = false;
   private animationsEnabled = true;
@@ -145,6 +147,7 @@ export class CanvasRenderer {
   /** 스크롤 소수점 오프셋 적용 — clear() 후, 모든 draw 호출 전에 호출 */
   beginDraw(scrollFracY: number) {
     this.animatedImageSeenThisFrame = false;
+    this.protectedImageCacheIds.clear();
     this.ctx.save();
     this.ctx.translate(0, -scrollFracY);
   }
@@ -170,17 +173,15 @@ export class CanvasRenderer {
       this.ctx.fillStyle = defaultBg;
       this.ctx.fillRect(0, y, this.canvas.width / this.dpr, rowH);
     }
-    let x = horizontalPadding;
     let runBg = '';
     let runX = 0;
     let runW = 0;
-    for (const cell of cells) {
-      if (cell.char === '') continue;
-      const cellWidth = this.isWideChar(cell.char) ? this.charWidth * 2 : this.charWidth;
-      const bg = this.resolveBg(cell.style);
+    for (let col = 0; col < cells.length; col++) {
+      const bg = this.resolveBg(cells[col].style);
+      const x = horizontalPadding + col * this.charWidth;
       if (bg !== defaultBg) {
-        if (bg === runBg) {
-          runW += cellWidth;
+        if (runW > 0 && bg === runBg) {
+          runW += this.charWidth;
         } else {
           if (runW > 0) {
             this.ctx.fillStyle = runBg;
@@ -188,14 +189,13 @@ export class CanvasRenderer {
           }
           runBg = bg;
           runX = x;
-          runW = cellWidth;
+          runW = this.charWidth;
         }
       } else if (runW > 0) {
         this.ctx.fillStyle = runBg;
         this.ctx.fillRect(runX, y, runW, rowH);
         runW = 0;
       }
-      x += cellWidth;
     }
     if (runW > 0) {
       this.ctx.fillStyle = runBg;
@@ -206,50 +206,77 @@ export class CanvasRenderer {
   private drawRowText(screenY: number, cells: Cell[]) {
     const { horizontalPadding, fontSize, fontFamily } = this.config;
     const y = screenY * this.charHeight;
-    const baseFont = `${fontSize}px ${fontFamily}`;
-    let x = horizontalPadding;
+    const baseFont = fontSize + 'px ' + fontFamily;
     let currentFont = '';
-    const textY = y + (this.charHeight - fontSize) / 2;
     this.ctx.textAlign = 'center';
 
-    for (const cell of cells) {
-      if (cell.char === '') continue;
+    for (let col = 0; col < cells.length; col++) {
+      const cell = cells[col];
+      const sizing = cell.textSizing;
+      if (cell.char === '' || (sizing && (sizing.row !== 0 || sizing.col !== 0))) continue;
+
       const style = cell.style;
-      const cellWidth = this.isWideChar(cell.char) ? this.charWidth * 2 : this.charWidth;
-      if (!style.hidden && !cell.imagePlaceholder) {
+      const x = horizontalPadding + col * this.charWidth;
+      const cellWidth = sizing
+        ? sizing.scale * sizing.width * this.charWidth
+        : this.isWideChar(cell.char) ? this.charWidth * 2 : this.charWidth;
+      const cellHeight = sizing ? sizing.scale * this.charHeight : this.charHeight;
+      const fraction = sizing?.denominator ? sizing.numerator / sizing.denominator : 1;
+      const renderWidth = cellWidth * fraction;
+      const renderHeight = cellHeight * fraction;
+      const renderX = sizing
+        ? x + (sizing.horizontalAlign === 1
+            ? cellWidth - renderWidth
+            : sizing.horizontalAlign === 2 ? (cellWidth - renderWidth) / 2 : 0)
+        : x;
+      const renderY = sizing
+        ? y + (sizing.verticalAlign === 1
+            ? cellHeight - renderHeight
+            : sizing.verticalAlign === 2 ? (cellHeight - renderHeight) / 2 : 0)
+        : y;
+      const targetFontSize = sizing ? fontSize * sizing.scale * fraction : fontSize;
+      if (!style.hidden && !cell.imagePlaceholder && targetFontSize > 0) {
         this.ctx.fillStyle = this.resolveFg(style);
         const fontPrefix = this.getFontPrefix(style);
-        const targetFont = fontPrefix ? `${fontPrefix}${baseFont}` : baseFont;
+        const sizedFont = sizing ? targetFontSize + 'px ' + fontFamily : baseFont;
+        const targetFont = fontPrefix ? fontPrefix + sizedFont : sizedFont;
         if (targetFont !== currentFont) {
           this.ctx.font = targetFont;
           currentFont = targetFont;
         }
-        const textX = x + cellWidth / 2;
-        this.ctx.fillText(cell.char, textX, textY);
+        const textX = renderX + renderWidth / 2;
+        const textY = renderY + (renderHeight - targetFontSize) / 2;
+        if (sizing) {
+          this.ctx.fillText(cell.char, textX, textY, renderWidth);
+        } else {
+          this.ctx.fillText(cell.char, textX, textY);
+        }
       }
       if (style.underline && !cell.imagePlaceholder) {
         this.ctx.fillStyle = this.resolveFg(style);
-        this.ctx.fillRect(x, y + this.charHeight - 1, cellWidth, 1);
+        this.ctx.fillRect(x, y + cellHeight - 1, cellWidth, 1);
       }
       if (style.strikethrough && !cell.imagePlaceholder) {
         this.ctx.fillStyle = this.resolveFg(style);
-        this.ctx.fillRect(x, y + this.charHeight / 2, cellWidth, 1);
+        this.ctx.fillRect(x, y + cellHeight / 2, cellWidth, 1);
       }
-      x += cellWidth;
     }
     this.ctx.textAlign = 'start';
   }
 
-  drawCursor(cursorX: number, screenY: number, captureSnapshot = false) {
-    const x = this.config.horizontalPadding + cursorX * this.charWidth;
-    const y = screenY * this.charHeight;
-    const width = Math.max(1, this.charWidth);
+  drawCursor(cursorX: number, screenY: number, captureSnapshot = false, cell?: Cell) {
+    const sizing = cell?.textSizing;
+    const x = this.config.horizontalPadding +
+      (cursorX - (sizing?.col ?? 0)) * this.charWidth;
+    const y = (screenY - (sizing?.row ?? 0)) * this.charHeight;
+    const width = Math.max(1, sizing ? sizing.scale * sizing.width * this.charWidth : this.charWidth);
+    const height = sizing ? sizing.scale * this.charHeight : this.charHeight;
     if (captureSnapshot) {
       const transform = this.ctx.getTransform();
       const left = Math.max(0, Math.floor(x * transform.a + transform.e));
       const top = Math.max(0, Math.floor(y * transform.d + transform.f));
       const right = Math.min(this.offscreen.width, Math.ceil((x + width) * transform.a + transform.e));
-      const bottom = Math.min(this.offscreen.height, Math.ceil((y + this.charHeight) * transform.d + transform.f));
+      const bottom = Math.min(this.offscreen.height, Math.ceil((y + height) * transform.d + transform.f));
       this.cursorSnapshot = right > left && bottom > top
         ? { x: left, y: top, pixels: this.ctx.getImageData(left, top, right - left, bottom - top) }
         : null;
@@ -258,7 +285,7 @@ export class CanvasRenderer {
     }
     this.ctx.fillStyle = this.config.cursorColor;
     this.ctx.globalAlpha = 0.95;
-    this.ctx.fillRect(x, y, width, this.charHeight);
+    this.ctx.fillRect(x, y, width, height);
     this.ctx.globalAlpha = 1.0;
   }
 
@@ -289,8 +316,10 @@ export class CanvasRenderer {
 
   drawVisibleRows(buffer: Cell[][], startRow: number, endRow: number) {
     for (let bufferY = startRow; bufferY < endRow && bufferY < buffer.length; bufferY++) {
-      const screenY = bufferY - startRow;
-      this.drawRow(screenY, buffer[bufferY]);
+      this.drawRowBackground(bufferY - startRow, buffer[bufferY], true);
+    }
+    for (let bufferY = Math.max(0, startRow - 6); bufferY < endRow && bufferY < buffer.length; bufferY++) {
+      this.drawRowText(bufferY - startRow, buffer[bufferY]);
     }
   }
 
@@ -301,7 +330,7 @@ export class CanvasRenderer {
   }
 
   drawVisibleRowText(buffer: Cell[][], startRow: number, endRow: number) {
-    for (let bufferY = startRow; bufferY < endRow && bufferY < buffer.length; bufferY++) {
+    for (let bufferY = Math.max(0, startRow - 6); bufferY < endRow && bufferY < buffer.length; bufferY++) {
       this.drawRowText(bufferY - startRow, buffer[bufferY]);
     }
   }
@@ -312,6 +341,11 @@ export class CanvasRenderer {
     endRow: number,
     layer: 'background' | 'below' | 'above' | 'all' = 'all',
   ) {
+    for (const image of images) {
+      if (image.row < endRow && image.row + image.heightCells > startRow) {
+        this.protectedImageCacheIds.add(image.dataId ?? image.id);
+      }
+    }
     const orderedImages = images
       .filter((image) => {
         if (layer === 'all') return true;
@@ -356,7 +390,9 @@ export class CanvasRenderer {
       return cached.source;
     }
 
-    const pixelCount = image.pixelWidth * image.pixelHeight;
+    const pixelCount = image.kind === 'encoded' && image.animated
+      ? image.decodedFramePixels ?? MAX_ANIMATED_IMAGE_FRAME_PIXELS
+      : image.pixelWidth * image.pixelHeight;
     if (!this.evictImageCacheIfNeeded(pixelCount)) return null;
 
     if (image.kind === 'png' || image.kind === 'encoded') {
@@ -417,7 +453,13 @@ export class CanvasRenderer {
       this.imageCache.size >= MAX_IMAGE_CACHE_ENTRIES ||
       this.imageCachePixels + incomingPixels > MAX_IMAGE_CACHE_PIXELS
     ) {
-      const oldestKey = this.imageCache.keys().next().value as number | undefined;
+      let oldestKey: number | undefined;
+      for (const cacheId of this.imageCache.keys()) {
+        if (!this.protectedImageCacheIds.has(cacheId)) {
+          oldestKey = cacheId;
+          break;
+        }
+      }
       if (oldestKey === undefined) return false;
       this.deleteImageCacheEntry(oldestKey);
     }
@@ -471,13 +513,20 @@ export class CanvasRenderer {
       this.drawVisibleRows(buffer, startRow, endRow);
       return;
     }
-
+    const visibleDirtyRows: number[] = [];
     for (const bufferY of dirtyBufferRows) {
       const fullY = bufferY + scrollbackLength;
-      if (fullY >= startRow && fullY < endRow) {
-        const screenY = fullY - startRow;
-        this.drawRow(screenY, buffer[fullY]);
-      }
+      if (fullY >= startRow && fullY < endRow) visibleDirtyRows.push(fullY);
+    }
+    for (const fullY of visibleDirtyRows) {
+      this.drawRowBackground(fullY - startRow, buffer[fullY], true);
+    }
+    const textRows = new Set<number>();
+    for (const fullY of visibleDirtyRows) {
+      for (let row = Math.max(0, fullY - 6); row <= fullY; row++) textRows.add(row);
+    }
+    for (const row of [...textRows].sort((left, right) => left - right)) {
+      this.drawRowText(row - startRow, buffer[row]);
     }
   }
 

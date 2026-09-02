@@ -458,6 +458,356 @@ describe("AnsiParser OSC compatibility", () => {
 
 });
 
+describe("AnsiParser OSC 66 text sizing", () => {
+  test("splits zero-width metadata into scaled grapheme blocks", () => {
+    const parser = new AnsiParser(12, 4);
+
+    parser.write("\x1b]66;s=2;Ab\x07");
+
+    const buffer = parser.getBuffer();
+    expect(parser.getCursor()).toEqual({ x: 4, y: 0 });
+    expect(buffer[0][0]).toMatchObject({
+      char: "A",
+      textSizing: { text: "A", scale: 2, width: 1, row: 0, col: 0 },
+    });
+    expect(buffer[0][1]).toMatchObject({ char: "", textSizing: { row: 0, col: 1 } });
+    expect(buffer[1][0]).toMatchObject({ char: "", textSizing: { row: 1, col: 0 } });
+    expect(buffer[0][2]).toMatchObject({
+      char: "b",
+      textSizing: { text: "b", scale: 2, width: 1, row: 0, col: 0 },
+    });
+  });
+
+  test("uses explicit width and fractional alignment for one block", () => {
+    const parser = new AnsiParser(12, 4);
+
+    parser.write("\x1b]66;s=2:w=3:n=1:d=2:v=1:h=2;Hi\x1b\\");
+
+    const buffer = parser.getBuffer();
+    expect(parser.getCursor()).toEqual({ x: 6, y: 0 });
+    expect(buffer[0][0]).toMatchObject({
+      char: "Hi",
+      textSizing: {
+        text: "Hi",
+        scale: 2,
+        width: 3,
+        numerator: 1,
+        denominator: 2,
+        verticalAlign: 1,
+        horizontalAlign: 2,
+        row: 0,
+        col: 0,
+      },
+    });
+    expect(buffer[1][5]).toMatchObject({ char: "", textSizing: { row: 1, col: 5 } });
+  });
+
+  test("reports width and scale support through cursor position changes", () => {
+    const parser = new AnsiParser(20, 4);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+
+    parser.write("\r\x1b[6n");
+    parser.write("\x1b]66;w=2; \x07\x1b[6n");
+    parser.write("\x1b]66;s=2; \x07\x1b[6n");
+
+    expect(responses).toEqual(["\x1b[1;1R", "\x1b[1;3R", "\x1b[1;5R"]);
+  });
+
+  test("wraps blocks and skips writes over their lower rows", () => {
+    const parser = new AnsiParser(5, 4);
+    parser.write("abcd\x1b]66;s=2:w=1;X\x07");
+
+    expect(parser.getCursor()).toEqual({ x: 2, y: 1 });
+    expect(parser.getBuffer()[1][0].textSizing?.text).toBe("X");
+
+    parser.write("\x1b[3;1Hq");
+    expect(parser.getBuffer()[1][0].textSizing?.text).toBe("X");
+    expect(parser.getBuffer()[2][2].char).toBe("q");
+    expect(parser.getCursor()).toEqual({ x: 3, y: 2 });
+  });
+
+  test("erases a whole block when writing or erasing through it", () => {
+    const rootOverwrite = new AnsiParser(8, 4);
+    rootOverwrite.write("\x1b]66;s=2:w=1;X\x07\x1b[1;1Ha");
+    expect(rootOverwrite.getBuffer()[0][0].char).toBe("a");
+    expect(rootOverwrite.getBuffer()[1][1].textSizing).toBeUndefined();
+
+    const lowerErase = new AnsiParser(8, 4);
+    lowerErase.write("\x1b]66;s=2:w=1;X\x07\x1b[2;2H\x1b[X");
+    expect(lowerErase.getBuffer()[0][0].char).toBe(" ");
+    expect(lowerErase.getBuffer()[1][1].textSizing).toBeUndefined();
+  });
+
+  test("preserves complete snapshots and discards blocks broken by reflow", () => {
+    const source = new AnsiParser(8, 4);
+    source.write("\x1b]66;s=2:w=2;Wide\x07");
+
+    const restored = new AnsiParser(8, 4);
+    restored.restoreSnapshot(source.createSnapshot());
+    expect(restored.getBuffer()[0][0].textSizing?.text).toBe("Wide");
+    expect(restored.getBuffer()[1][3].textSizing).toMatchObject({ row: 1, col: 3 });
+
+    restored.resize(3, 4);
+    expect(restored.getFullBuffer().flat().some((cell) => cell.textSizing)).toBe(false);
+  });
+
+  test("keeps earlier blocks when wrapped text crosses continuation rows", () => {
+    const parser = new AnsiParser(4, 4);
+
+    parser.write("\x1b]66;s=2;ABC\x07");
+
+    const buffer = parser.getBuffer();
+    expect(buffer[0][0].textSizing?.text).toBe("A");
+    expect(buffer[0][2].textSizing?.text).toBe("B");
+    expect(buffer[2][0].textSizing?.text).toBe("C");
+    expect(parser.getCursor()).toEqual({ x: 2, y: 2 });
+  });
+
+  test("wraps wide characters after skipping a block continuation row", () => {
+    const parser = new AnsiParser(3, 4);
+    parser.write("\x1b]66;s=2;X\x07");
+
+    parser.write("\x1b[2;1H가");
+
+    const buffer = parser.getBuffer();
+    expect(buffer[0][0].textSizing?.text).toBe("X");
+    expect(buffer[2][0].char).toBe("가");
+    expect(buffer[2][1].char).toBe("");
+    expect(parser.getCursor()).toEqual({ x: 2, y: 2 });
+  });
+
+  test("preserves complete scrollback blocks beyond the dropped edge", () => {
+    const blockSource = new AnsiParser(4, 2);
+    blockSource.write("\x1b]66;s=2;X\x07");
+    const blockRows = blockSource.createSnapshot().bufferRows;
+    const emptySnapshot = new AnsiParser(4, 2).createSnapshot();
+    const snapshot = blockSource.createSnapshot();
+    snapshot.scrollbackRows = Array.from({ length: 1000 }, (_, row) => {
+      if (row === 7) return structuredClone(blockRows[0]);
+      if (row === 8) return structuredClone(blockRows[1]);
+      return structuredClone(emptySnapshot.bufferRows[0]);
+    });
+    snapshot.bufferRows = structuredClone(emptySnapshot.bufferRows);
+    snapshot.cursorX = 0;
+    snapshot.cursorY = 1;
+
+    const restored = new AnsiParser(4, 2);
+    restored.restoreSnapshot(snapshot);
+    restored.write("\n");
+
+    const fullBuffer = restored.getFullBuffer();
+    expect(fullBuffer[6][0].textSizing?.text).toBe("X");
+    expect(fullBuffer[7][1].textSizing).toMatchObject({ row: 1, col: 1 });
+  });
+
+  test("removes blocks split by downward region scrolling", () => {
+    const parser = new AnsiParser(4, 4);
+    parser.write("\x1b]66;s=2;X\x07");
+
+    parser.write("\x1b[2;4r\x1b[T");
+
+    expect(parser.getBuffer().flat().some((cell) => cell.textSizing)).toBe(false);
+  });
+
+  test("removes blocks split by deleting lines at a region boundary", () => {
+    const parser = new AnsiParser(4, 4);
+    parser.write("\x1b[3;1H\x1b]66;s=2;X\x07");
+
+    parser.write("\x1b[2;3r\x1b[2;1H\x1b[M");
+
+    expect(parser.getBuffer().flat().some((cell) => cell.textSizing)).toBe(false);
+  });
+
+  test("bounds combining marks on text-sized cells and restored snapshots", () => {
+    const parser = new AnsiParser(8, 2);
+    parser.write("\x1b]66;s=1;X\x07\x1b[1;1H" + "\u0301".repeat(3000));
+
+    const cell = parser.getBuffer()[0][0];
+    const boundedText = cell.char;
+    expect(new TextEncoder().encode(boundedText).length).toBeLessThanOrEqual(4096);
+
+    parser.write("\u0301".repeat(100));
+    expect(parser.getBuffer()[0][0].char).toBe(boundedText);
+
+    const snapshot = parser.createSnapshot();
+    snapshot.bufferRows[0][0].char = "x".repeat(4097);
+    snapshot.bufferRows[0][0].textSizing!.text = snapshot.bufferRows[0][0].char;
+    const restored = new AnsiParser(8, 2);
+    restored.restoreSnapshot(snapshot);
+    expect(restored.getBuffer()[0][0].textSizing).toBeUndefined();
+  });
+
+  test("scrolls resized short scrollback rows without throwing", () => {
+    const source = new AnsiParser(2, 2);
+    const snapshot = source.createSnapshot();
+    snapshot.scrollbackRows = Array.from(
+      { length: 1000 },
+      () => structuredClone(snapshot.bufferRows[0]),
+    );
+    snapshot.cursorX = 0;
+    snapshot.cursorY = 1;
+    const restored = new AnsiParser(2, 2);
+    restored.restoreSnapshot(snapshot);
+    restored.resize(4, 2);
+
+    expect(() => restored.write("\n")).not.toThrow();
+    expect(restored.getFullBuffer()).toHaveLength(1002);
+  });
+
+  test("clears both cells of a wide character before placing a block", () => {
+    const parser = new AnsiParser(4, 2);
+    parser.write("가\x1b[1;2H\x1b]66;w=1;X\x07");
+
+    expect(parser.getBuffer()[0][0].char).toBe(" ");
+    expect(parser.getBuffer()[0][1].textSizing?.text).toBe("X");
+  });
+
+  test("rejects snapshot text on block continuation cells", () => {
+    const source = new AnsiParser(4, 2);
+    source.write("\x1b]66;s=2;X\x07");
+    const snapshot = source.createSnapshot();
+    snapshot.bufferRows[0][1].char = "x".repeat(4097);
+    snapshot.bufferRows[0][1].textSizing!.text = "x".repeat(4097);
+
+    const restored = new AnsiParser(4, 2);
+    restored.restoreSnapshot(snapshot);
+
+    expect(restored.getBuffer().flat().some((cell) => cell.textSizing)).toBe(false);
+  });
+
+  test("invalidates Kitty virtual origins overwritten by a block", () => {
+    const parser = new AnsiParser(20, 4);
+    parser.write(kittyRgbaTransmit({ imageId: 13 }));
+    parser.write(kittyRgbaTransmit({ imageId: 14 }));
+    parser.write("\x1b_Ga=p,i=13,p=11,U=1,c=1,r=1\x1b\\");
+    parser.write("\x1b_Ga=p,i=14,p=22,P=13,Q=11,c=1,r=1,C=1\x1b\\");
+    parser.write("\x1b[38:5:13;58:5:11m\u{10eeee}\x1b[0m");
+    expect(parser.getImages().map((image) => image.placementId)).toEqual([11, 22]);
+
+    parser.write("\x1b[1;1H\x1b]66;w=1;X\x07");
+
+    expect(parser.getImages()).toHaveLength(0);
+  });
+
+  test("combines OSC 66 marks with an existing block", () => {
+    const parser = new AnsiParser(8, 4);
+    parser.write("\x1b]66;s=2;A\x07\x1b[1;1H\x1b]66;s=2;\u0301\x07");
+
+    const buffer = parser.getBuffer();
+    expect(buffer[0][0].char).toBe("A\u0301");
+    expect(buffer[0][0].textSizing?.text).toBe("A\u0301");
+    expect(buffer[1][1].textSizing).toMatchObject({ row: 1, col: 1 });
+  });
+
+  test("does not combine explicit-width text that only starts with a mark", () => {
+    const parser = new AnsiParser(8, 4);
+    parser.write("\x1b]66;s=2;A\x07\x1b[1;1H\x1b]66;w=7;\u0301abcdef\x07");
+
+    expect(parser.getBuffer()[0][0].textSizing).toMatchObject({
+      text: "\u0301abcdef",
+      scale: 1,
+      width: 7,
+    });
+    expect(parser.getCursor()).toEqual({ x: 7, y: 0 });
+  });
+
+  test("uses presentation-sensitive widths for implicit OSC 66 graphemes", () => {
+    const parser = new AnsiParser(12, 4);
+    parser.write("\x1b]66;;©\x07");
+    parser.write("\x1b]66;;❤︎\x07");
+    parser.write("\x1b]66;;❤️\x07");
+    parser.write("\x1b]66;;🐈\x07");
+    parser.write("\x1b]66;;\u0301\x07");
+
+    expect(parser.getCursor()).toEqual({ x: 6, y: 0 });
+    expect(parser.getBuffer()[0][0].textSizing).toMatchObject({ text: "©", width: 1 });
+    expect(parser.getBuffer()[0][1].textSizing).toMatchObject({ text: "❤︎", width: 1 });
+    expect(parser.getBuffer()[0][2].textSizing).toMatchObject({ text: "❤️", width: 2 });
+    expect(parser.getBuffer()[0][4].textSizing).toMatchObject({ text: "🐈", width: 2 });
+  });
+
+  test("keeps OSC 66 blocks on the current row when DECAWM is disabled after restore", () => {
+    const source = new AnsiParser(5, 2);
+    source.write("abcd\x1b[?7l");
+    const restored = new AnsiParser(5, 2);
+    restored.restoreSnapshot(source.createSnapshot());
+
+    restored.write("\x1b]66;w=2;XY\x07");
+
+    expect(visibleRowText(restored)).toBe("abcXY");
+    expect(restored.getCursor()).toEqual({ x: 5, y: 0 });
+  });
+
+  test("overwrites a right-edge block instead of looping with DECAWM disabled", () => {
+    const parser = new AnsiParser(5, 4);
+    parser.write("\x1b[1;4H\x1b]66;s=2:w=1;X\x07");
+    parser.write("\x1b[2;4H\x1b[?7lq");
+
+    expect(parser.getBuffer()[1][3].char).toBe("q");
+    expect(parser.getBuffer().flat().some((cell) => cell.textSizing)).toBe(false);
+    expect(parser.getCursor()).toEqual({ x: 4, y: 1 });
+  });
+
+  test("preserves an existing block when partial-region overflow rejects replacement", () => {
+    const parser = new AnsiParser(8, 3);
+    parser.write("\x1b[3;1H\x1b]66;w=1;X\x07");
+    parser.write("\x1b[2;3r\x1b[3;1H\x1b]66;s=2;Y\x07");
+
+    expect(parser.getBuffer()[2][0].textSizing).toMatchObject({ text: "X", scale: 1, width: 1 });
+    expect(parser.getBuffer()[2][0].char).toBe("X");
+  });
+
+  test("rejects invalid metadata and text over the byte limit", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write("\x1b]66;s=8;bad\x07");
+    parser.write("\x1b]66;n=2:d=1;bad\x07");
+    parser.write("\x1b]66;;" + "한".repeat(1366) + "\x07");
+    parser.write("ok");
+
+    expect(visibleRowText(parser)).toBe("ok");
+    expect(parser.getFullBuffer().flat().some((cell) => cell.textSizing)).toBe(false);
+  });
+});
+
+describe("CanvasRenderer OSC 66 text sizing", () => {
+  test("draws scaled origins at the scaled font and block width", () => {
+    const draws: Array<{ text: string; maxWidth: number | undefined; font: string }> = [];
+    const context = {
+      fillStyle: "",
+      font: "",
+      textAlign: "start",
+      fillRect() {},
+      fillText(text: string, _x: number, _y: number, maxWidth?: number) {
+        draws.push({ text, maxWidth, font: this.font });
+      },
+    };
+    const renderer = Object.create(CanvasRenderer.prototype) as CanvasRenderer;
+    Object.assign(renderer, {
+      ctx: context,
+      wideCharCache: new Map(),
+      config: {
+        fontSize: 10,
+        fontFamily: "monospace",
+        defaultFg: "#fff",
+        defaultBg: "#000",
+        horizontalPadding: 0,
+      },
+      charWidth: 6,
+      charHeight: 14,
+    });
+    const parser = new AnsiParser(12, 4);
+    parser.write("\x1b]66;s=2;AB\x07");
+
+    renderer.drawVisibleRowText(parser.getBuffer(), 0, 4);
+
+    expect(draws.filter((draw) => draw.maxWidth !== undefined)).toEqual([
+      { text: "A", maxWidth: 12, font: "20px monospace" },
+      { text: "B", maxWidth: 12, font: "20px monospace" },
+    ]);
+  });
+});
+
 describe("CanvasRenderer image ordering", () => {
   test("orders same-z Kitty images by protocol image id", () => {
     const images = [
@@ -473,6 +823,26 @@ describe("CanvasRenderer image ordering", () => {
 });
 
 describe("AnsiParser Kitty images", () => {
+  test("retains three max-sized visible image caches without LRU churn", () => {
+    const renderer = Object.create(CanvasRenderer.prototype) as CanvasRenderer;
+    const pixelsPerImage = 4 * 1024 * 1024;
+    const internals = renderer as unknown as {
+      imageCache: Map<number, unknown>;
+      imageCachePixels: number;
+      protectedImageCacheIds: Set<number>;
+      evictImageCacheIfNeeded(incomingPixels: number): boolean;
+    };
+    internals.imageCache = new Map([
+      [1, { kind: "ready", source: {}, pixelCount: pixelsPerImage, animated: false }],
+      [2, { kind: "ready", source: {}, pixelCount: pixelsPerImage, animated: false }],
+    ]);
+    internals.imageCachePixels = pixelsPerImage * 2;
+    internals.protectedImageCacheIds = new Set([1, 2, 3]);
+
+    expect(internals.evictImageCacheIfNeeded(pixelsPerImage)).toBe(true);
+    expect([...internals.imageCache.keys()]).toEqual([1, 2]);
+  });
+
   test("prunes unretained image cache entries and revokes object URLs", () => {
     const renderer = Object.create(CanvasRenderer.prototype) as CanvasRenderer;
     const internals = renderer as unknown as {
@@ -2571,7 +2941,25 @@ describe("AnsiParser image resource limits", () => {
     expect(parser.getImages()).toHaveLength(0);
   });
 
-  test("limits decoded image placements by total pixel count", () => {
+  test("does not let retained Kitty history block another image protocol", () => {
+    const parser = new AnsiParser(40, 3);
+    const fourMegapixelPng = pngWithDimensionsBase64(2048, 2048);
+
+    for (let index = 0; index < 3; index++) {
+      parser.write("\x1b[1;1H");
+      parser.write(kittyPngApc({ widthCells: 1, heightCells: 1, payload: fourMegapixelPng }));
+    }
+    parser.write(iterm2FileOsc(["inline=1", "width=1", "height=1"], TINY_PNG_BASE64));
+
+    expect(parser.getImages().map((image) => image.protocol)).toEqual([
+      "kitty",
+      "kitty",
+      "kitty",
+      "iterm2",
+    ]);
+  });
+
+  test("retains compressed Kitty history beyond the renderer pixel cache", () => {
     const parser = new AnsiParser(40, 3);
     const fourMegapixelPng = pngWithDimensionsBase64(2048, 2048);
 
@@ -2580,7 +2968,7 @@ describe("AnsiParser image resource limits", () => {
       parser.write(kittyPngApc({ widthCells: 1, heightCells: 1, payload: fourMegapixelPng }));
     }
 
-    expect(parser.getImages()).toHaveLength(2);
+    expect(parser.getImages()).toHaveLength(3);
   });
 
   test("accepts animated GIFs through the encoded image path", () => {
@@ -2596,6 +2984,22 @@ describe("AnsiParser image resource limits", () => {
       kind: "encoded",
       mimeType: "image/gif",
       animated: true,
+      decodedFramePixels: 2,
+    });
+  });
+
+  test("accounts for an animated image's full logical canvas", () => {
+    const parser = new AnsiParser(40, 3);
+    const gifHeader = [0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0, 8, 0, 8, 0, 0, 0];
+    const gifFrame = [0x2c, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0];
+    const animatedGif = Buffer.from([...gifHeader, ...gifFrame, ...gifFrame, 0x3b]).toString("base64");
+
+    parser.write(iterm2FileOsc(["inline=1", "width=1", "height=1"], animatedGif));
+
+    expect(parser.getImages()[0]).toMatchObject({
+      pixelWidth: 2048,
+      pixelHeight: 2048,
+      decodedFramePixels: 4 * 1024 * 1024,
     });
   });
 
@@ -2623,6 +3027,7 @@ describe("AnsiParser image resource limits", () => {
       pixelWidth: 2,
       pixelHeight: 1,
       animated: true,
+      decodedFramePixels: 2,
     });
   });
   test("rejects separator-heavy iTerm2 and Kitty metadata", () => {

@@ -889,7 +889,7 @@
     if (connected && cursorVisible && parserCursorVisible && !(isDesktopTarget && isComposing)) {
       const cursorScreenY = cursorPos.y - startRow;
       if (cursorScreenY >= 0 && cursorScreenY < rows + 2) {
-        renderer.drawCursor(cursorPos.x, cursorScreenY, isDesktopTarget);
+        renderer.drawCursor(cursorPos.x, cursorScreenY, isDesktopTarget, buf[cursorPos.y]?.[cursorPos.x]);
       }
     }
 
@@ -1095,7 +1095,7 @@
           if (connected && cursorVisible && parserCursorVisible && !(isDesktopTarget && isComposing)) {
             const cursorScreenY = cursorPos.y - startRow;
             if (cursorScreenY >= 0 && cursorScreenY < rows + 2) {
-              renderer.drawCursor(cursorPos.x, cursorScreenY, isDesktopTarget);
+              renderer.drawCursor(cursorPos.x, cursorScreenY, isDesktopTarget, buf[cursorPos.y]?.[cursorPos.x]);
             }
           }
           renderer.endDraw();
@@ -1537,7 +1537,7 @@
       const cursorScreenY = cursorPos.y - startRow;
       if (connected && cursorVisible && parserCursorVisible && !(isDesktopTarget && isComposing)) {
         if (cursorScreenY >= 0 && cursorScreenY < rows + 2) {
-          renderer.drawCursor(cursorPos.x, cursorScreenY, isDesktopTarget);
+          renderer.drawCursor(cursorPos.x, cursorScreenY, isDesktopTarget, newBuffer[cursorPos.y]?.[cursorPos.x]);
         }
       }
 

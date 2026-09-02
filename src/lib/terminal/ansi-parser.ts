@@ -51,11 +51,24 @@ export type TerminalOscEvent =
   | { type: 'colors'; colors: TerminalOscColors };
 
 
+export interface TerminalTextSizingCell {
+  text?: string;
+  scale: number;
+  width: number;
+  numerator: number;
+  denominator: number;
+  verticalAlign: 0 | 1 | 2;
+  horizontalAlign: 0 | 1 | 2;
+  row: number;
+  col: number;
+}
+
 export interface Cell {
   char: string;
   hyperlink?: TerminalHyperlink;
   style: TextStyle;
   imagePlaceholder?: KittyPlaceholderCell;
+  textSizing?: TerminalTextSizingCell;
 }
 interface KittyPlaceholderCell {
   renderId: number;
@@ -110,6 +123,7 @@ export interface TerminalEncodedImage extends TerminalImageBase {
   mimeType: Exclude<EncodedImageMimeType, 'image/png'>;
   data: Uint8Array;
   animated: boolean;
+  decodedFramePixels?: number;
 }
 
 export type TerminalImage = TerminalRgbaImage | TerminalPngImage | TerminalEncodedImage;
@@ -194,6 +208,7 @@ interface EncodedImageDimensions {
   width: number;
   height: number;
   animated: boolean;
+  decodedFramePixels: number;
 }
 
 
@@ -237,6 +252,7 @@ export interface TerminalSnapshot {
   cursorX: number;
   cursorY: number;
   applicationCursorKeys: boolean;
+  autoWrapMode?: boolean;
   bracketedPasteMode?: boolean;
   mouseMode?: number;
   cursorVisible?: boolean;
@@ -305,12 +321,16 @@ const MAX_IMAGE_METADATA_CHARS = 4096;
 const MAX_IMAGE_DECODED_BYTES = 4 * 1024 * 1024;
 const MAX_IMAGE_BASE64_CHARS = Math.ceil(MAX_IMAGE_DECODED_BYTES / 3) * 4;
 const MAX_CONTROL_SEQUENCE_CHARS = MAX_IMAGE_BASE64_CHARS + 4096;
-const MAX_OSC_TEXT_CHARS = 4096;
+const MAX_OSC_TEXT_BYTES = 4096;
+const OSC_TEXT_ENCODER = new TextEncoder();
+const OSC_TEXT_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+const OSC_TEXT_EMOJI_PRESENTATION = /\p{Emoji_Presentation}|\p{Regional_Indicator}/u;
+const OSC_TEXT_ZERO_WIDTH_GRAPHEME = /^(?:\p{Mark}|\p{Cf})+$/u;
 const MAX_OSC_TITLE_CHARS = 1024;
 const MAX_OSC_URI_CHARS = 4096;
 const MAX_OSC_CLIPBOARD_BYTES = 64 * 1024;
 const MAX_OSC_CLIPBOARD_BASE64_CHARS = Math.ceil(MAX_OSC_CLIPBOARD_BYTES / 3) * 4;
-const MAX_OSC_SEQUENCE_CHARS = MAX_OSC_TEXT_CHARS + 64;
+const MAX_OSC_SEQUENCE_CHARS = MAX_OSC_TEXT_BYTES + 64;
 const MAX_IMAGE_CHUNKS = 4096;
 const MAX_IMAGE_PIXEL_DIMENSION = 4096;
 const MAX_IMAGE_PIXELS = 4 * 1024 * 1024;
@@ -438,6 +458,7 @@ export class AnsiParser {
   private scrollback: Cell[][] = [];
   private fullBufferCache: Cell[][] = [];
   private fullBufferDirty = true;
+  private textSizingByteLengths = new WeakMap<Cell, number>();
   private dirtyRows = new Set<number>();
   private allDirty = true; // 초기 상태 / resize 시 전체 다시 그리기
   private maxScrollback = 1000;
@@ -473,6 +494,7 @@ export class AnsiParser {
   private savedCursor = { x: 0, y: 0 };
   private lastPrintedChar = ' '; // CSI b (REP) 용
   private applicationCursorKeys = false;
+  private autoWrapMode = true;
   private kittyKeyboardMainFlags = 0;
   private kittyKeyboardAlternateFlags = 0;
   private kittyKeyboardMainStack: number[] = [];
@@ -585,6 +607,7 @@ export class AnsiParser {
       style: cell.style,
       hyperlink: cell.hyperlink ? { ...cell.hyperlink } : undefined,
       imagePlaceholder: cell.imagePlaceholder ? { ...cell.imagePlaceholder } : undefined,
+      textSizing: cell.textSizing ? { ...cell.textSizing } : undefined,
     }));
   }
 
@@ -648,7 +671,7 @@ export class AnsiParser {
   private rowContentLength(row: Cell[]): number {
     let last = 0;
     for (let i = 0; i < row.length; i++) {
-      if (row[i].char !== ' ') last = i + 1;
+      if (row[i].char !== ' ' || row[i].textSizing) last = i + 1;
     }
     return Math.max(1, last);
   }
@@ -926,6 +949,7 @@ export class AnsiParser {
           top: Math.min(this.rows - 1, Math.max(0, this.mainScreenScrollRegion.top)),
           bottom: Math.min(this.rows - 1, Math.max(0, this.mainScreenScrollRegion.bottom)),
         };
+    this.normalizeTextSizingRows(this.scrollback.concat(this.buffer));
     this.markFullBufferDirty();
     this.refreshKittyVirtualOrigins();
     this.markAllRowsDirty();
@@ -1213,7 +1237,7 @@ export class AnsiParser {
       maxPixels: MAX_IMAGE_PIXELS,
       transparentBackground: params[1] === 1,
     });
-    if (!decoded || !this.canRetainImageData(decoded.data) || !this.canRetainImagePlacement(decoded.width, decoded.height)) return;
+    if (!decoded || !this.canRetainImageData(decoded.data)) return;
 
     const placement = this.resolveImagePlacementCells(
       new Map(),
@@ -1272,6 +1296,9 @@ export class AnsiParser {
       case '52':
         this.handleOscClipboard(payload);
         return;
+      case '66':
+        this.handleOscTextSizing(payload);
+        return;
       case '104':
         this.resetOscPalette(payload);
         return;
@@ -1317,6 +1344,82 @@ export class AnsiParser {
       const pending = this.pendingITerm2File;
       this.pendingITerm2File = null;
       if (pending) this.completeITerm2File(pending.args, pending.chunks);
+    }
+  }
+
+  private handleOscTextSizing(payload: string) {
+    const separatorIndex = payload.indexOf(';');
+    if (separatorIndex < 0) return;
+
+    const rawMetadata = payload.slice(0, separatorIndex);
+    const text = payload.slice(separatorIndex + 1);
+    if (!text || OSC_TEXT_ENCODER.encode(text).length > MAX_OSC_TEXT_BYTES) return;
+
+    let scale = 1;
+    let width = 0;
+    let numerator = 0;
+    let denominator = 0;
+    let verticalAlign: 0 | 1 | 2 = 0;
+    let horizontalAlign: 0 | 1 | 2 = 0;
+    for (const item of rawMetadata.split(':')) {
+      if (!item) continue;
+      const match = /^([a-z])=(\d+)$/.exec(item);
+      if (!match) return;
+      const value = Number.parseInt(match[2], 10);
+      switch (match[1]) {
+        case 's':
+          if (value < 1 || value > 7) return;
+          scale = value;
+          break;
+        case 'w':
+          if (value < 0 || value > 7) return;
+          width = value;
+          break;
+        case 'n':
+          if (value < 0 || value > 15) return;
+          numerator = value;
+          break;
+        case 'd':
+          if (value < 0 || value > 15) return;
+          denominator = value;
+          break;
+        case 'v':
+          if (value < 0 || value > 2) return;
+          verticalAlign = value as 0 | 1 | 2;
+          break;
+        case 'h':
+          if (value < 0 || value > 2) return;
+          horizontalAlign = value as 0 | 1 | 2;
+          break;
+      }
+    }
+    if ((numerator !== 0 || denominator !== 0) && denominator <= numerator) return;
+
+    const options = {
+      scale,
+      numerator,
+      denominator,
+      verticalAlign,
+      horizontalAlign,
+    };
+    if (width > 0) {
+      this.putTextSizingBlock(text, width, options);
+      return;
+    }
+
+    for (const { segment } of OSC_TEXT_SEGMENTER.segment(text)) {
+      if (OSC_TEXT_ZERO_WIDTH_GRAPHEME.test(segment)) {
+        this.combineTextSizingMarkAt(this.cursorY, this.cursorX, segment);
+        continue;
+      }
+      const width = segment.includes('\ufe0e')
+        ? 1
+        : segment.includes('\ufe0f') ||
+            this.isWideChar(segment) ||
+            OSC_TEXT_EMOJI_PRESENTATION.test(segment)
+          ? 2
+          : 1;
+      this.putTextSizingBlock(segment, width, options);
     }
   }
 
@@ -1549,11 +1652,7 @@ export class AnsiParser {
       dimensions,
       args.get('preserveAspectRatio') !== '0',
     );
-    if (
-      !placementCells ||
-      !this.canRetainImageData(bytes) ||
-      !this.canRetainImagePlacement(dimensions.width, dimensions.height)
-    ) {
+    if (!placementCells || !this.canRetainImageData(bytes)) {
       return;
     }
 
@@ -1580,7 +1679,14 @@ export class AnsiParser {
     };
     const terminalImage: TerminalImage = mimeType === 'image/png'
       ? { ...common, kind: 'png', mimeType, data: bytes }
-      : { ...common, kind: 'encoded', mimeType, data: bytes, animated: dimensions.animated };
+      : {
+          ...common,
+          kind: 'encoded',
+          mimeType,
+          data: bytes,
+          animated: dimensions.animated,
+          decodedFramePixels: dimensions.decodedFramePixels,
+        };
 
     this.appendTerminalImage(terminalImage);
     if (args.get('doNotMoveCursor') !== '1') this.advanceCursorRows(placementCells.height);
@@ -1718,7 +1824,9 @@ export class AnsiParser {
     const dimensions = mimeType === 'image/png'
       ? this.parsePngDimensions(data)
       : this.parseJpegDimensions(data);
-    return dimensions ? { ...dimensions, animated: false } : null;
+    return dimensions
+      ? { ...dimensions, animated: false, decodedFramePixels: dimensions.width * dimensions.height }
+      : null;
   }
   private parseJpegDimensions(data: Uint8Array): { width: number; height: number } | null {
     if (data.length < 4 || data[0] !== 0xff || data[1] !== 0xd8) return null;
@@ -1781,7 +1889,14 @@ export class AnsiParser {
     while (offset < data.length) {
       const blockType = data[offset++];
       if (blockType === 0x3b) {
-        return frameCount > 0 ? { width, height, animated: frameCount > 1 } : null;
+        return frameCount > 0
+          ? {
+              width,
+              height,
+              animated: frameCount > 1,
+              decodedFramePixels: Math.max(width * height, decodedFramePixels),
+            }
+          : null;
       }
 
       if (blockType === 0x21) {
@@ -1846,7 +1961,9 @@ export class AnsiParser {
       const width = 1 + this.readLittleEndianUint24(data, 24);
       const height = 1 + this.readLittleEndianUint24(data, 27);
       const animated = (data[20] & 0x02) !== 0;
-      if (!animated) return { width, height, animated: false };
+      if (!animated) {
+        return { width, height, animated: false, decodedFramePixels: width * height };
+      }
 
       let offset = 12;
       let frameCount = 0;
@@ -1870,16 +1987,21 @@ export class AnsiParser {
         }
         offset = chunkEnd + (chunkLength & 1);
       }
-      return frameCount > 0 ? { width, height, animated: true } : null;
+      return frameCount > 0
+        ? {
+            width,
+            height,
+            animated: true,
+            decodedFramePixels: Math.max(width * height, decodedFramePixels),
+          }
+        : null;
     }
 
     if (chunkType === 'VP8L') {
       if (data[20] !== 0x2f) return null;
-      return {
-        width: 1 + data[21] + ((data[22] & 0x3f) << 8),
-        height: 1 + ((data[22] & 0xc0) >> 6) + (data[23] << 2) + ((data[24] & 0x0f) << 10),
-        animated: false,
-      };
+      const width = 1 + data[21] + ((data[22] & 0x3f) << 8);
+      const height = 1 + ((data[22] & 0xc0) >> 6) + (data[23] << 2) + ((data[24] & 0x0f) << 10);
+      return { width, height, animated: false, decodedFramePixels: width * height };
     }
 
     if (
@@ -1889,11 +2011,9 @@ export class AnsiParser {
       data[24] === 0x01 &&
       data[25] === 0x2a
     ) {
-      return {
-        width: (data[26] + (data[27] << 8)) & 0x3fff,
-        height: (data[28] + (data[29] << 8)) & 0x3fff,
-        animated: false,
-      };
+      const width = (data[26] + (data[27] << 8)) & 0x3fff;
+      const height = (data[28] + (data[29] << 8)) & 0x3fff;
+      return { width, height, animated: false, decodedFramePixels: width * height };
     }
 
     return null;
@@ -2309,8 +2429,7 @@ export class AnsiParser {
         this.kittyVirtualPlacements.has(key) || this.kittyRelativePlacements.has(key);
       if (
         !replacesDetachedPlacement &&
-        (this.kittyVirtualPlacements.size + this.kittyRelativePlacements.size >= MAX_KITTY_DETACHED_PLACEMENTS ||
-          !this.canRetainImagePlacement(imageData.pixelWidth, imageData.pixelHeight))
+        this.kittyVirtualPlacements.size + this.kittyRelativePlacements.size >= MAX_KITTY_DETACHED_PLACEMENTS
       ) {
         return { ok: false, error: 'ENOSPC:image placement limit exceeded' };
       }
@@ -2350,8 +2469,7 @@ export class AnsiParser {
         this.kittyVirtualPlacements.has(childKey) || this.kittyRelativePlacements.has(childKey);
       if (
         !replacesDetachedPlacement &&
-        (this.kittyVirtualPlacements.size + this.kittyRelativePlacements.size >= MAX_KITTY_DETACHED_PLACEMENTS ||
-          !this.canRetainImagePlacement(imageData.pixelWidth, imageData.pixelHeight))
+        this.kittyVirtualPlacements.size + this.kittyRelativePlacements.size >= MAX_KITTY_DETACHED_PLACEMENTS
       ) {
         return { ok: false, error: 'ENOSPC:image placement limit exceeded' };
       }
@@ -2392,10 +2510,6 @@ export class AnsiParser {
           placement.placementId === placementId,
       );
     }
-    if (!this.canRetainImagePlacement(imageData.pixelWidth, imageData.pixelHeight)) {
-      return { ok: false, error: 'ENOSPC:image placement limit exceeded' };
-    }
-
     const common = {
       id: this.nextImageId++,
       protocol: 'kitty' as const,
@@ -3399,29 +3513,6 @@ export class AnsiParser {
     return seen.has(data) || totalBytes + data.byteLength <= MAX_TOTAL_IMAGE_DATA_BYTES;
   }
 
-  private canRetainImagePlacement(pixelWidth: number, pixelHeight: number): boolean {
-    let totalPixels = 0;
-    for (const image of this.images) totalPixels += image.pixelWidth * image.pixelHeight;
-    for (const image of this.mainScreenImages) totalPixels += image.pixelWidth * image.pixelHeight;
-    for (const placement of this.kittyVirtualPlacements.values()) {
-      const data = this.kittyImageData.get(placement.imageId);
-      if (data) totalPixels += data.pixelWidth * data.pixelHeight;
-    }
-    for (const placement of this.kittyRelativePlacements.values()) {
-      const data = this.kittyImageData.get(placement.imageId);
-      if (data) totalPixels += data.pixelWidth * data.pixelHeight;
-    }
-    for (const placement of this.mainScreenKittyVirtualPlacements.values()) {
-      const data = this.kittyImageData.get(placement.imageId);
-      if (data) totalPixels += data.pixelWidth * data.pixelHeight;
-    }
-    for (const placement of this.mainScreenKittyRelativePlacements.values()) {
-      const data = this.kittyImageData.get(placement.imageId);
-      if (data) totalPixels += data.pixelWidth * data.pixelHeight;
-    }
-    return totalPixels + pixelWidth * pixelHeight <= MAX_TOTAL_IMAGE_PIXELS;
-  }
-
   private encodedImageLength(chunks: string[]): number | null {
     if (chunks.length === 0 || chunks.length > MAX_IMAGE_CHUNKS) return null;
 
@@ -3774,7 +3865,7 @@ export class AnsiParser {
       } else if (mode === 2004) {
         this.bracketedPasteMode = enabled;
       } else if (mode === 7) {
-        // Auto-wrap mode (DECAWM) — 항상 켜져있는 것으로 처리
+        this.autoWrapMode = enabled;
       } else if (mode === 2026) {
         this.synchronizedOutput = enabled;
       } else if (mode === 9 || mode === 1000 || mode === 1002 || mode === 1003) {
@@ -3851,6 +3942,7 @@ export class AnsiParser {
       this.scrollBottom = this.rows - 1;
     }
 
+    this.normalizeTextSizingRows(this.scrollback.concat(this.buffer));
     this.imageCachePrunePending = true;
     this.mainScreenBuffer = null;
     this.mainScreenScrollback = [];
@@ -3871,8 +3963,20 @@ export class AnsiParser {
     const row = this.buffer[this.cursorY];
     const amount = this.boundedCsiCount(count, this.cols - this.cursorX);
     if (amount === 0) return;
+    const targets = new Map<string, number>();
+    for (let col = this.cursorX; col < this.cols; col++) {
+      const sizing = row[col].textSizing;
+      if (!sizing) continue;
+      const originCol = col - sizing.col;
+      const rightCol = originCol + sizing.scale * sizing.width - 1;
+      if (sizing.scale > 1 || originCol < this.cursorX || rightCol >= this.cols - amount) {
+        targets.set(String(originCol), col);
+      }
+    }
+    for (const col of targets.values()) this.eraseTextSizingAt(this.cursorY, col);
     row.splice(this.cursorX, 0, ...Array.from({ length: amount }, () => this.createEmptyCell()));
     row.splice(this.cols);
+    this.markRowDirty(this.cursorY);
     this.kittyVirtualOriginsDirty = true;
   }
 
@@ -3880,28 +3984,52 @@ export class AnsiParser {
     const row = this.buffer[this.cursorY];
     const amount = this.boundedCsiCount(count, this.cols - this.cursorX);
     if (amount === 0) return;
-    row.splice(this.cursorX, amount);
-    while (row.length < this.cols) {
-      row.push(this.createEmptyCell());
+    const targets = new Map<string, number>();
+    for (let col = this.cursorX; col < this.cols; col++) {
+      const sizing = row[col].textSizing;
+      if (!sizing) continue;
+      const originCol = col - sizing.col;
+      if (sizing.scale > 1 || originCol < this.cursorX + amount) {
+        targets.set(String(originCol), col);
+      }
     }
+    for (const col of targets.values()) this.eraseTextSizingAt(this.cursorY, col);
+    row.splice(this.cursorX, amount);
+    while (row.length < this.cols) row.push(this.createEmptyCell());
+    this.markRowDirty(this.cursorY);
     this.kittyVirtualOriginsDirty = true;
   }
 
   private eraseChars(count: number) {
     const row = this.buffer[this.cursorY];
     const amount = this.boundedCsiCount(count, this.cols - this.cursorX);
-    for (let x = this.cursorX; x < this.cursorX + amount; x++) {
-      row[x] = this.createEmptyCell();
-    }
+    this.eraseTextSizingIntersecting(
+      this.cursorY,
+      this.cursorY,
+      this.cursorX,
+      this.cursorX + amount - 1,
+    );
+    for (let x = this.cursorX; x < this.cursorX + amount; x++) row[x] = this.createEmptyCell();
+    this.markRowDirty(this.cursorY);
     this.kittyVirtualOriginsDirty = true;
   }
 
   private insertLines(count: number) {
-    if (this.cursorY < this.scrollTop || this.cursorY > this.scrollBottom) {
-      return;
-    }
+    if (this.cursorY < this.scrollTop || this.cursorY > this.scrollBottom) return;
 
     const amount = Math.min(Math.max(1, count), this.scrollBottom - this.cursorY + 1);
+    const splitTargets: number[] = [];
+    for (let col = 0; col < this.cols; col++) {
+      const sizing = this.buffer[this.cursorY][col].textSizing;
+      if (sizing?.row && !splitTargets.includes(col - sizing.col)) splitTargets.push(col - sizing.col);
+    }
+    for (const col of splitTargets) this.eraseTextSizingAt(this.cursorY, col);
+    this.eraseTextSizingIntersecting(
+      this.scrollBottom - amount + 1,
+      this.scrollBottom,
+      0,
+      this.cols - 1,
+    );
     this.markFullBufferDirty();
     this.scrollImagesInRegion(this.cursorY, this.scrollBottom, amount);
     for (let i = 0; i < amount; i++) {
@@ -3912,11 +4040,16 @@ export class AnsiParser {
   }
 
   private deleteLines(count: number) {
-    if (this.cursorY < this.scrollTop || this.cursorY > this.scrollBottom) {
-      return;
-    }
+    if (this.cursorY < this.scrollTop || this.cursorY > this.scrollBottom) return;
 
     const amount = Math.min(Math.max(1, count), this.scrollBottom - this.cursorY + 1);
+    this.eraseTextSizingCrossingRowBoundary(this.scrollBottom + 1);
+    this.eraseTextSizingIntersecting(
+      this.cursorY,
+      this.cursorY + amount - 1,
+      0,
+      this.cols - 1,
+    );
     this.markFullBufferDirty();
     this.scrollImagesInRegion(this.cursorY, this.scrollBottom, -amount);
     for (let i = 0; i < amount; i++) {
@@ -3942,6 +4075,15 @@ export class AnsiParser {
 
   private scrollRegionUp(count: number, trackScrollback = false) {
     const amount = this.boundedCsiCount(count, this.scrollBottom - this.scrollTop + 1);
+    if (!trackScrollback) {
+      this.eraseTextSizingCrossingRowBoundary(this.scrollBottom + 1);
+      this.eraseTextSizingIntersecting(
+        this.scrollTop,
+        this.scrollTop + amount - 1,
+        0,
+        this.cols - 1,
+      );
+    }
 
     this.markFullBufferDirty();
     if (!trackScrollback) this.scrollImagesInRegion(this.scrollTop, this.scrollBottom, -amount);
@@ -3953,6 +4095,7 @@ export class AnsiParser {
       if (trackScrollback && removedLine && !this.usingAlternateScreen) {
         this.scrollback.push(removedLine);
         if (this.scrollback.length > this.maxScrollback) {
+          this.eraseTextSizingInAbsoluteRow(0);
           this.scrollback.shift();
           droppedScrollbackRows++;
         }
@@ -4113,6 +4256,13 @@ export class AnsiParser {
 
   private scrollRegionDown(count: number) {
     const amount = this.boundedCsiCount(count, this.scrollBottom - this.scrollTop + 1);
+    this.eraseTextSizingCrossingRowBoundary(this.scrollTop);
+    this.eraseTextSizingIntersecting(
+      this.scrollBottom - amount + 1,
+      this.scrollBottom,
+      0,
+      this.cols - 1,
+    );
 
     this.markFullBufferDirty();
     this.scrollImagesInRegion(this.scrollTop, this.scrollBottom, amount);
@@ -4257,6 +4407,297 @@ export class AnsiParser {
     return false;
   }
 
+  private normalizeTextSizingRows(rows: Cell[][]) {
+    const groups = new Map<string, Array<{ row: number; col: number }>>();
+    for (let row = 0; row < rows.length; row++) {
+      for (let col = 0; col < rows[row].length; col++) {
+        const sizing = rows[row][col].textSizing;
+        if (!sizing) continue;
+        const validCoordinates =
+          Number.isInteger(sizing.row) && Number.isInteger(sizing.col) &&
+          sizing.row >= 0 && sizing.col >= 0;
+        const key = validCoordinates
+          ? (row - sizing.row) + ':' + (col - sizing.col)
+          : 'invalid:' + row + ':' + col;
+        const positions = groups.get(key) ?? [];
+        positions.push({ row, col });
+        groups.set(key, positions);
+      }
+    }
+
+    for (const positions of groups.values()) {
+      const first = positions[0];
+      const sample = rows[first.row][first.col].textSizing!;
+      const originRow = first.row - sample.row;
+      const originCol = first.col - sample.col;
+      const blockWidth = sample.scale * sample.width;
+      const origin = rows[originRow]?.[originCol];
+      const root = origin?.textSizing;
+      const originTextBytes = origin && origin.char.length <= MAX_OSC_TEXT_BYTES
+        ? OSC_TEXT_ENCODER.encode(origin.char).length
+        : MAX_OSC_TEXT_BYTES + 1;
+      let valid =
+        Number.isInteger(sample.scale) && sample.scale >= 1 && sample.scale <= 7 &&
+        Number.isInteger(sample.width) && sample.width >= 1 && sample.width <= 7 &&
+        Number.isInteger(sample.numerator) && sample.numerator >= 0 && sample.numerator <= 15 &&
+        Number.isInteger(sample.denominator) && sample.denominator >= 0 && sample.denominator <= 15 &&
+        (sample.numerator === 0 && sample.denominator === 0 || sample.denominator > sample.numerator) &&
+        Number.isInteger(sample.verticalAlign) && sample.verticalAlign >= 0 && sample.verticalAlign <= 2 &&
+        Number.isInteger(sample.horizontalAlign) && sample.horizontalAlign >= 0 && sample.horizontalAlign <= 2 &&
+        blockWidth <= this.cols && sample.scale <= this.rows &&
+        originRow >= 0 && originCol >= 0 &&
+        positions.length === blockWidth * sample.scale &&
+        originTextBytes <= MAX_OSC_TEXT_BYTES &&
+        root?.row === 0 && root.col === 0 &&
+        (root.text?.length ?? MAX_OSC_TEXT_BYTES + 1) <= MAX_OSC_TEXT_BYTES &&
+        root.text === origin.char;
+
+      for (let row = 0; valid && row < sample.scale; row++) {
+        for (let col = 0; col < blockWidth; col++) {
+          const candidateCell = rows[originRow + row]?.[originCol + col];
+          const candidate = candidateCell?.textSizing;
+          if (
+            !candidate || candidate.row !== row || candidate.col !== col ||
+            candidate.scale !== sample.scale || candidate.width !== sample.width ||
+            candidate.numerator !== sample.numerator || candidate.denominator !== sample.denominator ||
+            candidate.verticalAlign !== sample.verticalAlign ||
+            candidate.horizontalAlign !== sample.horizontalAlign ||
+            (row === 0 && col === 0
+              ? candidateCell.char !== origin?.char || candidate.text !== origin.char
+              : candidateCell.char !== '' || candidate.text !== undefined)
+          ) {
+            valid = false;
+            break;
+          }
+        }
+      }
+      if (valid && origin) {
+        this.textSizingByteLengths.set(origin, originTextBytes);
+      } else {
+        for (const position of positions) {
+          rows[position.row][position.col] = this.createEmptyCell();
+        }
+      }
+    }
+  }
+
+  private eraseTextSizingIntersecting(
+    startRow: number,
+    endRow: number,
+    startCol: number,
+    endCol: number,
+  ) {
+    const targets = new Map<string, { row: number; col: number }>();
+    for (let row = Math.max(0, startRow); row <= Math.min(this.rows - 1, endRow); row++) {
+      for (let col = Math.max(0, startCol); col <= Math.min(this.cols - 1, endCol); col++) {
+        const sizing = this.buffer[row][col].textSizing;
+        if (!sizing) continue;
+        const key = (row - sizing.row) + ':' + (col - sizing.col);
+        if (!targets.has(key)) targets.set(key, { row, col });
+      }
+    }
+    for (const target of targets.values()) this.eraseTextSizingAt(target.row, target.col);
+  }
+
+  private eraseTextSizingCrossingRowBoundary(boundaryRow: number) {
+    if (boundaryRow <= 0 || boundaryRow >= this.rows) return;
+    const row = this.buffer[boundaryRow];
+    for (let col = 0; col < this.cols; col++) {
+      const sizing = row[col].textSizing;
+      if (sizing && sizing.row > 0) this.eraseTextSizingAt(boundaryRow, col);
+    }
+  }
+
+  private getAbsoluteRow(absoluteRow: number): Cell[] | undefined {
+    if (absoluteRow < 0) return undefined;
+    return absoluteRow < this.scrollback.length
+      ? this.scrollback[absoluteRow]
+      : this.buffer[absoluteRow - this.scrollback.length];
+  }
+
+  private eraseTextSizingInAbsoluteRow(absoluteRow: number) {
+    const row = this.getAbsoluteRow(absoluteRow);
+    if (!row) return;
+    for (let col = 0; col < row.length; col++) {
+      if (row[col].textSizing) this.eraseTextSizingAbsoluteAt(absoluteRow, col);
+    }
+  }
+
+  private eraseTextSizingAt(row: number, col: number) {
+    this.eraseTextSizingAbsoluteAt(this.scrollback.length + row, col);
+  }
+
+  private eraseTextSizingAbsoluteAt(absoluteRow: number, col: number) {
+    const sizing = this.getAbsoluteRow(absoluteRow)?.[col]?.textSizing;
+    if (!sizing) return;
+    const originRow = absoluteRow - sizing.row;
+    const originCol = col - sizing.col;
+    const blockWidth = sizing.scale * sizing.width;
+    for (let y = 0; y < sizing.scale; y++) {
+      const row = this.getAbsoluteRow(originRow + y);
+      for (let x = 0; x < blockWidth; x++) {
+        const candidate = row?.[originCol + x]?.textSizing;
+        if (
+          candidate && candidate.row === y && candidate.col === x &&
+          candidate.scale === sizing.scale && candidate.width === sizing.width
+        ) {
+          row![originCol + x] = this.createEmptyCell();
+          const bufferRow = originRow + y - this.scrollback.length;
+          if (bufferRow >= 0) this.markRowDirty(bufferRow);
+        }
+      }
+    }
+    this.markFullBufferDirty();
+  }
+
+  private eraseWideCharAt(row: number, col: number) {
+    const cells = this.buffer[row];
+    const cell = cells?.[col];
+    if (!cell) return;
+    if (cell.char === '' && col > 0 && this.isWideChar(cells[col - 1].char)) {
+      cells[col - 1] = this.createEmptyCell();
+    }
+    if (this.isWideChar(cell.char) && cells[col + 1]?.char === '') {
+      cells[col + 1] = this.createEmptyCell();
+    }
+  }
+
+  private combineTextSizingMarkAt(row: number, col: number, char: string): boolean {
+    if (!/^\p{Mark}+$/u.test(char)) return false;
+    const sizing = this.buffer[row]?.[col]?.textSizing;
+    if (!sizing) return false;
+    const originAbsoluteRow = this.scrollback.length + row - sizing.row;
+    const originCol = col - sizing.col;
+    const origin = originAbsoluteRow < this.scrollback.length
+      ? this.scrollback[originAbsoluteRow]?.[originCol]
+      : this.buffer[originAbsoluteRow - this.scrollback.length]?.[originCol];
+    if (origin?.textSizing) {
+      const currentBytes = this.textSizingByteLengths.get(origin) ??
+        (origin.char.length <= MAX_OSC_TEXT_BYTES
+          ? OSC_TEXT_ENCODER.encode(origin.char).length
+          : MAX_OSC_TEXT_BYTES + 1);
+      this.textSizingByteLengths.set(origin, currentBytes);
+      const combinedBytes = currentBytes + OSC_TEXT_ENCODER.encode(char).length;
+      if (combinedBytes <= MAX_OSC_TEXT_BYTES) {
+        origin.char += char;
+        origin.textSizing.text = origin.char;
+        this.textSizingByteLengths.set(origin, combinedBytes);
+        const bufferOriginRow = originAbsoluteRow - this.scrollback.length;
+        if (bufferOriginRow >= 0) this.markRowDirty(bufferOriginRow);
+      }
+    }
+    return true;
+  }
+
+  private prepareTextSizingWrite(
+    char: string,
+    cellWidth: number,
+    blockHeight = 1,
+    combineMark = true,
+  ): boolean {
+    const partialScrollRegion = this.scrollTop !== 0 || this.scrollBottom !== this.rows - 1;
+    while (true) {
+      if (this.cursorX >= this.cols || this.cursorX + cellWidth > this.cols) {
+        if (!this.autoWrapMode) {
+          this.cursorX = Math.max(0, this.cols - cellWidth);
+        } else {
+          const nextCursorY = this.cursorY === this.scrollBottom
+            ? this.cursorY
+            : Math.min(this.rows - 1, this.cursorY + 1);
+          if (partialScrollRegion && nextCursorY + blockHeight > this.rows) return false;
+          this.cursorX = 0;
+          this.lineFeed();
+        }
+      }
+      if (partialScrollRegion && this.cursorY + blockHeight > this.rows) return false;
+      let skippedTo = this.cursorX;
+      const intersecting: Array<{ row: number; col: number }> = [];
+      for (let x = this.cursorX; x < Math.min(this.cols, this.cursorX + cellWidth); x++) {
+        const sizing = this.buffer[this.cursorY][x].textSizing;
+        if (!sizing) continue;
+        if (combineMark && this.combineTextSizingMarkAt(this.cursorY, x, char)) return false;
+        if (sizing.row > 0) {
+          const blockEnd = x - sizing.col + sizing.scale * sizing.width;
+          if (!this.autoWrapMode && blockEnd >= this.cols) {
+            intersecting.push({ row: this.cursorY, col: x });
+          } else {
+            skippedTo = Math.max(skippedTo, blockEnd);
+          }
+        } else {
+          intersecting.push({ row: this.cursorY, col: x });
+        }
+      }
+      if (skippedTo > this.cursorX) {
+        this.cursorX = skippedTo;
+        continue;
+      }
+      for (const position of intersecting) {
+        this.eraseTextSizingAt(position.row, position.col);
+      }
+      return true;
+    }
+  }
+
+  private putTextSizingBlock(
+    text: string,
+    width: number,
+    options: {
+      scale: number;
+      numerator: number;
+      denominator: number;
+      verticalAlign: 0 | 1 | 2;
+      horizontalAlign: 0 | 1 | 2;
+    },
+  ) {
+    const blockWidth = options.scale * width;
+    if (blockWidth > this.cols || options.scale > this.rows) return;
+    if (!this.prepareTextSizingWrite(text, blockWidth, options.scale)) return;
+
+    const overflow = this.cursorY + options.scale - this.rows;
+    if (overflow > 0) {
+      if (this.scrollTop !== 0 || this.scrollBottom !== this.rows - 1) return;
+      this.scrollRegionUp(overflow, !this.usingAlternateScreen);
+      this.cursorY -= overflow;
+    }
+
+    for (let y = this.cursorY; y < this.cursorY + options.scale; y++) {
+      for (let x = this.cursorX; x < this.cursorX + blockWidth; x++) {
+        if (this.buffer[y][x].imagePlaceholder) this.kittyVirtualOriginsDirty = true;
+        this.eraseTextSizingAt(y, x);
+        this.eraseWideCharAt(y, x);
+      }
+    }
+
+    const style = this.getInternedStyle(this.style);
+    const originX = this.cursorX;
+    for (let row = 0; row < options.scale; row++) {
+      for (let col = 0; col < blockWidth; col++) {
+        const cell: Cell = {
+          char: row === 0 && col === 0 ? text : '',
+          hyperlink: this.activeHyperlink ?? undefined,
+          style,
+          textSizing: {
+            ...(row === 0 && col === 0 ? { text } : {}),
+            scale: options.scale,
+            width,
+            numerator: options.numerator,
+            denominator: options.denominator,
+            verticalAlign: options.verticalAlign,
+            horizontalAlign: options.horizontalAlign,
+            row,
+            col,
+          },
+        };
+        this.buffer[this.cursorY + row][originX + col] = cell;
+        if (row === 0 && col === 0) {
+          this.textSizingByteLengths.set(cell, OSC_TEXT_ENCODER.encode(text).length);
+        }
+      }
+      this.markRowDirty(this.cursorY + row);
+    }
+    this.cursorX += blockWidth;
+  }
+
   private putChar(char: string) {
     const diacriticIndex = kittyDiacriticIndex(char);
     if (diacriticIndex !== null && this.cursorX > 0) {
@@ -4301,9 +4742,14 @@ export class AnsiParser {
 
     const isWide = this.isWideChar(char);
     if (this.cursorX >= this.cols || (isWide && this.cursorX >= this.cols - 1)) {
-      this.cursorX = 0;
-      this.lineFeed();
+      if (this.autoWrapMode) {
+        this.cursorX = 0;
+        this.lineFeed();
+      } else {
+        this.cursorX = Math.max(0, this.cols - (isWide ? 2 : 1));
+      }
     }
+    if (!this.prepareTextSizingWrite(char, isWide ? 2 : 1)) return;
 
     const cell: Cell = {
       char,
@@ -4402,21 +4848,23 @@ export class AnsiParser {
   private eraseInDisplay(mode: number) {
     this.markFullBufferDirty();
     if (mode === 0) {
-      // Erase from cursor to end
+      this.eraseTextSizingIntersecting(this.cursorY, this.cursorY, this.cursorX, this.cols - 1);
+      this.eraseTextSizingIntersecting(this.cursorY + 1, this.rows - 1, 0, this.cols - 1);
       this.eraseInLine(0);
       for (let y = this.cursorY + 1; y < this.rows; y++) {
         this.buffer[y] = this.createEmptyRow();
         this.markRowDirty(y);
       }
     } else if (mode === 1) {
-      // Erase from start to cursor
+      this.eraseTextSizingIntersecting(0, this.cursorY - 1, 0, this.cols - 1);
+      this.eraseTextSizingIntersecting(this.cursorY, this.cursorY, 0, this.cursorX);
       for (let y = 0; y < this.cursorY; y++) {
         this.buffer[y] = this.createEmptyRow();
         this.markRowDirty(y);
       }
       this.eraseInLine(1);
     } else if (mode === 2) {
-      // Erase entire visible display only. Scrollback is preserved for CSI 2 J.
+      this.eraseTextSizingIntersecting(0, this.rows - 1, 0, this.cols - 1);
       this.buffer = this.createBuffer();
       this.imageCachePrunePending = true;
       this.images = [];
@@ -4426,7 +4874,6 @@ export class AnsiParser {
       this.pendingITerm2File = null;
       this.markAllRowsDirty();
     } else if (mode === 3) {
-      // Erase display + scrollback (xterm 확장)
       this.scrollback = [];
       this.buffer = this.createBuffer();
       this.imageCachePrunePending = true;
@@ -4442,17 +4889,13 @@ export class AnsiParser {
   private eraseInLine(mode: number) {
     const row = this.buffer[this.cursorY];
     if (mode === 0) {
-      // Erase from cursor to end
-      for (let x = this.cursorX; x < this.cols; x++) {
-        row[x] = this.createEmptyCell();
-      }
+      this.eraseTextSizingIntersecting(this.cursorY, this.cursorY, this.cursorX, this.cols - 1);
+      for (let x = this.cursorX; x < this.cols; x++) row[x] = this.createEmptyCell();
     } else if (mode === 1) {
-      // Erase from start to cursor
-      for (let x = 0; x <= this.cursorX; x++) {
-        row[x] = this.createEmptyCell();
-      }
+      this.eraseTextSizingIntersecting(this.cursorY, this.cursorY, 0, this.cursorX);
+      for (let x = 0; x <= this.cursorX; x++) row[x] = this.createEmptyCell();
     } else if (mode === 2) {
-      // Erase entire line
+      this.eraseTextSizingIntersecting(this.cursorY, this.cursorY, 0, this.cols - 1);
       this.markFullBufferDirty();
       this.buffer[this.cursorY] = this.createEmptyRow();
     }
@@ -4816,6 +5259,7 @@ export class AnsiParser {
       cursorX: this.cursorX,
       cursorY: this.cursorY,
       applicationCursorKeys: this.applicationCursorKeys,
+      autoWrapMode: this.autoWrapMode,
       bracketedPasteMode: this.bracketedPasteMode,
       mouseMode: this.mouseMode,
       sgrMouseEncoding: this.sgrMouseEncoding,
@@ -5194,6 +5638,7 @@ export class AnsiParser {
     this.cursorX = Math.min(this.cols - 1, Math.max(0, snapshot.cursorX));
     this.cursorY = restoredState.cursorY;
     this.applicationCursorKeys = snapshot.applicationCursorKeys;
+    this.autoWrapMode = snapshot.autoWrapMode ?? true;
     this.bracketedPasteMode = snapshot.bracketedPasteMode ?? false;
     this.mouseMode =
       snapshot.mouseMode === 9 ||
@@ -5236,6 +5681,10 @@ export class AnsiParser {
     );
     this.mainScreenBuffer = snapshot.mainScreenBufferRows ? restoredMainScreenState.buffer : null;
     this.mainScreenScrollback = restoredMainScreenState.scrollback;
+    this.normalizeTextSizingRows(this.scrollback.concat(this.buffer));
+    if (this.mainScreenBuffer) {
+      this.normalizeTextSizingRows(this.mainScreenScrollback.concat(this.mainScreenBuffer));
+    }
     this.mainScreenCursor = snapshot.mainScreenCursor
       ? {
           x: Math.min(this.cols - 1, Math.max(0, snapshot.mainScreenCursor.x)),
@@ -5320,6 +5769,7 @@ export class AnsiParser {
         style: this.getInternedStyle(source.style),
         hyperlink: source.hyperlink ? { ...source.hyperlink } : undefined,
         imagePlaceholder: source.imagePlaceholder ? { ...source.imagePlaceholder } : undefined,
+        textSizing: source.textSizing ? { ...source.textSizing } : undefined,
       };
     }
 
