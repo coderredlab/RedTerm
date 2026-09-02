@@ -180,12 +180,10 @@
       window.alert(`Please wait for "${document.name}" to finish saving before closing it.`);
       return;
     }
-    if (
-      document.dirty &&
-      !window.confirm(`Discard unsaved changes to "${document.name}"?`)
-    ) {
-      return;
-    }
+    const confirmed = document.dirty
+      ? window.confirm(`Discard unsaved changes to "${document.name}"?`)
+      : window.confirm(`Close "${document.name}"?`);
+    if (!confirmed) return;
     void tabsStore.closeDocument(tabId, document.id);
   }
 </script>

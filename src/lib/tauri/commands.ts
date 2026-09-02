@@ -140,6 +140,14 @@ export async function getRuntimeInstanceId(): Promise<string> {
   return invoke<string>("get_runtime_instance_id");
 }
 
+export async function exitApplication(): Promise<void> {
+  return invoke<void>("exit_application");
+}
+
+export async function listenAppExitRequested(callback: () => void): Promise<UnlistenFn> {
+  return listen("app-exit-requested", callback);
+}
+
 export interface KeyboardLayoutEntry {
   unshifted: string;
   shifted: string | null;

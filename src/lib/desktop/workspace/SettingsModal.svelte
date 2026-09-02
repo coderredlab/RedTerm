@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { THEMES } from "$lib/styles/themes";
+  import { isLightTheme, THEMES } from "$lib/styles/themes";
   import { settingsStore } from "$lib/stores/settings.svelte";
   import { modalFocus } from "./modal-focus";
 
@@ -32,25 +32,9 @@
 
   type ThemeGroup = "dark" | "light";
 
-  function linearChannel(channel: number): number {
-    const normalized = channel / 255;
-    return normalized <= 0.04045
-      ? normalized / 12.92
-      : ((normalized + 0.055) / 1.055) ** 2.4;
-  }
-
-  function isLightTheme(background: string): boolean {
-    const value = Number.parseInt(background.slice(1), 16);
-    const luminance =
-      0.2126 * linearChannel((value >> 16) & 0xff) +
-      0.7152 * linearChannel((value >> 8) & 0xff) +
-      0.0722 * linearChannel(value & 0xff);
-    return luminance > 0.5;
-  }
-
   const THEME_GROUPS = {
-    dark: THEMES.filter((theme) => !isLightTheme(theme.colors.terminalBg)),
-    light: THEMES.filter((theme) => isLightTheme(theme.colors.terminalBg)),
+    dark: THEMES.filter((theme) => !isLightTheme(theme)),
+    light: THEMES.filter(isLightTheme),
   } satisfies Record<ThemeGroup, typeof THEMES>;
 
   function groupForTheme(themeId: string): ThemeGroup {

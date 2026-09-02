@@ -216,6 +216,7 @@
   }
 
   async function handleCloseTab(tabId: string) {
+    if (!window.confirm("Close this tab?")) return;
     const terminal = terminalRefs[tabId];
     const tab = tabsStore.getTab(tabId);
     if (terminal?.disconnect) {

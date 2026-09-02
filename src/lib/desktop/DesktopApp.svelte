@@ -5,6 +5,8 @@
   import { tabsStore, type Pane, type PaneNode } from "$lib/stores/tabs.svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
   import {
+    exitApplication,
+    listenAppExitRequested,
     localShellDisconnect,
     sshDisconnect,
     type SavedConnection,
@@ -123,19 +125,34 @@
     void retryPendingManagedKeyCleanup();
 
     let disposed = false;
+    let unlistenAppExitRequested: (() => void) | undefined;
     let unlistenCloseRequested: (() => void) | undefined;
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-      if (windowCloseConfirmed || (!hasDirtyDocuments() && !hasSavingDocuments())) return;
+      if (windowCloseConfirmed) return;
       event.preventDefault();
       event.returnValue = "";
     };
     window.addEventListener("beforeunload", handleBeforeUnload);
 
     if ("__TAURI_INTERNALS__" in window) {
+      void listenAppExitRequested(() => {
+        if (windowCloseConfirmed || !confirmCloseApplication()) return;
+        windowCloseConfirmed = true;
+        void exitApplication().catch((error) => {
+          windowCloseConfirmed = false;
+          console.error("Application exit error:", error);
+        });
+      })
+        .then((unlisten) => {
+          if (disposed) unlisten();
+          else unlistenAppExitRequested = unlisten;
+        })
+        .catch((error) => console.error("Application exit listener error:", error));
+
       void getCurrentWindow()
         .onCloseRequested((event) => {
-          if (windowCloseConfirmed || (!hasDirtyDocuments() && !hasSavingDocuments())) return;
-          if (confirmDiscardAllDocuments()) {
+          if (windowCloseConfirmed) return;
+          if (confirmCloseApplication()) {
             windowCloseConfirmed = true;
           } else {
             event.preventDefault();
@@ -150,6 +167,7 @@
 
     return () => {
       disposed = true;
+      unlistenAppExitRequested?.();
       unlistenCloseRequested?.();
       window.removeEventListener("beforeunload", handleBeforeUnload);
     };
@@ -283,18 +301,7 @@
     settingsOpen = true;
   }
 
-  function hasDirtyDocuments(): boolean {
-    return tabsStore.tabs.some((tab) =>
-      tab.documents.some((document) => document.dirty)
-    );
-  }
-
-  function hasSavingDocuments(): boolean {
-    return tabsStore.tabs.some((tab) =>
-      tab.documents.some((document) => document.saveState === "saving")
-    );
-  }
-  function confirmDiscardAllDocuments(): boolean {
+  function confirmCloseApplication(): boolean {
     const savingDocuments = tabsStore.tabs.flatMap((tab) =>
       tab.documents.filter((document) => document.saveState === "saving")
     );
@@ -309,7 +316,7 @@
     const dirtyDocuments = tabsStore.tabs.flatMap((tab) =>
       tab.documents.filter((document) => document.dirty)
     );
-    if (dirtyDocuments.length === 0) return true;
+    if (dirtyDocuments.length === 0) return window.confirm("Close RedTerm?");
     const label =
       dirtyDocuments.length === 1
         ? `"${dirtyDocuments[0]!.name}"`
@@ -319,7 +326,7 @@
     );
   }
 
-  function confirmDiscardDocuments(tabId: string, sourcePaneId?: string): boolean {
+  function confirmCloseDocuments(tabId: string, sourcePaneId?: string): boolean {
     const documents = (tabsStore.getTab(tabId)?.documents ?? []).filter(
       (document) =>
         sourcePaneId === undefined || document.sourcePaneId === sourcePaneId
@@ -336,7 +343,9 @@
       return false;
     }
     const dirtyDocuments = documents.filter((document) => document.dirty);
-    if (dirtyDocuments.length === 0) return true;
+    if (dirtyDocuments.length === 0) {
+      return window.confirm(sourcePaneId === undefined ? "Close this tab?" : "Close this pane?");
+    }
     const label =
       dirtyDocuments.length === 1
         ? `"${dirtyDocuments[0]!.name}"`
@@ -345,7 +354,7 @@
   }
   async function closeTabById(tabId: string) {
     const tab = tabsStore.getTab(tabId);
-    if (!tab || tabIsClosing(tabId) || !confirmDiscardDocuments(tabId)) return;
+    if (!tab || tabIsClosing(tabId) || !confirmCloseDocuments(tabId)) return;
     const paneIds = tab.panes.map((pane) => pane.id);
     closingTabIds.add(tabId);
     for (const paneId of paneIds) closingPaneIds.add(paneId);
@@ -603,7 +612,7 @@
       void closeTabById(tabId);
     },
     closePane(_tabId, paneId) {
-      if (paneIsClosing(_tabId, paneId) || !confirmDiscardDocuments(_tabId, paneId)) return;
+      if (paneIsClosing(_tabId, paneId) || !confirmCloseDocuments(_tabId, paneId)) return;
       closingPaneIds.add(paneId);
       void (async () => {
         try {

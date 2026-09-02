@@ -1,14 +1,17 @@
 <script lang="ts">
   import { convertFileSrc } from "@tauri-apps/api/core";
-  import { LanguageDescription } from "@codemirror/language";
+  import { HighlightStyle, LanguageDescription, syntaxHighlighting } from "@codemirror/language";
   import { languages } from "@codemirror/language-data";
-  import { EditorState } from "@codemirror/state";
+  import { Compartment, EditorState } from "@codemirror/state";
   import { EditorView, keymap } from "@codemirror/view";
+  import { tags } from "@lezer/highlight";
   import { basicSetup } from "codemirror";
   import DOMPurify from "dompurify";
   import { marked } from "marked";
   import { onDestroy, untrack } from "svelte";
+  import { settingsStore } from "$lib/stores/settings.svelte";
   import { tabsStore, type PaneDocument } from "$lib/stores/tabs.svelte";
+  import { getThemeById, isLightTheme, THEMES } from "$lib/styles/themes";
   import {
     MAX_SFTP_DOWNLOAD_BYTES,
     MAX_SFTP_READ_BYTES,
@@ -47,6 +50,8 @@
   let mediaUrl = $state("");
   let editorHost: HTMLDivElement | null = $state(null);
   let editorView: EditorView | null = null;
+  const editorThemeCompartment = new Compartment();
+  let appliedEditorDarkTheme: boolean | null = null;
   let mode = $state<"edit" | "preview">("edit");
   let downloading = $state(false);
   let downloadedHint = $state(false);
@@ -62,6 +67,9 @@
     () => previewKindOf(document.name) as FilePreviewKind
   );
   const editable = fileKind === "code" || fileKind === "text" || fileKind === "markdown";
+  const editorUsesDarkTheme = $derived(
+    !isLightTheme(getThemeById(settingsStore.theme) ?? THEMES[0]!)
+  );
   const needsExplicitDownload =
     fileKind === "audio" ||
     fileKind === "video" ||
@@ -343,6 +351,83 @@
     }
   }
 
+  interface EditorHighlightPalette {
+    muted: string;
+    link: string;
+    heading: string;
+    keyword: string;
+    constant: string;
+    number: string;
+    string: string;
+    variable: string;
+    definition: string;
+    type: string;
+    operator: string;
+    invalid: string;
+  }
+
+  function createEditorHighlightStyle(
+    palette: EditorHighlightPalette,
+    themeType: "dark" | "light"
+  ): HighlightStyle {
+    return HighlightStyle.define([
+      { tag: tags.meta, color: palette.muted },
+      { tag: [tags.link, tags.url], color: palette.link, textDecoration: "underline" },
+      { tag: tags.heading, color: palette.heading, fontWeight: "bold" },
+      { tag: tags.emphasis, fontStyle: "italic" },
+      { tag: tags.strong, fontWeight: "bold" },
+      { tag: tags.strikethrough, textDecoration: "line-through" },
+      { tag: tags.quote, color: palette.string },
+      { tag: tags.monospace, color: palette.number },
+      { tag: [tags.keyword, tags.modifier, tags.operatorKeyword], color: palette.keyword },
+      { tag: [tags.atom, tags.bool, tags.null, tags.unit, tags.labelName], color: palette.constant },
+      { tag: tags.number, color: palette.number },
+      { tag: [tags.literal, tags.string, tags.docString, tags.character, tags.attributeValue, tags.inserted], color: palette.string },
+      { tag: [tags.regexp, tags.escape, tags.special(tags.string), tags.deleted], color: palette.constant },
+      { tag: tags.name, color: palette.variable },
+      { tag: [tags.definition(tags.variableName), tags.function(tags.variableName)], color: palette.definition },
+      { tag: [tags.special(tags.variableName), tags.constant(tags.variableName), tags.macroName], color: palette.keyword },
+      { tag: [tags.propertyName, tags.attributeName], color: palette.definition },
+      { tag: [tags.definition(tags.propertyName), tags.function(tags.propertyName)], color: palette.link },
+      { tag: [tags.typeName, tags.className, tags.namespace, tags.tagName], color: palette.type },
+      { tag: tags.changed, color: palette.number },
+      { tag: tags.operator, color: palette.operator },
+      { tag: tags.punctuation, color: palette.operator },
+      { tag: tags.comment, color: palette.muted, fontStyle: "italic" },
+      { tag: tags.invalid, color: palette.invalid, textDecoration: "underline" },
+    ], { themeType });
+  }
+
+  const darkEditorHighlightStyle = createEditorHighlightStyle({
+    muted: "#a89ca4",
+    link: "#82b1ff",
+    heading: "#ffcb6b",
+    keyword: "#c792ea",
+    constant: "#f78c6c",
+    number: "#f2c078",
+    string: "#b7d58a",
+    variable: "#d4c2e8",
+    definition: "#82b1ff",
+    type: "#ffcb6b",
+    operator: "#89ddff",
+    invalid: "#ff7187",
+  }, "dark");
+
+  const lightEditorHighlightStyle = createEditorHighlightStyle({
+    muted: "#50555a",
+    link: "#005f9e",
+    heading: "#6f4f00",
+    keyword: "#6b21a8",
+    constant: "#9a3412",
+    number: "#8a4b08",
+    string: "#225d16",
+    variable: "#374151",
+    definition: "#005f9e",
+    type: "#6f4f00",
+    operator: "#005966",
+    invalid: "#b00020",
+  }, "light");
+
   const editorTheme = EditorView.theme({
     "&": {
       height: "100%",
@@ -368,9 +453,15 @@
     ".cm-cursor": { borderLeftColor: "var(--text-primary)" },
   });
 
+  function editorThemeType(dark: boolean) {
+    return EditorView.theme({}, { dark });
+  }
+
   async function mountEditor(host: HTMLDivElement, content: string, token: number) {
     const language = await LanguageDescription.matchFilename(languages, document.name)?.load();
     if (token !== editorToken || editorHost !== host) return;
+    const darkTheme = untrack(() => editorUsesDarkTheme);
+    appliedEditorDarkTheme = darkTheme;
     editorView = new EditorView({
       doc: content,
       parent: host,
@@ -378,6 +469,9 @@
         basicSetup,
         EditorState.lineSeparator.of(lineSeparatorOf(content)),
         editorTheme,
+        editorThemeCompartment.of(editorThemeType(darkTheme)),
+        syntaxHighlighting(darkEditorHighlightStyle),
+        syntaxHighlighting(lightEditorHighlightStyle),
         keymap.of([
           {
             key: "Mod-s",
@@ -411,7 +505,17 @@
       editorToken += 1;
       editorView?.destroy();
       editorView = null;
+      appliedEditorDarkTheme = null;
     };
+  });
+
+  $effect(() => {
+    const darkTheme = editorUsesDarkTheme;
+    if (!editorView || appliedEditorDarkTheme === darkTheme) return;
+    appliedEditorDarkTheme = darkTheme;
+    editorView.dispatch({
+      effects: editorThemeCompartment.reconfigure(editorThemeType(darkTheme)),
+    });
   });
 
   $effect(() => {

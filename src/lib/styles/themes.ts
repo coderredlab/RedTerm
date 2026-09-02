@@ -26,6 +26,22 @@ export interface ThemeDefinition {
   colors: ThemeColors;
 }
 
+function linearChannel(channel: number): number {
+  const normalized = channel / 255;
+  return normalized <= 0.04045
+    ? normalized / 12.92
+    : ((normalized + 0.055) / 1.055) ** 2.4;
+}
+
+export function isLightTheme(theme: ThemeDefinition): boolean {
+  const value = Number.parseInt(theme.colors.terminalBg.slice(1), 16);
+  const luminance =
+    0.2126 * linearChannel((value >> 16) & 0xff) +
+    0.7152 * linearChannel((value >> 8) & 0xff) +
+    0.0722 * linearChannel(value & 0xff);
+  return luminance > 0.5;
+}
+
 export const THEMES: ThemeDefinition[] = [
   {
     id: "coder-red",
