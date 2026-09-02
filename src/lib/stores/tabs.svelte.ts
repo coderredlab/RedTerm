@@ -64,6 +64,37 @@ function documentTargetMatchesPane(
   );
 }
 
+function documentsShareTargetPath(
+  left: PaneDocument,
+  right: PaneDocument
+): boolean {
+  return (
+    left.path === right.path &&
+    left.sourceKind === right.sourceKind &&
+    (left.sourceKind === "local" ||
+      (left.sourceHost === right.sourceHost &&
+        left.sourcePort === right.sourcePort &&
+        left.sourceUsername === right.sourceUsername))
+  );
+}
+
+function copyAvailableDocumentState(
+  target: PaneDocument,
+  source: PaneDocument
+): void {
+  if (target.cachedLocalPath === null && source.cachedLocalPath !== null) {
+    target.cachedLocalPath = source.cachedLocalPath;
+  }
+  if (target.content === null && source.content !== null) {
+    target.content = source.content;
+    target.savedContent = source.savedContent;
+    target.dirty = source.dirty;
+    target.saveState = source.saveState;
+    target.saveError = source.saveError;
+    target.hasUtf8Bom = source.hasUtf8Bom;
+  }
+}
+
 export type PaneItem =
   | { kind: "terminal"; id: string }
   | { kind: "document"; id: string };
@@ -956,6 +987,24 @@ function createTabsStore() {
         ?.documents.find((document) => document.id === documentId);
     },
 
+    getCachedDocumentPath(
+      tabId: string,
+      sourcePaneId: string,
+      path: string
+    ): string | null {
+      const tab = tabs.find((candidate) => candidate.id === tabId);
+      const source = tab?.panes.find((pane) => pane.id === sourcePaneId);
+      if (!tab || !source) return null;
+      return (
+        tab.documents.find(
+          (document) =>
+            document.path === path &&
+            document.cachedLocalPath !== null &&
+            documentTargetMatchesPane(document, source)
+        )?.cachedLocalPath ?? null
+      );
+    },
+
     async openDocument(
       tabId: string,
       sourcePaneId: string,
@@ -966,7 +1015,6 @@ function createTabsStore() {
       if (!tab || !source) return null;
       const existing = tab.documents.find(
         (document) =>
-          document.sourcePaneId === sourcePaneId &&
           document.path === entry.path &&
           documentTargetMatchesPane(document, source)
       );
@@ -989,21 +1037,45 @@ function createTabsStore() {
         cachedLocalPath: null,
         hasUtf8Bom: false,
       };
+      const existingOwner = existing
+        ? tab.panes.find((pane) => pane.id === existing.sourcePaneId)
+        : null;
+      const retargetExisting = Boolean(
+        existing && source.sessionId && !existingOwner?.sessionId
+      );
+      const targetPaneId = retargetExisting
+        ? sourcePaneId
+        : existing?.sourcePaneId ?? sourcePaneId;
       let documentId: string | null = null;
 
       await withPreservedLayout([tabId], () => {
         const target = tabs.find((candidate) => candidate.id === tabId);
         if (!target) return;
-        if (!existing) target.documents = [...target.documents, document];
-        target.layout = replaceLeaf(target.layout, sourcePaneId, (leafNode) =>
+        if (!existing) {
+          target.documents = [...target.documents, document];
+        } else if (retargetExisting) {
+          const targetDocument = target.documents.find(
+            (candidate) => candidate.id === existing.id
+          );
+          if (!targetDocument) return;
+          target.layout = removeDocumentsFromLayout(
+            target.layout,
+            new Set([targetDocument.id])
+          );
+          targetDocument.sourcePaneId = sourcePaneId;
+          targetDocument.sourceSessionId = source.sessionId;
+        }
+        target.layout = replaceLeaf(target.layout, targetPaneId, (leafNode) =>
           leaf(
-            sourcePaneId,
+            targetPaneId,
             leafPaneIds(leafNode),
-            [...leafNode.documentIds, document.id],
+            leafNode.documentIds.includes(document.id)
+              ? leafNode.documentIds
+              : [...leafNode.documentIds, document.id],
             { kind: "document", id: document.id }
           )
         );
-        target.activePaneId = sourcePaneId;
+        target.activePaneId = targetPaneId;
         syncTabFromPanes(target);
         documentId = document.id;
       });
@@ -1425,7 +1497,10 @@ function createTabsStore() {
       dir: "row" | "col",
       side: "before" | "after"
     ) {
-      if (sourceTabId === targetTabId) return;
+      const result: { status: "merged" | "conflict" | "noop"; path?: string } = {
+        status: "noop",
+      };
+      if (sourceTabId === targetTabId) return result;
       await withPreservedLayout([sourceTabId, targetTabId], () => {
         const source = tabs.find(
           (candidate) => candidate.id === sourceTabId
@@ -1435,16 +1510,69 @@ function createTabsStore() {
         );
         if (!source || !destination) return;
 
+        const sourceDocuments = source.documents.map((document) => ({ ...document }));
+        const destinationDocuments = destination.documents.map((document) => ({ ...document }));
+        const removedSourceDocumentIds = new Set<string>();
+        const removedDestinationDocumentIds = new Set<string>();
+
+        for (const sourceDocument of sourceDocuments) {
+          const destinationDocument = destinationDocuments.find((candidate) =>
+            documentsShareTargetPath(candidate, sourceDocument)
+          );
+          if (!destinationDocument) continue;
+          if (
+            sourceDocument.dirty &&
+            destinationDocument.dirty &&
+            sourceDocument.content !== destinationDocument.content
+          ) {
+            result.status = "conflict";
+            result.path = sourceDocument.path;
+            return;
+          }
+
+          const keepSource =
+            (sourceDocument.dirty && !destinationDocument.dirty) ||
+            (sourceDocument.dirty === destinationDocument.dirty &&
+              Boolean(sourceDocument.sourceSessionId) &&
+              !destinationDocument.sourceSessionId) ||
+            (!sourceDocument.dirty &&
+              !destinationDocument.dirty &&
+              sourceDocument.content !== null &&
+              destinationDocument.content === null);
+          if (keepSource) {
+            copyAvailableDocumentState(sourceDocument, destinationDocument);
+            removedDestinationDocumentIds.add(destinationDocument.id);
+          } else {
+            copyAvailableDocumentState(destinationDocument, sourceDocument);
+            removedSourceDocumentIds.add(sourceDocument.id);
+          }
+        }
+
+        const sourceLayout = removeDocumentsFromLayout(
+          source.layout,
+          removedSourceDocumentIds
+        );
+        const destinationLayout = removeDocumentsFromLayout(
+          destination.layout,
+          removedDestinationDocumentIds
+        );
         const movedPanes = source.panes.map((pane) => ({
           ...pane,
           tabId: targetTabId,
         }));
         const mergedLayout = makeSplit(dir, 0.5, [
-          side === "before" ? source.layout : destination.layout,
-          side === "before" ? destination.layout : source.layout,
+          side === "before" ? sourceLayout : destinationLayout,
+          side === "before" ? destinationLayout : sourceLayout,
         ]);
         destination.panes = [...destination.panes, ...movedPanes];
-        destination.documents = [...destination.documents, ...source.documents];
+        destination.documents = [
+          ...destinationDocuments.filter(
+            (document) => !removedDestinationDocumentIds.has(document.id)
+          ),
+          ...sourceDocuments.filter(
+            (document) => !removedSourceDocumentIds.has(document.id)
+          ),
+        ];
         destination.layout = mergedLayout;
         destination.activePaneId = source.activePaneId ?? movedPanes[0]?.id ?? destination.activePaneId;
         syncTabFromPanes(destination);
@@ -1453,8 +1581,10 @@ function createTabsStore() {
         if (activeTabId === sourceTabId) {
           activeTabId = targetTabId;
         }
+        result.status = "merged";
       });
-      commit();
+      if (result.status === "merged") commit();
+      return result;
     },
 
     updateSplitRatio(tabId: string, splitId: string, ratio: number) {

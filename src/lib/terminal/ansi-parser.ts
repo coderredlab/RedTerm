@@ -318,9 +318,14 @@ const MAX_CSI_REP_COUNT = 256;
 const MAX_CSI_SEQUENCE_CHARS = 1024;
 const MAX_CONTROL_FIELDS = 32;
 const MAX_IMAGE_METADATA_CHARS = 4096;
-const MAX_IMAGE_DECODED_BYTES = 4 * 1024 * 1024;
+const MAX_IMAGE_PIXEL_DIMENSION = 4096;
+const MAX_IMAGE_PIXELS = 4 * 1024 * 1024;
+const MAX_IMAGE_DECODED_BYTES = MAX_IMAGE_PIXELS * 4;
 const MAX_IMAGE_BASE64_CHARS = Math.ceil(MAX_IMAGE_DECODED_BYTES / 3) * 4;
-const MAX_CONTROL_SEQUENCE_CHARS = MAX_IMAGE_BASE64_CHARS + 4096;
+const MAX_KITTY_CHUNK_BASE64_CHARS = 4096;
+const MAX_KITTY_APC_SEQUENCE_CHARS =
+  1 + MAX_IMAGE_METADATA_CHARS + 1 + MAX_KITTY_CHUNK_BASE64_CHARS;
+const MAX_CONTROL_SEQUENCE_CHARS = Math.ceil((4 * 1024 * 1024) / 3) * 4 + 4096;
 const MAX_OSC_TEXT_BYTES = 4096;
 const OSC_TEXT_ENCODER = new TextEncoder();
 const OSC_TEXT_SEGMENTER = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
@@ -331,9 +336,7 @@ const MAX_OSC_URI_CHARS = 4096;
 const MAX_OSC_CLIPBOARD_BYTES = 64 * 1024;
 const MAX_OSC_CLIPBOARD_BASE64_CHARS = Math.ceil(MAX_OSC_CLIPBOARD_BYTES / 3) * 4;
 const MAX_OSC_SEQUENCE_CHARS = MAX_OSC_TEXT_BYTES + 64;
-const MAX_IMAGE_CHUNKS = 4096;
-const MAX_IMAGE_PIXEL_DIMENSION = 4096;
-const MAX_IMAGE_PIXELS = 4 * 1024 * 1024;
+const MAX_IMAGE_CHUNKS = Math.ceil(MAX_IMAGE_BASE64_CHARS / MAX_KITTY_CHUNK_BASE64_CHARS);
 const MAX_TOTAL_IMAGE_DATA_BYTES = 32 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_PIXELS = 8 * 1024 * 1024;
 const MAX_TERMINAL_IMAGES = 128;
@@ -1126,7 +1129,7 @@ export class AnsiParser {
           this.parseState = 'normal';
         } else if (char === '\x1b') {
           this.parseState = 'apcEscape';
-        } else if (this.escapeBuffer.length >= MAX_CONTROL_SEQUENCE_CHARS) {
+        } else if (this.escapeBuffer.length >= MAX_KITTY_APC_SEQUENCE_CHARS) {
           this.escapeBuffer = '';
           this.pendingKittyImage = null;
           this.parseState = 'apcDiscard';
@@ -1164,7 +1167,7 @@ export class AnsiParser {
           this.parseState = 'normal';
         } else if (char === '\x1b') {
           this.parseState = 'apcEscape';
-        } else if (this.escapeBuffer.length + 2 > MAX_CONTROL_SEQUENCE_CHARS) {
+        } else if (this.escapeBuffer.length + 2 > MAX_KITTY_APC_SEQUENCE_CHARS) {
           this.escapeBuffer = '';
           this.pendingKittyImage = null;
           this.parseState = 'apcDiscard';
@@ -2047,6 +2050,11 @@ export class AnsiParser {
       this.pendingKittyImage = null;
       return;
     }
+    if (payload.length > MAX_KITTY_CHUNK_BASE64_CHARS) {
+      this.pendingKittyImage = null;
+      this.sendKittyResponse(params, false, 'ENOSPC:image chunk too large', null, true);
+      return;
+    }
 
     const action = params.get('a') ?? 't';
     if (action === 'd') {
@@ -2214,10 +2222,10 @@ export class AnsiParser {
       const expectedLength = pixelWidth * pixelHeight * bytesPerPixel;
       if (bytes.length !== expectedLength) return { ok: false, error: 'EINVAL:unexpected pixel data size' };
 
-      const data = new Uint8ClampedArray(pixelWidth * pixelHeight * 4);
-      if (format === 32) {
-        data.set(bytes);
-      } else {
+      const data = format === 32
+        ? new Uint8ClampedArray(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+        : new Uint8ClampedArray(pixelWidth * pixelHeight * 4);
+      if (format === 24) {
         for (let src = 0, dst = 0; src < bytes.length; src += 3, dst += 4) {
           data[dst] = bytes[src];
           data[dst + 1] = bytes[src + 1];
@@ -3536,25 +3544,26 @@ export class AnsiParser {
   }
 
   private decodeIndependentBase64Bytes(chunks: string[]): Uint8Array | null {
-    if (this.encodedImageLength(chunks) === null) return null;
+    const encodedLength = this.encodedImageLength(chunks);
+    if (encodedLength === null) return null;
+
+    const finalChunk = chunks.at(-1)!;
+    const padding = finalChunk.endsWith('==') ? 2 : finalChunk.endsWith('=') ? 1 : 0;
+    const decodedLength = Math.floor(encodedLength / 4) * 3 - padding;
+    if (decodedLength > MAX_IMAGE_DECODED_BYTES) return null;
 
     try {
-      const decodedChunks: Uint8Array[] = [];
-      let totalLength = 0;
-      for (const chunk of chunks) {
-        const decoded = this.decodeBase64Chunk(chunk);
-        totalLength += decoded.length;
-        if (totalLength > MAX_IMAGE_DECODED_BYTES) return null;
-        decodedChunks.push(decoded);
-      }
-
-      const bytes = new Uint8Array(totalLength);
+      const bytes = new Uint8Array(decodedLength);
       let offset = 0;
-      for (const chunk of decodedChunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.length;
+      for (const chunk of chunks) {
+        const binary = atob(chunk);
+        if (offset + binary.length > bytes.length) return null;
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[offset + index] = binary.charCodeAt(index);
+        }
+        offset += binary.length;
       }
-      return bytes;
+      return offset === bytes.length ? bytes : null;
     } catch {
       return null;
     }
@@ -5565,9 +5574,13 @@ export class AnsiParser {
     const escapeBuffer = typeof snapshot.parserEscapeBuffer === 'string'
       ? snapshot.parserEscapeBuffer
       : '';
+    const maxEscapeBufferChars =
+      snapshot.parserState === 'apc' || snapshot.parserState === 'apcEscape'
+        ? MAX_KITTY_APC_SEQUENCE_CHARS
+        : MAX_CONTROL_SEQUENCE_CHARS;
     if (
       this.isTerminalParseState(snapshot.parserState) &&
-      escapeBuffer.length <= MAX_CONTROL_SEQUENCE_CHARS
+      escapeBuffer.length <= maxEscapeBufferChars
     ) {
       this.parseState = snapshot.parserState;
       this.escapeBuffer = escapeBuffer;

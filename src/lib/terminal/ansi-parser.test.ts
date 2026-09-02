@@ -124,6 +124,19 @@ function chunkBase64(value: string, size: number): string[] {
   return chunks;
 }
 
+function writeChunkedKittyImage(parser: AnsiParser, params: string, payload: string): void {
+  const chunks = chunkBase64(payload, 4096);
+  if (chunks.length === 1) {
+    parser.write(`\x1b_G${params};${chunks[0]}\x1b\\`);
+    return;
+  }
+  parser.write(`\x1b_G${params},m=1;${chunks[0]}\x1b\\`);
+  for (const chunk of chunks.slice(1, -1)) {
+    parser.write(`\x1b_Gm=1;${chunk}\x1b\\`);
+  }
+  parser.write(`\x1b_Gm=0;${chunks.at(-1)}\x1b\\`);
+}
+
 
 function scrollUntilScrollbackCapStopsGrowing(parser: AnsiParser): number {
   let previousLength = parser.getScrollbackLength();
@@ -950,11 +963,26 @@ describe("AnsiParser Kitty images", () => {
     expect((restored as unknown as { pendingKittyImage: unknown }).pendingKittyImage).toBeNull();
   });
 
+  test("rejects oversized pending Kitty APC buffers from snapshots", () => {
+    const source = new AnsiParser(80, 3);
+    const snapshot = source.createSnapshot();
+    snapshot.parserState = "apc";
+    snapshot.parserEscapeBuffer = "G".repeat(8195);
+
+    const restored = new AnsiParser(80, 3);
+    restored.restoreSnapshot(snapshot);
+
+    expect(restored.createSnapshot()).toMatchObject({
+      parserState: "normal",
+      parserEscapeBuffer: "",
+    });
+  });
+
   test("rejects pending image snapshots above the chunk count limit", () => {
     const source = new AnsiParser(80, 3);
     source.write("\x1b_Ga=T,f=32,s=2,v=2,m=1;AAAA\x1b\\");
     const snapshot = source.createSnapshot();
-    snapshot.pendingKittyImage!.chunks = Array.from({ length: 4097 }, () => "");
+    snapshot.pendingKittyImage!.chunks = Array.from({ length: 5463 }, () => "");
 
     const restored = new AnsiParser(80, 3);
     restored.restoreSnapshot(snapshot);
@@ -1513,9 +1541,9 @@ describe("AnsiParser Kitty images", () => {
     const parser = new AnsiParser(20, 3);
     const responses: string[] = [];
     parser.setResponseHandler((response) => responses.push(response));
-    const payload = Buffer.from(zlibSync(new Uint8Array(4 * 1024 * 1024 + 1))).toString("base64");
+    const payload = Buffer.from(zlibSync(new Uint8Array(16 * 1024 * 1024 + 1))).toString("base64");
 
-    parser.write(`\x1b_Ga=t,f=32,s=1,v=1,i=42,o=z;${payload}\x1b\\`);
+    writeChunkedKittyImage(parser, "a=t,f=32,s=1,v=1,i=42,o=z", payload);
 
     expect(parser.getImages()).toHaveLength(0);
     expect(responses.at(-1)).toContain("ENOSPC:decompressed image too large");
@@ -1957,9 +1985,9 @@ describe("AnsiParser Kitty images", () => {
       }>;
     };
 
-    parser.write(`\x1b_Ga=t,f=100,i=83;${png}\x1b\\`);
+    writeChunkedKittyImage(parser, "a=t,f=100,i=83", png);
     for (let frame = 2; frame <= 10; frame++) {
-      parser.write(`\x1b_Ga=f,f=100,i=83,z=40;${png}\x1b\\`);
+      writeChunkedKittyImage(parser, "a=f,f=100,i=83,z=40", png);
     }
     responses.length = 0;
 
@@ -2811,7 +2839,7 @@ describe("AnsiParser CSI work limits", () => {
 
 describe("AnsiParser image resource limits", () => {
   test("discards oversized OSC and APC controls and resumes plain text", () => {
-    const oversizedControl = "x".repeat(6 * 1024 * 1024);
+    const oversizedControl = "x".repeat(24 * 1024 * 1024);
 
     for (const state of ["osc", "apc"]) {
       const parser = new AnsiParser(40, 2);
@@ -2837,7 +2865,7 @@ describe("AnsiParser image resource limits", () => {
   });
 
   test("cancels oversized APC and DCS controls with CAN or SUB", () => {
-    const oversizedControl = "x".repeat(6 * 1024 * 1024);
+    const oversizedControl = "x".repeat(24 * 1024 * 1024);
 
     for (const [state, cancel] of [["apc", "\x18"], ["dcs", "\x1a"]] as const) {
       const parser = new AnsiParser(40, 2);
@@ -2891,6 +2919,58 @@ describe("AnsiParser image resource limits", () => {
     parser.write("\x1b_Gm=1;AAAA\x1b\\");
     expect(parserInternals.pendingKittyImage).toBeNull();
     expect(parser.getImages()).toHaveLength(0);
+  });
+
+  test("accepts a maximum-size raw Kitty image in protocol-sized chunks", () => {
+    const parser = new AnsiParser(120, 40);
+    const width = 4096;
+    const height = 1024;
+    const payload = Buffer.alloc(width * height * 4, 255).toString("base64");
+    const chunks = chunkBase64(payload, 4096);
+
+    parser.write(
+      `\x1b_Ga=T,f=32,s=${width},v=${height},i=901,c=20,r=20,m=1;${chunks[0]}\x1b\\`,
+    );
+    for (const chunk of chunks.slice(1, -1)) {
+      parser.write(`\x1b_Gm=1;${chunk}\x1b\\`);
+    }
+    parser.write(`\x1b_Gm=0;${chunks.at(-1)}\x1b\\`);
+
+    expect(parser.getImages()).toHaveLength(1);
+    expect(parser.getImages()[0]).toMatchObject({
+      pixelWidth: width,
+      pixelHeight: height,
+    });
+    expect(parser.getImages()[0].data).toHaveLength(width * height * 4);
+  });
+
+  test("rejects raw Kitty images one pixel over the decoded byte budget", () => {
+    const parser = new AnsiParser(120, 40);
+    const width = 4096;
+    const height = 1024;
+    const payload = Buffer.alloc(width * height * 4 + 4, 255).toString("base64");
+    const chunks = chunkBase64(payload, 4096);
+
+    parser.write(
+      `\x1b_Ga=T,f=32,s=${width},v=${height},i=902,c=20,r=20,m=1;${chunks[0]}\x1b\\`,
+    );
+    for (const chunk of chunks.slice(1, -1)) {
+      parser.write(`\x1b_Gm=1;${chunk}\x1b\\`);
+    }
+    parser.write(`\x1b_Gm=0;${chunks.at(-1)}\x1b\\`);
+
+    expect(parser.getImages()).toHaveLength(0);
+  });
+
+  test("rejects Kitty APC chunks above the protocol limit", () => {
+    const parser = new AnsiParser(40, 3);
+    const oversizedChunk = "A".repeat(4097);
+
+    parser.write(`\x1b_Ga=T,f=32,s=1,v=1,m=0;${oversizedChunk}\x1b\\`);
+    parser.write(kittyRgbaApc({ imageId: 903, width: 1, height: 1 }));
+
+    expect(parser.getImages()).toHaveLength(1);
+    expect(parser.getImages()[0]).toMatchObject({ pixelWidth: 1, pixelHeight: 1 });
   });
 
   test("rejects encoded images whose dimensions exceed the pixel budget", () => {

@@ -464,6 +464,131 @@ describe("tabs store persistence", () => {
     }
   });
 
+  test("reuses a document opened from another split pane", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const tabId = tabsStore.addTab(
+      "preview.example.com",
+      22,
+      { username: "deploy", method: { type: "password", password: "" } }
+    );
+
+    try {
+      const sourcePaneId = tabsStore.getTab(tabId)!.activePaneId!;
+      const documentId = await tabsStore.openDocument(tabId, sourcePaneId, {
+        name: "README.md",
+        path: "/srv/README.md",
+        size: 64,
+      });
+      tabsStore.setDocumentCachedLocalPath(
+        tabId,
+        documentId!,
+        "/tmp/redterm-preview.mp4"
+      );
+      const secondPaneId = await tabsStore.splitPane(tabId, sourcePaneId, "row");
+
+      const reopenedDocumentId = await tabsStore.openDocument(
+        tabId,
+        secondPaneId!,
+        { name: "README.md", path: "/srv/README.md", size: 64 }
+      );
+
+      expect(reopenedDocumentId).toBe(documentId);
+      expect(tabsStore.getTab(tabId)?.documents).toHaveLength(1);
+      expect(
+        tabsStore.getCachedDocumentPath(
+          tabId,
+          secondPaneId!,
+          "/srv/README.md"
+        )
+      ).toBe("/tmp/redterm-preview.mp4");
+      expect(tabsStore.getTab(tabId)).toMatchObject({
+        activePaneId: sourcePaneId,
+        layout: {
+          type: "split",
+          dir: "row",
+          children: [
+            {
+              paneIds: [sourcePaneId],
+              documentIds: [documentId],
+              activeItem: { kind: "document", id: documentId },
+            },
+            {
+              paneIds: [secondPaneId],
+              documentIds: [],
+              activeItem: { kind: "terminal", id: secondPaneId },
+            },
+          ],
+        },
+      });
+    } finally {
+      tabsStore.removeTab(tabId);
+    }
+  });
+
+  test("reattaches a reused document when its original pane is disconnected", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const tabId = tabsStore.addTab(
+      "preview.example.com",
+      22,
+      { username: "deploy", method: { type: "password", password: "" } }
+    );
+
+    try {
+      const firstPaneId = tabsStore.getTab(tabId)!.activePaneId!;
+      tabsStore.setPaneConnected(tabId, firstPaneId, "session-one");
+      const documentId = await tabsStore.openDocument(tabId, firstPaneId, {
+        name: "README.md",
+        path: "/srv/README.md",
+        size: 64,
+      });
+      tabsStore.setDocumentLoaded(tabId, documentId!, "saved", false);
+      tabsStore.setDocumentContent(tabId, documentId!, "unsaved");
+      tabsStore.setDocumentCachedLocalPath(tabId, documentId!, "/tmp/readme-cache");
+      const secondPaneId = await tabsStore.splitPane(tabId, firstPaneId, "row");
+      tabsStore.setPaneConnected(tabId, secondPaneId!, "session-two");
+      tabsStore.setPaneDisconnected(tabId, firstPaneId);
+
+      const reopenedDocumentId = await tabsStore.openDocument(
+        tabId,
+        secondPaneId!,
+        { name: "README.md", path: "/srv/README.md", size: 64 }
+      );
+
+      expect(reopenedDocumentId).toBe(documentId);
+      expect(tabsStore.getTab(tabId)?.documents).toHaveLength(1);
+      expect(tabsStore.getDocument(tabId, documentId!)).toMatchObject({
+        sourcePaneId: secondPaneId,
+        sourceSessionId: "session-two",
+        content: "unsaved",
+        savedContent: "saved",
+        dirty: true,
+        cachedLocalPath: "/tmp/readme-cache",
+      });
+      expect(tabsStore.getTab(tabId)).toMatchObject({
+        activePaneId: secondPaneId,
+        layout: {
+          type: "split",
+          children: [
+            {
+              paneIds: [firstPaneId],
+              documentIds: [],
+              activeItem: { kind: "terminal", id: firstPaneId },
+            },
+            {
+              paneIds: [secondPaneId],
+              documentIds: [documentId],
+              activeItem: { kind: "document", id: documentId },
+            },
+          ],
+        },
+      });
+    } finally {
+      tabsStore.removeTab(tabId);
+    }
+  });
+
   test("keeps a pane's documents attached when moving the pane", async () => {
     installBrowserStorage(new MemoryStorage());
     const { tabsStore } = await import("./tabs.svelte");
@@ -590,6 +715,104 @@ describe("tabs store persistence", () => {
         dirty: false,
         savedContent: "after",
         saveState: "saved",
+      });
+    } finally {
+      tabsStore.removeTab(sourceTabId);
+      tabsStore.removeTab(targetTabId);
+    }
+  });
+
+  test("deduplicates the same target path while preserving unsaved source content", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const auth = { username: "deploy", method: { type: "password" as const, password: "" } };
+    const sourceTabId = tabsStore.addTab("merge.example.com", 22, auth);
+    const targetTabId = tabsStore.addTab("merge.example.com", 22, auth);
+
+    try {
+      const sourcePaneId = tabsStore.getTab(sourceTabId)!.activePaneId!;
+      const targetPaneId = tabsStore.getTab(targetTabId)!.activePaneId!;
+      tabsStore.setPaneConnected(sourceTabId, sourcePaneId, "source-session");
+      tabsStore.setPaneConnected(targetTabId, targetPaneId, "target-session");
+      const sourceDocumentId = await tabsStore.openDocument(sourceTabId, sourcePaneId, {
+        name: "shared.txt",
+        path: "/srv/shared.txt",
+        size: 32,
+      });
+      const targetDocumentId = await tabsStore.openDocument(targetTabId, targetPaneId, {
+        name: "shared.txt",
+        path: "/srv/shared.txt",
+        size: 32,
+      });
+      tabsStore.setDocumentLoaded(sourceTabId, sourceDocumentId!, "base", false);
+      tabsStore.setDocumentContent(sourceTabId, sourceDocumentId!, "source edit");
+      tabsStore.setDocumentLoaded(targetTabId, targetDocumentId!, "base", false);
+      tabsStore.setDocumentCachedLocalPath(
+        targetTabId,
+        targetDocumentId!,
+        "/tmp/shared-cache"
+      );
+
+      const result = await tabsStore.mergeTab(sourceTabId, targetTabId, "row", "before");
+
+      expect(result).toEqual({ status: "merged" });
+      expect(tabsStore.getTab(sourceTabId)).toBeUndefined();
+      expect(tabsStore.getTab(targetTabId)?.documents).toHaveLength(1);
+      expect(tabsStore.getDocument(targetTabId, sourceDocumentId!)).toMatchObject({
+        sourcePaneId,
+        sourceSessionId: "source-session",
+        content: "source edit",
+        savedContent: "base",
+        dirty: true,
+        cachedLocalPath: "/tmp/shared-cache",
+      });
+      expect(tabsStore.getDocument(targetTabId, targetDocumentId!)).toBeUndefined();
+      const layout = JSON.stringify(tabsStore.getTab(targetTabId)?.layout);
+      expect(layout).toContain(sourceDocumentId!);
+      expect(layout).not.toContain(targetDocumentId!);
+    } finally {
+      tabsStore.removeTab(sourceTabId);
+      tabsStore.removeTab(targetTabId);
+    }
+  });
+
+  test("rejects a tab merge with divergent unsaved copies of the same file", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const auth = { username: "deploy", method: { type: "password" as const, password: "" } };
+    const sourceTabId = tabsStore.addTab("merge.example.com", 22, auth);
+    const targetTabId = tabsStore.addTab("merge.example.com", 22, auth);
+
+    try {
+      const sourcePaneId = tabsStore.getTab(sourceTabId)!.activePaneId!;
+      const targetPaneId = tabsStore.getTab(targetTabId)!.activePaneId!;
+      const sourceDocumentId = await tabsStore.openDocument(sourceTabId, sourcePaneId, {
+        name: "shared.txt",
+        path: "/srv/shared.txt",
+        size: 32,
+      });
+      const targetDocumentId = await tabsStore.openDocument(targetTabId, targetPaneId, {
+        name: "shared.txt",
+        path: "/srv/shared.txt",
+        size: 32,
+      });
+      tabsStore.setDocumentLoaded(sourceTabId, sourceDocumentId!, "base", false);
+      tabsStore.setDocumentContent(sourceTabId, sourceDocumentId!, "source edit");
+      tabsStore.setDocumentLoaded(targetTabId, targetDocumentId!, "base", false);
+      tabsStore.setDocumentContent(targetTabId, targetDocumentId!, "target edit");
+
+      const result = await tabsStore.mergeTab(sourceTabId, targetTabId, "row", "before");
+
+      expect(result).toEqual({ status: "conflict", path: "/srv/shared.txt" });
+      expect(tabsStore.getTab(sourceTabId)?.documents).toHaveLength(1);
+      expect(tabsStore.getTab(targetTabId)?.documents).toHaveLength(1);
+      expect(tabsStore.getDocument(sourceTabId, sourceDocumentId!)).toMatchObject({
+        content: "source edit",
+        dirty: true,
+      });
+      expect(tabsStore.getDocument(targetTabId, targetDocumentId!)).toMatchObject({
+        content: "target edit",
+        dirty: true,
       });
     } finally {
       tabsStore.removeTab(sourceTabId);

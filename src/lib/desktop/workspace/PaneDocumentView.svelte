@@ -1,3 +1,27 @@
+<script module lang="ts">
+  import type { SftpDownloadedFile } from "$lib/tauri/commands";
+
+  interface PendingDocumentDownload {
+    sourceKey: string;
+    promise: Promise<SftpDownloadedFile>;
+  }
+
+  const pendingDocumentDownloads = new Map<string, PendingDocumentDownload>();
+  const freshlyDownloadedDocumentPaths = new Map<string, string>();
+
+  function getPendingDocumentDownload(
+    documentId: string,
+    sourceKey: string,
+    start: () => Promise<SftpDownloadedFile>
+  ): PendingDocumentDownload {
+    const existing = pendingDocumentDownloads.get(documentId);
+    if (existing?.sourceKey === sourceKey) return existing;
+    const request = { sourceKey, promise: start() };
+    pendingDocumentDownloads.set(documentId, request);
+    return request;
+  }
+</script>
+
 <script lang="ts">
   import { convertFileSrc } from "@tauri-apps/api/core";
   import { HighlightStyle, LanguageDescription, syntaxHighlighting } from "@codemirror/language";
@@ -37,10 +61,11 @@
   interface Props {
     tabId: string;
     document: PaneDocument;
+    visible: boolean;
     active: boolean;
   }
 
-  let { tabId, document, active }: Props = $props();
+  let { tabId, document, visible, active }: Props = $props();
 
   let loadState = $state<"loading" | "ready" | "idle" | "error">("loading");
   let errorMessage = $state("");
@@ -60,6 +85,7 @@
   let editorToken = 0;
   let leasedMediaPath = "";
   let recoverableCachedMedia = false;
+  let cachedPathChangeAction: "load-document" | "load-media" | "ignore" | null = null;
 
   const boundKind = untrack(() => document.sourceKind);
   const boundPath = untrack(() => document.path);
@@ -153,10 +179,45 @@
       : sftpReadFile(document.sourceSessionId!, boundPath);
   }
 
-  async function downloadToCache() {
-    return boundKind === "local"
-      ? localDownloadFile(boundPath)
-      : sftpDownloadFile(document.sourceSessionId!, boundPath);
+  async function downloadToCache(): Promise<boolean> {
+    const sourceSessionId = boundKind === "ssh" ? document.sourceSessionId : null;
+    const sourceKey = `${boundKind}\0${sourceSessionId ?? ""}\0${boundPath}`;
+    const request = getPendingDocumentDownload(
+      document.id,
+      sourceKey,
+      () => boundKind === "local"
+        ? localDownloadFile(boundPath)
+        : sftpDownloadFile(sourceSessionId!, boundPath)
+    );
+    try {
+      const downloaded = await request.promise;
+      if (pendingDocumentDownloads.get(document.id) !== request) return false;
+      const currentTab = tabsStore.tabs.find((candidate) =>
+        candidate.documents.some((candidateDocument) => candidateDocument.id === document.id)
+      );
+      const current = currentTab?.documents.find(
+        (candidate) => candidate.id === document.id
+      );
+      if (
+        !currentTab ||
+        !current ||
+        current.sourceKind !== boundKind ||
+        current.path !== boundPath ||
+        (boundKind === "ssh" && current.sourceSessionId !== sourceSessionId) ||
+        current.cachedLocalPath !== null
+      ) return false;
+      freshlyDownloadedDocumentPaths.set(document.id, downloaded.local_path);
+      tabsStore.setDocumentCachedLocalPath(
+        currentTab.id,
+        document.id,
+        downloaded.local_path
+      );
+      return true;
+    } finally {
+      if (pendingDocumentDownloads.get(document.id) === request) {
+        pendingDocumentDownloads.delete(document.id);
+      }
+    }
   }
 
   async function loadDocument() {
@@ -177,7 +238,14 @@
     const cachedPath = document.cachedLocalPath;
     if (cachedPath && (fileKind === "pdf" || needsExplicitDownload)) {
       try {
-        const available = await acquireMediaPath(cachedPath, token, true);
+        const freshlyDownloaded =
+          freshlyDownloadedDocumentPaths.get(document.id) === cachedPath;
+        if (freshlyDownloaded) freshlyDownloadedDocumentPaths.delete(document.id);
+        const available = await acquireMediaPath(
+          cachedPath,
+          token,
+          !freshlyDownloaded
+        );
         if (token !== loadToken) return;
         if (available) return;
         tabsStore.setDocumentCachedLocalPath(tabId, document.id, null);
@@ -204,18 +272,7 @@
 
     try {
       if (fileKind === "pdf") {
-        const downloaded = await downloadToCache();
-        if (token !== loadToken) return;
-        const available = await acquireMediaPath(downloaded.local_path, token, false);
-        if (token !== loadToken) return;
-        if (!available) {
-          throw new Error("Downloaded preview cache file is unavailable.");
-        }
-        tabsStore.setDocumentCachedLocalPath(
-          tabId,
-          document.id,
-          downloaded.local_path
-        );
+        await downloadToCache();
         return;
       }
 
@@ -248,18 +305,7 @@
     errorMessage = "";
     revokeMediaUrl();
     try {
-      const downloaded = await downloadToCache();
-      if (token !== loadToken) return;
-      const available = await acquireMediaPath(downloaded.local_path, token, false);
-      if (token !== loadToken) return;
-      if (!available) {
-        throw new Error("Downloaded preview cache file is unavailable.");
-      }
-      tabsStore.setDocumentCachedLocalPath(
-        tabId,
-        document.id,
-        downloaded.local_path
-      );
+      await downloadToCache();
     } catch (error) {
       if (token !== loadToken) return;
       loadState = "error";
@@ -270,17 +316,14 @@
   function recoverCachedMedia() {
     if (!leasedMediaPath || !document.cachedLocalPath) return;
     const shouldRedownload = recoverableCachedMedia;
+    cachedPathChangeAction = shouldRedownload
+      ? fileKind === "pdf" ? "load-document" : "load-media"
+      : "ignore";
     revokeMediaUrl();
     tabsStore.setDocumentCachedLocalPath(tabId, document.id, null);
     if (!shouldRedownload) {
       loadState = "error";
       errorMessage = "Unable to preview this file.";
-      return;
-    }
-    if (fileKind === "pdf") {
-      void loadDocument();
-    } else {
-      void loadMedia();
     }
   }
   async function save() {
@@ -533,13 +576,19 @@
   });
 
   $effect(() => {
-    if (active && editorView && mode === "edit") editorView.focus();
+    if (!visible || !editorView || mode !== "edit") return;
+    editorView.requestMeasure();
+    if (active) editorView.focus();
   });
 
   $effect(() => {
     document.id;
     document.sourceSessionId;
-    untrack(() => void loadDocument());
+    document.cachedLocalPath;
+    const action = cachedPathChangeAction;
+    cachedPathChangeAction = null;
+    if (action === "ignore") return;
+    untrack(() => void (action === "load-media" ? loadMedia() : loadDocument()));
   });
 
   function handleWindowKeydown(event: KeyboardEvent) {

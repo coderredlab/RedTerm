@@ -158,7 +158,9 @@
           >
             <div class="connection-name">{connection.name}</div>
             <div class="connection-details">
-              {connection.username}@{connection.host}:{connection.port}
+              <span class="connection-endpoint">
+                {connection.username}@{connection.host}:{connection.port}
+              </span>
               {#if connection.has_saved_password}
                 <span class="password-saved" title="Password saved">🔐</span>
               {/if}
@@ -358,7 +360,9 @@
   }
 
   .connection-main {
+    min-width: 0;
     flex: 1;
+    overflow: hidden;
     padding: 12px 16px;
     background: transparent;
     border: none;
@@ -372,10 +376,13 @@
   }
 
   .connection-name {
+    overflow: hidden;
     color: var(--text-primary);
     font-size: 14px;
     font-weight: 500;
     margin-bottom: 4px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .connection-details {
@@ -386,6 +393,13 @@
     gap: 6px;
   }
 
+  .connection-endpoint {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .password-saved,
   .key-auth {
     font-size: 10px;
@@ -393,6 +407,7 @@
 
   .connection-actions {
     display: flex;
+    flex: 0 0 auto;
     padding: 0 8px;
     gap: 4px;
   }

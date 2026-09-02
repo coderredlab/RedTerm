@@ -6,6 +6,8 @@
     localDownloadToDir,
     localHomeDir,
     localListDir,
+    previewCacheAcquire,
+    previewCacheRelease,
     sftpDownloadToDir,
     sftpHomeDir,
     sftpListDir,
@@ -29,9 +31,17 @@
     initialPath: string | null;
     onPathChange: (path: string) => void;
     onPreview: (entry: { name: string; path: string; size: number }) => void;
+    cachedLocalPathFor: (path: string) => string | null;
   }
 
-  let { kind, sessionId, initialPath, onPathChange, onPreview }: Props = $props();
+  let {
+    kind,
+    sessionId,
+    initialPath,
+    onPathChange,
+    onPreview,
+    cachedLocalPathFor,
+  }: Props = $props();
 
   let path = $state("/");
   let entries = $state<SftpDirEntry[] | null>(null);
@@ -198,9 +208,16 @@
     if (downloadingPaths.includes(target)) return;
     downloadingPaths = [...downloadingPaths, target];
     downloads[target] = { transferred: 0, total: entry.size || null };
+    let leasedCachedPath: string | null = null;
     try {
-      const saved =
-        kind === "local"
+      const cachedLocalPath =
+        kind === "ssh" ? cachedLocalPathFor(target) : null;
+      if (cachedLocalPath && await previewCacheAcquire(cachedLocalPath)) {
+        leasedCachedPath = cachedLocalPath;
+      }
+      const saved = leasedCachedPath
+        ? await localDownloadToDir(leasedCachedPath, directory, entry.name)
+        : kind === "local"
           ? await localDownloadToDir(target, directory)
           : await sftpDownloadToDir(sessionId!, target, directory);
       showStatus(`Saved to ${saved.local_path}`);
@@ -209,6 +226,11 @@
         `Download failed: ${error instanceof Error ? error.message : String(error)}`
       );
     } finally {
+      if (leasedCachedPath) {
+        void previewCacheRelease(leasedCachedPath).catch((error) => {
+          console.error("[FileExplorer] failed to release preview cache:", error);
+        });
+      }
       downloadingPaths = downloadingPaths.filter((candidate) => candidate !== target);
       setTimeout(() => {
         delete downloads[target];

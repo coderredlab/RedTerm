@@ -20,6 +20,7 @@
     onNewConnection: () => void;
     onOpenLocal: () => void;
     onPreview: (entry: { name: string; path: string; size: number }) => void;
+    cachedLocalPathFor: (path: string) => string | null;
   }
 
   let {
@@ -34,6 +35,7 @@
     onNewConnection,
     onOpenLocal,
     onPreview,
+    cachedLocalPathFor,
   }: Props = $props();
 
   let view = $state<"connections" | "files">("connections");
@@ -146,6 +148,7 @@
         initialPath={explorerPaths[explorerId] ?? null}
         onPathChange={rememberExplorerPath(explorerId)}
         {onPreview}
+        {cachedLocalPathFor}
       />
     {/key}
   {:else}

@@ -26,12 +26,14 @@
   interface Props {
     tabId: string;
     node: PaneNode;
-    /** True when this tab is the active tab and no overlay is open. */
+    /** True when this tab is visible in the workspace. */
+    visible: boolean;
+    /** True when this tab is active and no overlay is open. */
     interactive: boolean;
     activePaneId: string | null;
   }
 
-  let { tabId, node, interactive, activePaneId }: Props = $props();
+  let { tabId, node, visible, interactive, activePaneId }: Props = $props();
 
   const workspace = getWorkspaceApi();
   let splitEl: HTMLDivElement | null = $state(null);
@@ -214,7 +216,7 @@
     bind:this={splitEl}
   >
     <div class="split-child" style:flex-grow={liveRatio}>
-      <Self {tabId} node={node.children[0]} {interactive} {activePaneId} />
+      <Self {tabId} node={node.children[0]} {visible} {interactive} {activePaneId} />
     </div>
     <div
       class="divider"
@@ -225,7 +227,7 @@
       onpointerdown={startResize}
     ></div>
     <div class="split-child" style:flex-grow={1 - liveRatio}>
-      <Self {tabId} node={node.children[1]} {interactive} {activePaneId} />
+      <Self {tabId} node={node.children[1]} {visible} {interactive} {activePaneId} />
     </div>
   </div>
 {:else}
@@ -388,6 +390,7 @@
                     <PaneDocumentView
                       {tabId}
                       document={activeDocument}
+                      {visible}
                       active={focused}
                     />
                   {/key}

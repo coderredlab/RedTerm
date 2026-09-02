@@ -28,6 +28,7 @@
   import PaneView from "./workspace/PaneView.svelte";
   import TabStrip from "./workspace/TabStrip.svelte";
   import SettingsModal from "./workspace/SettingsModal.svelte";
+  import CloseConfirmationModal from "./workspace/CloseConfirmationModal.svelte";
   import { desktopPrefsStore } from "./workspace/desktop-prefs.svelte";
   import {
     dragTargets,
@@ -46,6 +47,17 @@
   let workspaceEl: HTMLElement | null = $state(null);
   let editPaneRequestGeneration = 0;
   let connectionsViewRequest = $state(0);
+
+  interface ApplicationClosePrompt {
+    title: string;
+    message: string;
+    detail: string;
+    confirmLabel: string;
+    destructive: boolean;
+  }
+
+  let applicationClosePrompt = $state<ApplicationClosePrompt | null>(null);
+  let resolveApplicationClosePrompt: ((confirmed: boolean) => void) | null = null;
 
   const terminals = new Map<string, Terminal>();
   const confirmingTabIds = new Set<string>();
@@ -94,6 +106,14 @@
   );
   const explorerId = $derived(activePane?.id ?? null);
 
+  function cachedLocalPathForActivePane(path: string): string | null {
+    const tab = tabsStore.activeTab;
+    const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
+    return tab && paneId
+      ? tabsStore.getCachedDocumentPath(tab.id, paneId, path)
+      : null;
+  }
+
   $effect(() => {
     dragTargets.workspace = workspaceEl;
     return () => {
@@ -110,7 +130,10 @@
     const tab = tabsStore.activeTab;
     const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
     const overlayFree =
-      !showDialog && !settingsOpen && sessionsReconciled;
+      !showDialog &&
+      !settingsOpen &&
+      applicationClosePrompt === null &&
+      sessionsReconciled;
     if (
       !tab ||
       !paneId ||
@@ -170,6 +193,7 @@
       unlistenAppExitRequested?.();
       unlistenCloseRequested?.();
       window.removeEventListener("beforeunload", handleBeforeUnload);
+      settleApplicationClosePrompt(false);
     };
   });
 
@@ -301,6 +325,21 @@
     settingsOpen = true;
   }
 
+  function requestApplicationClosePrompt(prompt: ApplicationClosePrompt): Promise<boolean> {
+    return new Promise((resolve) => {
+      applicationClosePrompt = prompt;
+      resolveApplicationClosePrompt = resolve;
+    });
+  }
+
+  function settleApplicationClosePrompt(confirmed: boolean) {
+    const resolve = resolveApplicationClosePrompt;
+    if (!resolve) return;
+    resolveApplicationClosePrompt = null;
+    applicationClosePrompt = null;
+    resolve(confirmed);
+  }
+
   async function confirmAndCloseApplication(closeApplication: () => Promise<void>) {
     if (windowCloseConfirmed || windowCloseConfirmationPending) return;
     windowCloseConfirmationPending = true;
@@ -331,14 +370,26 @@
     const dirtyDocuments = tabsStore.tabs.flatMap((tab) =>
       tab.documents.filter((document) => document.dirty)
     );
-    if (dirtyDocuments.length === 0) return confirmAction("Close RedTerm?");
+    if (dirtyDocuments.length === 0) {
+      return requestApplicationClosePrompt({
+        title: "Close RedTerm?",
+        message: "Your active terminal sessions will be disconnected.",
+        detail: "You can reconnect when you open RedTerm again.",
+        confirmLabel: "Close RedTerm",
+        destructive: false,
+      });
+    }
     const label =
       dirtyDocuments.length === 1
         ? `"${dirtyDocuments[0]!.name}"`
         : `${dirtyDocuments.length} documents`;
-    return confirmAction(
-      `Discard unsaved changes in ${label} and close RedTerm?`
-    );
+    return requestApplicationClosePrompt({
+      title: "Discard unsaved changes?",
+      message: `Unsaved changes in ${label} will be lost.`,
+      detail: "This action cannot be undone.",
+      confirmLabel: "Discard & Close",
+      destructive: true,
+    });
   }
 
   async function confirmCloseDocuments(tabId: string, sourcePaneId?: string): Promise<boolean> {
@@ -568,7 +619,13 @@
       await storeTabSnapshots([sourceTabId, targetTabId]);
       if (tabIsClosing(sourceTabId) || tabIsClosing(targetTabId)) return;
       await tick();
-      await tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
+      const result = await tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
+      if (result.status === "conflict") {
+        await showWarning(
+          "These tabs cannot be merged because the same file has different unsaved changes in both tabs. Save or close one copy and try again."
+        );
+        return;
+      }
       for (const pane of tabsStore.getTab(targetTabId)?.panes ?? []) {
         terminals.get(pane.id)?.syncSize();
       }
@@ -697,6 +754,10 @@
     if (terminal) void terminal.pasteFromClipboard();
   }
 
+  function preventWebviewContextMenu(event: MouseEvent) {
+    event.preventDefault();
+  }
+
   function onKeydownCapture(event: KeyboardEvent) {
     const terminalTarget = isTerminalShortcutTarget(
       event.target,
@@ -718,7 +779,11 @@
         pasteFromClipboard: () => void pasteFromClipboardToActivePane(),
         openSettings: handleOpenSettings,
       },
-      () => !showDialog && !settingsOpen && sessionsReconciled,
+      () =>
+        !showDialog &&
+        !settingsOpen &&
+        applicationClosePrompt === null &&
+        sessionsReconciled,
       terminalTarget
     );
     if (consumed) {
@@ -729,6 +794,7 @@
 </script>
 
 <svelte:window
+  oncontextmenu={preventWebviewContextMenu}
   onkeydowncapture={onKeydownCapture}
   onpagehide={() => desktopPrefsStore.flushPendingPersist()}
 />
@@ -752,6 +818,7 @@
     onEdit={handleEdit}
     onNewConnection={handleNewConnection}
     onOpenLocal={() => void tabsStore.addLocalTab()}
+    cachedLocalPathFor={cachedLocalPathForActivePane}
     onPreview={(entry) => {
       const tab = tabsStore.activeTab;
       const paneId = tab?.activePaneId ?? tab?.panes[0]?.id;
@@ -802,9 +869,11 @@
             <PaneView
               tabId={tab.id}
               node={tab.layout}
+              visible={tab.id === tabsStore.activeTabId}
               interactive={
                 !showDialog &&
                 !settingsOpen &&
+                applicationClosePrompt === null &&
                 tab.id === tabsStore.activeTabId}
               activePaneId={tab.activePaneId}
             />
@@ -831,6 +900,17 @@
   />
 
   <SettingsModal open={settingsOpen} onClose={() => (settingsOpen = false)} />
+
+  <CloseConfirmationModal
+    open={applicationClosePrompt !== null}
+    title={applicationClosePrompt?.title ?? ""}
+    message={applicationClosePrompt?.message ?? ""}
+    detail={applicationClosePrompt?.detail ?? ""}
+    confirmLabel={applicationClosePrompt?.confirmLabel ?? ""}
+    destructive={applicationClosePrompt?.destructive ?? false}
+    onCancel={() => settleApplicationClosePrompt(false)}
+    onConfirm={() => settleApplicationClosePrompt(true)}
+  />
 
 
   {#if tabDrag.active}
