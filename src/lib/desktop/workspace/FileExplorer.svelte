@@ -2,7 +2,8 @@
   import { onDestroy, untrack } from "svelte";
   import {
     listenDownloadProgress,
-    chooseDownloadDirectory,
+    chooseDownloadSavePath,
+    splitSavePath,
     localDownloadToDir,
     localHomeDir,
     localListDir,
@@ -197,14 +198,15 @@
   async function downloadEntry(entry: SftpDirEntry) {
     const target = joinPath(path, entry.name);
     if (!canBrowse || downloadingPaths.includes(target)) return;
-    // Pick the destination folder before anything starts transferring.
-    let directory: string | null = null;
+    // Open a save dialog pre-filled with the file name before transferring.
+    let saveTarget: string | null = null;
     try {
-      directory = await chooseDownloadDirectory();
+      saveTarget = await chooseDownloadSavePath(entry.name);
     } catch {
-      directory = null;
+      saveTarget = null;
     }
-    if (!directory) return;
+    if (!saveTarget) return;
+    const { directory, fileName } = splitSavePath(saveTarget);
     if (downloadingPaths.includes(target)) return;
     downloadingPaths = [...downloadingPaths, target];
     downloads[target] = { transferred: 0, total: entry.size || null };
@@ -216,10 +218,10 @@
         leasedCachedPath = cachedLocalPath;
       }
       const saved = leasedCachedPath
-        ? await localDownloadToDir(leasedCachedPath, directory, entry.name)
+        ? await localDownloadToDir(leasedCachedPath, directory, fileName)
         : kind === "local"
-          ? await localDownloadToDir(target, directory)
-          : await sftpDownloadToDir(sessionId!, target, directory);
+          ? await localDownloadToDir(target, directory, fileName)
+          : await sftpDownloadToDir(sessionId!, target, directory, fileName);
       showStatus(`Saved to ${saved.local_path}`);
     } catch (error) {
       showStatus(

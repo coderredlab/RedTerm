@@ -42,7 +42,8 @@
   import {
     MAX_SFTP_DOWNLOAD_BYTES,
     MAX_SFTP_READ_BYTES,
-    chooseDownloadDirectory,
+    chooseDownloadSavePath,
+    splitSavePath,
     localDownloadFile,
     localDownloadToDir,
     localReadFile,
@@ -421,17 +422,18 @@
     const sessionId = document.sourceSessionId;
     const cachedPath = boundKind === "ssh" ? document.cachedLocalPath : null;
     if (downloading || (boundKind === "ssh" && !sessionId && !cachedPath)) return;
-    const directory = await chooseDownloadDirectory();
-    if (!directory) return;
+    const saveTarget = await chooseDownloadSavePath(document.name);
+    if (!saveTarget) return;
+    const { directory, fileName } = splitSavePath(saveTarget);
     downloading = true;
     actionError = "";
     try {
       if (cachedPath) {
-        await localDownloadToDir(cachedPath, directory, document.name);
+        await localDownloadToDir(cachedPath, directory, fileName);
       } else if (boundKind === "local") {
-        await localDownloadToDir(boundPath, directory);
+        await localDownloadToDir(boundPath, directory, fileName);
       } else {
-        await sftpDownloadToDir(sessionId!, boundPath, directory);
+        await sftpDownloadToDir(sessionId!, boundPath, directory, fileName);
       }
       downloadedHint = true;
       setTimeout(() => (downloadedHint = false), 1800);

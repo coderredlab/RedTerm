@@ -11,6 +11,7 @@ mock.module("@tauri-apps/plugin-dialog", () => ({
   confirm: mock(async () => false),
   message: mock(async () => undefined),
   open: mock(async () => null),
+  save: mock(async () => null),
 }));
 
 // Static import would evaluate before Bun mock.module registrations, so this test intentionally loads commands after mocks.

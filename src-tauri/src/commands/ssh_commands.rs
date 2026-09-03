@@ -1867,6 +1867,7 @@ pub async fn sftp_download_to_dir(
     session_id: String,
     remote_path: String,
     destination_dir: Option<String>,
+    file_name: Option<String>,
 ) -> Result<SftpDownloadedFile, String> {
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
 
@@ -1880,12 +1881,16 @@ pub async fn sftp_download_to_dir(
     std::fs::create_dir_all(&downloads_dir)
         .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
 
-    let file_name = remote_path
+    let remote_base = remote_path
         .rsplit('/')
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
-    let safe_name = sanitize_file_name(file_name);
+    let requested_name = file_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.trim().is_empty());
+    let safe_name = sanitize_file_name(requested_name.unwrap_or(remote_base));
     let mut claimed = claim_download_destination(&downloads_dir, &safe_name)?;
 
     let total = connection

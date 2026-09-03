@@ -1,7 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { confirm as confirmNative, message as messageNative, open } from "@tauri-apps/plugin-dialog";
+import {
+  confirm as confirmNative,
+  message as messageNative,
+  open,
+  save,
+} from "@tauri-apps/plugin-dialog";
 import type { Update } from "@tauri-apps/plugin-updater";
 import type { TerminalSnapshot } from "$lib/terminal/ansi-parser";
 import type {
@@ -420,12 +425,14 @@ export async function sftpHomeDir(sessionId: string): Promise<string> {
 export async function sftpDownloadToDir(
   sessionId: string,
   remotePath: string,
-  destinationDir?: string | null
+  destinationDir?: string | null,
+  fileName?: string | null
 ): Promise<SftpDownloadedFile> {
   return invoke<SftpDownloadedFile>("sftp_download_to_dir", {
     sessionId,
     remotePath,
     destinationDir: destinationDir ?? null,
+    fileName: fileName ?? null,
   });
 }
 
@@ -474,17 +481,28 @@ export async function localDownloadToDir(
   });
 }
 
-/** Open a native folder picker so the user chooses where a download lands. */
-export async function chooseDownloadDirectory(): Promise<string | null> {
-  const result = await open({
-    directory: true,
-    multiple: false,
-    title: "Choose download folder",
+/** Open a native save dialog pre-filled with the download file name. */
+export async function chooseDownloadSavePath(
+  defaultFileName: string
+): Promise<string | null> {
+  const result = await save({
+    defaultPath: defaultFileName,
+    title: "Save download as",
   });
-  if (Array.isArray(result)) {
-    return result[0] ?? null;
-  }
   return result ?? null;
+}
+
+/** Split a save-dialog result into directory and file name (POSIX and Windows). */
+export function splitSavePath(
+  savePath: string
+): { directory: string; fileName: string } {
+  const separator = savePath.includes("\\") ? "\\" : "/";
+  const index = savePath.lastIndexOf(separator);
+  if (index <= 0) return { directory: savePath, fileName: "" };
+  return {
+    directory: savePath.slice(0, index),
+    fileName: savePath.slice(index + 1),
+  };
 }
 
 export interface DownloadProgressEvent {
