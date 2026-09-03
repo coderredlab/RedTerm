@@ -778,12 +778,6 @@ pub async fn local_download_to_dir(
     if !scoped.is_file() {
         return Err("File not found".to_string());
     }
-    let downloads_dir = app
-        .path()
-        .download_dir()
-        .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?;
-    std::fs::create_dir_all(&downloads_dir)
-        .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
 
     let default_name = download_file_name(&scoped, None);
     let requested = destination_path
@@ -791,8 +785,17 @@ pub async fn local_download_to_dir(
         .filter(|candidate| !candidate.trim().is_empty());
     let destination_path = match requested {
         Some(path) => std::path::PathBuf::from(path),
-        None => downloads_dir.join(&default_name),
+        None => {
+            let downloads_dir = app
+                .path()
+                .download_dir()
+                .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?;
+            std::fs::create_dir_all(&downloads_dir)
+                .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
+            downloads_dir.join(&default_name)
+        }
     };
+
     let Some(parent) = destination_path.parent().map(|parent| parent.to_path_buf()) else {
         return Err("Invalid download destination path".to_string());
     };
