@@ -1875,7 +1875,7 @@ pub async fn sftp_download_to_dir(
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
-    let destination_path = match destination_path.as_deref().map(str::trim) {
+    let destination_path = match destination_path.as_deref().filter(|p| !p.trim().is_empty()) {
         Some(path) if path.is_empty() => {
             return Err("Invalid download destination path".to_string())
         }
