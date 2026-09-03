@@ -18,6 +18,10 @@ const SSH_DATA_CHUNK_BYTES: usize = 64 * 1024;
 const SSH_COMMAND_CHANNEL_CAPACITY: usize = 256;
 const MAX_EXEC_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_SFTP_LIST_ENTRIES: usize = 10_000;
+/// Recursive SFTP delete aborts before deleting anything when a tree exceeds
+/// either bound, so a cyclic or runaway remote tree cannot exhaust memory.
+const MAX_SFTP_DELETE_DIRS: usize = 4_096;
+const MAX_SFTP_DELETE_FILES: usize = 100_000;
 const EXEC_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_COMMAND_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_CHANNEL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -493,18 +497,35 @@ impl SshConnection {
                 .await
                 .map_err(|e| SshError::SessionError(e.to_string()));
         }
-        // Depth-first removal with an explicit stack: pop order records the
-        // directory hierarchy, so a reverse pass removes deepest-first.
-        let mut pending = vec![path.to_string()];
-        let mut dir_order = Vec::new();
-        while let Some(dir) = pending.pop() {
-            dir_order.push(dir.clone());
-            let mut file_children = Vec::new();
+        // Scan the whole tree before deleting anything, so an over-large or
+        // cyclic tree aborts without touching a single file. ReadDir entry
+        // types do not follow symlinks, so a symlinked directory is unlinked
+        // as a file instead of traversed. Known crate limit: russh-sftp 2.4
+        // `read_dir` materializes a whole directory before returning, so the
+        // per-directory count is enforced post hoc — the same exposure the
+        // browse listing already has.
+        let mut files: Vec<String> = Vec::new();
+        let mut dirs: Vec<String> = Vec::new();
+        let mut queue = vec![path.to_string()];
+        while let Some(dir) = queue.pop() {
+            dirs.push(dir.clone());
+            if dirs.len() > MAX_SFTP_DELETE_DIRS {
+                return Err(SshError::SessionError(format!(
+                    "Refusing to delete: directory tree exceeds {MAX_SFTP_DELETE_DIRS} directories"
+                )));
+            }
+            let mut scanned = 0usize;
             for entry in sftp
                 .read_dir(&dir)
                 .await
                 .map_err(|e| SshError::SessionError(e.to_string()))?
             {
+                scanned += 1;
+                if scanned > MAX_SFTP_LIST_ENTRIES {
+                    return Err(SshError::SessionError(format!(
+                        "Refusing to delete: a directory exceeds {MAX_SFTP_LIST_ENTRIES} entries"
+                    )));
+                }
                 let name = entry.file_name();
                 if name == "." || name == ".." {
                     continue;
@@ -515,18 +536,24 @@ impl SshConnection {
                     format!("{dir}/{name}")
                 };
                 if entry.metadata().file_type().is_dir() {
-                    pending.push(child);
+                    queue.push(child);
                 } else {
-                    file_children.push(child);
+                    if files.len() >= MAX_SFTP_DELETE_FILES {
+                        return Err(SshError::SessionError(format!(
+                            "Refusing to delete: directory tree exceeds {MAX_SFTP_DELETE_FILES} files"
+                        )));
+                    }
+                    files.push(child);
                 }
             }
-            for child in file_children {
-                sftp.remove_file(&child)
-                    .await
-                    .map_err(|e| SshError::SessionError(e.to_string()))?;
-            }
         }
-        for dir in dir_order.iter().rev() {
+        for file in &files {
+            sftp.remove_file(file)
+                .await
+                .map_err(|e| SshError::SessionError(e.to_string()))?;
+        }
+        // Reverse discovery order removes deepest directories first.
+        for dir in dirs.iter().rev() {
             sftp.remove_dir(dir)
                 .await
                 .map_err(|e| SshError::SessionError(e.to_string()))?;

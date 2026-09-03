@@ -74,7 +74,7 @@
   const sortedEntries = $derived(entries === null ? null : sortExplorerEntries(entries, sort));
 
   let contextMenu = $state<{ x: number; y: number; entry: SftpDirEntry | null } | null>(null);
-  let deleteTarget = $state<SftpDirEntry | null>(null);
+  let deleteTarget = $state<{ entry: SftpDirEntry; path: string } | null>(null);
   let nameDialog = $state<{ mode: "file" | "folder" } | null>(null);
 
   const menuPosition = $derived.by(() => {
@@ -159,9 +159,13 @@
   }
 
   async function removeEntry() {
-    const entry = deleteTarget;
+    const pending = deleteTarget;
     deleteTarget = null;
-    if (!entry || !canBrowse) return;
+    if (!pending || !canBrowse) return;
+    // The prompt was opened against a specific directory of a specific
+    // session; if either moved on, the shown entry no longer exists.
+    if (pending.path !== path) return;
+    const entry = pending.entry;
     const target = joinPath(path, entry.name);
     try {
       if (kind === "local") await localRemovePath(target);
@@ -236,6 +240,11 @@
 
   $effect(() => {
     // Restart browsing whenever the active session changes, restoring this pane's path.
+    // Pending destructive prompts are bound to the session/path they were opened
+    // against, so a session switch must never leave them confirmable.
+    contextMenu = null;
+    deleteTarget = null;
+    nameDialog = null;
     if (!canBrowse) {
       loadToken += 1;
       entries = null;
@@ -542,7 +551,7 @@
           onclick={() => {
             const entry = contextMenu?.entry ?? null;
             closeContextMenu();
-            deleteTarget = entry;
+            deleteTarget = entry ? { entry, path } : null;
           }}
         >Delete</button>
       {/if}
@@ -561,9 +570,9 @@
   <CloseConfirmationModal
     open={deleteTarget !== null}
     title="Delete"
-    message={deleteTarget !== null ? `Delete "${deleteTarget.name}"?` : ""}
+    message={deleteTarget !== null ? `Delete "${deleteTarget.entry.name}"?` : ""}
     detail={
-      deleteTarget?.is_dir
+      deleteTarget?.entry.is_dir
         ? "Everything inside this folder will also be deleted. This cannot be undone."
         : "This cannot be undone."
     }

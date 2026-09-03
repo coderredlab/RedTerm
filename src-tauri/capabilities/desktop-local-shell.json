@@ -22,6 +22,9 @@
     "allow-local-download-to-dir",
     "allow-preview-cache-acquire",
     "allow-preview-cache-release",
-    "allow-sftp-write-file"
+    "allow-sftp-write-file",
+    "allow-sftp-create-dir",
+    "allow-sftp-create-file",
+    "allow-sftp-remove-path"
   ]
 }

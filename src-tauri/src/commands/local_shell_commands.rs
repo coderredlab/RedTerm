@@ -426,6 +426,13 @@ fn validate_local_entry_name(name: &str) -> Result<(), String> {
 /// (existing) parent to be inside the home directory. Validating the parent
 /// instead of the full path keeps a symlinked parent from escaping home on
 /// create and lets deletes operate on the link itself rather than its target.
+///
+/// Known residual race (same class as the documented download-destination
+/// limitation): a same-uid process renaming the validated parent into a
+/// symlink between this check and the mutation could redirect it. A local
+/// same-uid process is outside the webview threat model these guards exist
+/// for; pinning a parent directory handle (openat on Unix, handles on
+/// Windows) is the recorded hardening task if that ever changes.
 fn ensure_within_home_entry(path: &Path) -> Result<std::path::PathBuf, String> {
     let parent = path
         .parent()
