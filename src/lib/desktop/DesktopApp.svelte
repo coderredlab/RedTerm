@@ -1006,7 +1006,7 @@
               node={tab.layout}
               visible={tab.id === tabsStore.activeTabId}
               interactive={
-                !settingsOpen &&
+                !showDialog &&
                 closePrompt === null &&
                 updateOfferPrompt === null &&
                 updateRestartPrompt === null &&
