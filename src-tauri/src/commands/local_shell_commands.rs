@@ -796,7 +796,9 @@ pub async fn local_download_to_dir(
     let Some(parent) = destination_path.parent().map(|parent| parent.to_path_buf()) else {
         return Err("Invalid download destination path".to_string());
     };
-    let Some(leaf) = destination_path.file_name().map(|name| name.to_string_lossy().to_string())
+    let Some(leaf) = destination_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
     else {
         return Err("Invalid download file name".to_string());
     };

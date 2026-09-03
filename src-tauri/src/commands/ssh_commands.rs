@@ -1870,14 +1870,15 @@ pub async fn sftp_download_to_dir(
 ) -> Result<SftpDownloadedFile, String> {
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
 
-
     let remote_base = remote_path
         .rsplit('/')
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
     let destination_path = match destination_path.as_deref().map(str::trim) {
-        Some(path) if path.is_empty() => return Err("Invalid download destination path".to_string()),
+        Some(path) if path.is_empty() => {
+            return Err("Invalid download destination path".to_string())
+        }
         Some(path) => PathBuf::from(path),
         None => {
             let dir = app
@@ -1893,7 +1894,9 @@ pub async fn sftp_download_to_dir(
     let Some(parent) = destination_path.parent().map(|parent| parent.to_path_buf()) else {
         return Err("Invalid download destination path".to_string());
     };
-    let Some(leaf) = destination_path.file_name().map(|name| name.to_string_lossy().to_string())
+    let Some(leaf) = destination_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
     else {
         return Err("Invalid download file name".to_string());
     };
