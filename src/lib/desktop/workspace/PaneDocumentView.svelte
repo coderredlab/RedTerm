@@ -43,6 +43,7 @@
     MAX_SFTP_DOWNLOAD_BYTES,
     MAX_SFTP_READ_BYTES,
     chooseDownloadSavePath,
+    sanitizeDownloadDialogFileName,
     localDownloadFile,
     localDownloadToDir,
     localReadFile,
@@ -421,7 +422,7 @@
     const sessionId = document.sourceSessionId;
     const cachedPath = boundKind === "ssh" ? document.cachedLocalPath : null;
     if (downloading || (boundKind === "ssh" && !sessionId && !cachedPath)) return;
-    const saveTarget = await chooseDownloadSavePath(document.name);
+    const saveTarget = await chooseDownloadSavePath(sanitizeDownloadDialogFileName(document.name));
     if (!saveTarget) return;
     downloading = true;
     actionError = "";

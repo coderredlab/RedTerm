@@ -788,8 +788,7 @@ pub async fn local_download_to_dir(
     let default_name = download_file_name(&scoped, None);
     let requested = destination_path
         .as_deref()
-        .map(str::trim)
-        .filter(|candidate| !candidate.is_empty());
+        .filter(|candidate| !candidate.trim().is_empty());
     let destination_path = match requested {
         Some(path) => std::path::PathBuf::from(path),
         None => downloads_dir.join(&default_name),

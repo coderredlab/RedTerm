@@ -488,6 +488,24 @@ export async function chooseDownloadSavePath(
   return result ?? null;
 }
 
+/** Sanitize a remote/server-supplied file name before using it as a save-dialog default. */
+export function sanitizeDownloadDialogFileName(name: string): string {
+  const windows = navigator.userAgent.includes("Windows");
+  let safe = [...name]
+    .filter((ch) => {
+      const code = ch.codePointAt(0)!;
+      if (code < 0x20 || code === 0x7f || ch === "/") return false;
+      return !windows || !"\\:*?\"<>|".includes(ch);
+    })
+    .join("");
+  if (windows) {
+    safe = safe.replace(/[ .]+$/u, "");
+    const stem = safe.split(".", 1)[0]?.toUpperCase();
+    if (stem && /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/u.test(stem)) safe = `_${safe}`;
+  }
+  return !safe || safe === "." || safe === ".." ? "download" : safe;
+}
+
 export interface DownloadProgressEvent {
   path: string;
   transferred: number;

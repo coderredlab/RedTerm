@@ -1870,26 +1870,26 @@ pub async fn sftp_download_to_dir(
 ) -> Result<SftpDownloadedFile, String> {
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
 
-    let downloads_dir = app
-        .path()
-        .download_dir()
-        .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?;
-    std::fs::create_dir_all(&downloads_dir)
-        .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
 
     let remote_base = remote_path
         .rsplit('/')
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
-    let requested = destination_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|candidate| !candidate.is_empty());
-    let destination_path = match requested {
+    let destination_path = match destination_path.as_deref().map(str::trim) {
+        Some(path) if path.is_empty() => return Err("Invalid download destination path".to_string()),
         Some(path) => PathBuf::from(path),
-        None => downloads_dir.join(remote_base),
+        None => {
+            let dir = app
+                .path()
+                .download_dir()
+                .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?;
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
+            dir.join(sanitize_file_name(remote_base))
+        }
     };
+
     let Some(parent) = destination_path.parent().map(|parent| parent.to_path_buf()) else {
         return Err("Invalid download destination path".to_string());
     };

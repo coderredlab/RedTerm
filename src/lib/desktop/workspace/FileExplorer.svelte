@@ -3,6 +3,7 @@
   import {
     listenDownloadProgress,
     chooseDownloadSavePath,
+    sanitizeDownloadDialogFileName,
     localDownloadToDir,
     localHomeDir,
     localListDir,
@@ -200,7 +201,7 @@
     // Open a save dialog pre-filled with the file name before transferring.
     let saveTarget: string | null = null;
     try {
-      saveTarget = await chooseDownloadSavePath(entry.name);
+      saveTarget = await chooseDownloadSavePath(sanitizeDownloadDialogFileName(entry.name));
     } catch {
       saveTarget = null;
     }
