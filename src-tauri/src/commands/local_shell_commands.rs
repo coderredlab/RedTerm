@@ -8,9 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 
 use super::ssh_commands::{
-    claim_download_destination, ensure_local_sftp_preview_dir, make_download_progress_emitter,
-    resolve_sftp_preview_cache_file, sanitize_file_name, SftpDownloadedFile, SftpFileContent,
-    MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
+    append_cleanup_error, claim_download_destination, ensure_local_sftp_preview_dir,
+    make_download_progress_emitter, resolve_sftp_preview_cache_file, sanitize_file_name,
+    SftpDownloadedFile, SftpFileContent, MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
 };
 use crate::ssh::SftpDirEntry;
 
@@ -636,16 +636,13 @@ pub async fn local_write_file(
 }
 async fn copy_with_progress(
     from: &Path,
-    to: &Path,
+    destination_file: &mut tokio::fs::File,
     max_bytes: u64,
     on_progress: &(dyn Fn(u64) + Send + Sync),
 ) -> Result<u64, String> {
     let mut source = tokio::fs::File::open(from)
         .await
         .map_err(|e| format!("Failed to read file: {}", e))?;
-    let mut destination = tokio::fs::File::create(to)
-        .await
-        .map_err(|e| format!("Failed to write file: {}", e))?;
     let mut buffer = vec![0_u8; 256 * 1024];
     let mut total: u64 = 0;
     loop {
@@ -660,13 +657,13 @@ async fn copy_with_progress(
         if total > max_bytes {
             return Err(format!("Download exceeded the {} byte limit", max_bytes));
         }
-        destination
+        destination_file
             .write_all(&buffer[..read])
             .await
             .map_err(|e| format!("Failed to write file: {}", e))?;
         on_progress(total);
     }
-    destination
+    destination_file
         .flush()
         .await
         .map_err(|e| format!("Failed to write file: {}", e))?;
@@ -675,26 +672,21 @@ async fn copy_with_progress(
 
 async fn local_download(
     app: &AppHandle,
-    source: std::path::PathBuf,
-    destination: std::path::PathBuf,
+    source: &Path,
+    destination_file: &mut tokio::fs::File,
+    destination_path: &Path,
     remote_path_label: String,
     max_bytes: u64,
 ) -> Result<SftpDownloadedFile, String> {
-    let total = tokio::fs::metadata(&source)
+    let total = tokio::fs::metadata(source)
         .await
         .ok()
         .map(|metadata| metadata.len());
     let on_progress = make_download_progress_emitter(app.clone(), remote_path_label.clone(), total);
-    let size = match copy_with_progress(&source, &destination, max_bytes, &on_progress).await {
-        Ok(size) => size,
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&destination).await;
-            return Err(error);
-        }
-    };
+    let size = copy_with_progress(source, destination_file, max_bytes, &on_progress).await?;
     Ok(SftpDownloadedFile {
         remote_path: remote_path_label,
-        local_path: destination.to_string_lossy().to_string(),
+        local_path: destination_path.to_string_lossy().to_string(),
         size,
     })
 }
@@ -727,14 +719,27 @@ pub async fn local_download_file(
     ));
     let scoped_label = path.clone();
 
-    let downloaded = local_download(
+    let mut part_file = tokio::fs::File::create(&part_path)
+        .await
+        .map_err(|error| format!("Failed to create preview download file: {error}"))?;
+    let downloaded = match local_download(
         &app,
-        scoped.clone(),
-        part_path.clone(),
+        &scoped,
+        &mut part_file,
+        &part_path,
         scoped_label,
         MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
     )
-    .await?;
+    .await
+    {
+        Ok(downloaded) => downloaded,
+        Err(error) => {
+            drop(part_file);
+            let _ = tokio::fs::remove_file(&part_path).await;
+            return Err(error);
+        }
+    };
+    drop(part_file);
     if let Err(error) = tokio::fs::rename(&part_path, &destination).await {
         let _ = tokio::fs::remove_file(&part_path).await;
         return Err(format!("Failed to finalize preview download: {}", error));
@@ -785,10 +790,21 @@ pub async fn local_download_to_dir(
         .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
 
     let file_name = download_file_name(&scoped, file_name.as_deref());
-    let destination = claim_download_destination(&downloads_dir, &sanitize_file_name(&file_name))?;
+    let safe_name = sanitize_file_name(&file_name);
+    let mut claimed = claim_download_destination(&downloads_dir, &safe_name)?;
     let scoped_label = path.clone();
+    let destination_path = claimed.path().to_path_buf();
 
-    local_download(&app, scoped, destination, scoped_label, u64::MAX).await
+    match local_download(&app, &scoped, claimed.file_mut(), &destination_path, scoped_label, u64::MAX).await {
+        Ok(mut downloaded) => {
+            downloaded.local_path = claimed.commit().to_string_lossy().into_owned();
+            Ok(downloaded)
+        }
+        Err(error) => {
+            let cleanup = claimed.discard();
+            Err(append_cleanup_error(error, cleanup))
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

@@ -5,6 +5,7 @@
   import { CanvasRenderer } from './CanvasRenderer';
   import {
     MAX_CLIPBOARD_IMAGE_BYTES,
+    confirmAction,
     getKeyboardLayoutMap,
     listenKeyboardLayoutChanged,
     sshConnect,
@@ -48,6 +49,7 @@
     resolveTerminalClipboardImagePath,
     writeTerminalClipboardText,
   } from "./terminal-clipboard";
+  import { Osc52SessionGate } from "./terminal-osc52";
   import { SshOutputDecoder } from "./ssh-output-decoder";
   import { cleanupFailedSessionAttach } from "./session-attach-cleanup";
   import { AutomaticResponseBuffer } from "./automatic-response-buffer";
@@ -229,6 +231,12 @@
   let reconnecting = false;
   let disconnectRequested = false;
   let connectionGeneration = 0;
+
+  // Remote servers must earn clipboard access (OSC 52) once per connection
+  // generation; local shells are trusted. The gate keys approval to the
+  // generation, so every reconnect requires fresh approval without any
+  // explicit reset call site.
+  const osc52SessionGate = new Osc52SessionGate();
   let lastProcessedSeq = 0;
   let startupScriptDispatcher: StartupScriptDispatcher | null = null;
   const REPLAY_SLICE_BUDGET_MS = 8;
@@ -2369,10 +2377,28 @@
       requestRedraw();
       return;
     }
-    if (!interactive) return;
-    void writeSystemClipboardText(event.text).catch((error) => {
-      console.error("[Terminal] OSC 52 clipboard write failed:", error);
-    });
+    if (event.type === "clipboard") {
+      if (!interactive) return;
+      const generation = connectionGeneration;
+      void osc52SessionGate
+        .resolve(
+          event.text,
+          kind === "local",
+          generation,
+          () =>
+            confirmAction(
+              "The remote server requested to write to your clipboard (OSC 52). Allow clipboard writes from this server while this session is open?"
+            )
+        )
+        .then((text) => {
+          if (text === null) return;
+          if (destroyed || !interactive || generation !== connectionGeneration) return;
+          return writeSystemClipboardText(text);
+        })
+        .catch((error) => {
+          console.error("[Terminal] OSC 52 clipboard write failed:", error);
+        });
+    }
   }
 
   function resetParser(notifyTitleReset = true) {

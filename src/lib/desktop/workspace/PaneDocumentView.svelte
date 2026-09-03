@@ -32,6 +32,9 @@
   import { basicSetup } from "codemirror";
   import DOMPurify from "dompurify";
   import { marked } from "marked";
+  import { classifyMarkdownLink } from "./markdown-links";
+  import { confirmAction } from "$lib/tauri/commands";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import { onDestroy, untrack } from "svelte";
   import { settingsStore } from "$lib/stores/settings.svelte";
   import { tabsStore, type PaneDocument } from "$lib/stores/tabs.svelte";
@@ -82,6 +85,41 @@
   let downloadedHint = $state(false);
   let loadToken = 0;
   let markdownToken = 0;
+  let markdownLinkOpening = false;
+
+  /** Middle-click / auxclick must not navigate the addressless webview either. */
+  function blockMarkdownAuxiliaryClick(event: MouseEvent) {
+    const clicked = event.target instanceof Element ? event.target.closest("a") : null;
+    if (!clicked) return;
+    const href = clicked.getAttribute("href");
+    if (href === null || href.startsWith("#")) return;
+    event.preventDefault();
+  }
+
+  async function handleMarkdownLinkClick(event: MouseEvent) {
+    const clicked = event.target instanceof Element ? event.target.closest("a") : null;
+    if (!clicked) return;
+    const href = clicked.getAttribute("href");
+    if (href === null) return;
+    const decision = classifyMarkdownLink(href);
+    if (decision.action === "anchor") return;
+    event.preventDefault();
+    if (decision.action !== "open-external" || markdownLinkOpening) return;
+    markdownLinkOpening = true;
+    try {
+      if (
+        await confirmAction(
+          `Open this link in your default browser?\n\n${decision.url}\n\nThe link came from a remote document.`
+        )
+      ) {
+        await openUrl(decision.url);
+      }
+    } catch (error) {
+      console.error("[PaneDocumentView] failed to open markdown link:", error);
+    } finally {
+      markdownLinkOpening = false;
+    }
+  }
   let editorToken = 0;
   let leasedMediaPath = "";
   let recoverableCachedMedia = false;
@@ -680,8 +718,9 @@
     {:else if editable && (fileKind !== "markdown" || mode === "edit")}
       <div class="editor-host" bind:this={editorHost}></div>
     {:else if fileKind === "markdown" && mode === "preview"}
+      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -- click delegation guards the focusable links inside; keyboard activation of an <a href> reaches the same handler -->
       <!-- eslint-disable-next-line svelte/no-at-html-tags -- content is sanitized with DOMPurify -->
-      <article class="markdown-body">{@html renderedMarkdown}</article>
+      <article class="markdown-body" onclick={handleMarkdownLinkClick} onauxclick={blockMarkdownAuxiliaryClick}>{@html renderedMarkdown}</article>
     {:else if fileKind === "pdf" && mediaUrl}
       <iframe class="pdf-preview" src={mediaUrl} title={document.name} onerror={recoverCachedMedia}></iframe>
     {:else if fileKind === "image" && mediaUrl}
@@ -695,7 +734,6 @@
       </div>
     {:else}
       <div class="document-status">
-        <strong>No inline preview is available.</strong>
         <span>You can download this file instead.</span>
       </div>
     {/if}

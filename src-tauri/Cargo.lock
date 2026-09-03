@@ -4513,6 +4513,7 @@ dependencies = [
  "gdk",
  "image",
  "keyring",
+ "libc",
  "log",
  "parking_lot",
  "portable-pty",

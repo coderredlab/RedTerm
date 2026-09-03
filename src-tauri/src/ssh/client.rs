@@ -614,7 +614,7 @@ impl SshConnection {
     pub async fn download_file_via_sftp(
         &self,
         remote_path: &str,
-        destination: &Path,
+        destination_file: &mut tokio::fs::File,
         max_bytes: u64,
         on_progress: Option<&(dyn Fn(u64) + Send + Sync)>,
     ) -> Result<u64, SshError> {
@@ -639,10 +639,9 @@ impl SshConnection {
             .open(remote_path)
             .await
             .map_err(|e| SshError::SessionError(e.to_string()))?;
-        let mut local_file = tokio::fs::File::create(destination)
-            .await
-            .map_err(|e| SshError::SessionError(e.to_string()))?;
 
+        // Write through the pre-claimed exclusive handle. Re-opening the path
+        // here would let a symlink swap redirect the write after the claim.
         let mut buffer = vec![0_u8; 256 * 1024];
         let mut total: u64 = 0;
         loop {
@@ -660,7 +659,7 @@ impl SshConnection {
                     max_bytes
                 )));
             }
-            local_file
+            destination_file
                 .write_all(&buffer[..read])
                 .await
                 .map_err(|e| SshError::SessionError(e.to_string()))?;
@@ -668,7 +667,7 @@ impl SshConnection {
                 on_progress(total.min(total_size.unwrap_or(total)));
             }
         }
-        local_file
+        destination_file
             .flush()
             .await
             .map_err(|e| SshError::SessionError(e.to_string()))?;
@@ -680,6 +679,7 @@ impl SshConnection {
 
         Ok(total)
     }
+
 }
 
 enum ChannelCommand {

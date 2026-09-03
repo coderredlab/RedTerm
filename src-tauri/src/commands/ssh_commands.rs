@@ -10,6 +10,18 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
+#[cfg(windows)]
+use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::AsRawHandle};
+#[cfg(windows)]
+use windows::Win32::{
+    Foundation::{GENERIC_WRITE, HANDLE},
+    Storage::FileSystem::{
+        GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
+        FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfo, VOLUME_NAME_DOS,
+    },
+};
 
 use crate::ssh::known_hosts::{
     check_host_key_result, delete_known_host as delete_known_host_entry,
@@ -1446,10 +1458,13 @@ pub async fn sftp_download_file(
         .await
         .unwrap_or(None);
     let on_progress = make_download_progress_emitter(app.clone(), remote_path.clone(), total);
+    let mut part_file = tokio::fs::File::create(&part_path)
+        .await
+        .map_err(|error| format!("Failed to create preview download file: {error}"))?;
     let size = match connection
         .download_file_via_sftp(
             &remote_path,
-            &part_path,
+            &mut part_file,
             MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
             Some(&on_progress),
         )
@@ -1457,11 +1472,13 @@ pub async fn sftp_download_file(
     {
         Ok(size) => size,
         Err(error) => {
+            drop(part_file);
             let _ = tokio::fs::remove_file(&part_path).await;
             return Err(error.to_string());
         }
     };
 
+    drop(part_file);
     if let Err(error) = tokio::fs::rename(&part_path, &destination).await {
         let _ = tokio::fs::remove_file(&part_path).await;
         return Err(format!("Failed to finalize preview download: {}", error));
@@ -1562,11 +1579,9 @@ pub(crate) fn sanitize_file_name(file_name: &str) -> String {
 /// Collision-safe destination candidates: the plain name first, then
 /// "name (1)", "name (2)", … — claim_download_destination stops at the
 /// first free name and errors out after the retry budget is exhausted.
-pub(crate) fn unique_download_candidates(
-    dir: &Path,
+pub(crate) fn unique_download_candidate_names(
     file_name: &str,
-) -> impl Iterator<Item = PathBuf> {
-    let dir = dir.to_path_buf();
+) -> impl Iterator<Item = String> {
     let stem = Path::new(file_name)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -1575,27 +1590,263 @@ pub(crate) fn unique_download_candidates(
         .extension()
         .map(|s| format!(".{}", s.to_string_lossy()))
         .unwrap_or_default();
-    let base = dir.join(file_name);
-    std::iter::once(base).chain(
-        (1..1000u32).map(move |index| dir.join(format!("{} ({}){}", stem, index, extension))),
+    std::iter::once(file_name.to_string()).chain(
+        (1..1000u32).map(move |index| format!("{} ({}){}", stem, index, extension)),
     )
 }
 
-/// Claim a destination atomically (create_new) so concurrent downloads and
-/// symlink swaps cannot clobber or redirect an existing file.
-pub(crate) fn claim_download_destination(dir: &Path, file_name: &str) -> Result<PathBuf, String> {
-    for candidate in unique_download_candidates(dir, file_name) {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(_) => return Ok(candidate),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("Failed to prepare download destination: {}", error)),
+/// Platform-neutral claimed destination: owns the exclusive write handle and
+/// every handle needed to clean itself up safely if the download fails. A
+/// concurrently re-pointed ancestor directory cannot redirect the download
+/// or its cleanup to an unrelated file.
+pub(crate) struct ClaimedDownloadDestination {
+    path: PathBuf,
+    file: tokio::fs::File,
+    cleanup: ClaimedCleanup,
+    armed: bool,
+}
+
+impl ClaimedDownloadDestination {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn file_mut(&mut self) -> &mut tokio::fs::File {
+        &mut self.file
+    }
+
+    /// Remove the claimed file through pinned handles. Never falls back to
+    /// pathname removal, so a re-pointed ancestor cannot make this delete an
+    /// unrelated file.
+    pub fn discard(&mut self) -> Result<(), String> {
+        let result = match &self.cleanup {
+            #[cfg(unix)]
+            ClaimedCleanup::Unix(cleanup) => unlink_candidate_at(cleanup)
+                .map_err(|e| format!("Failed to remove partial download: {e}")),
+            #[cfg(windows)]
+            ClaimedCleanup::Windows => mark_delete_by_handle(&self.file)
+                .map_err(|e| format!("Failed to mark partial download for deletion: {e}")),
+        };
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+
+    /// Disarm cleanup and hand over the final destination path.
+    pub fn commit(&mut self) -> PathBuf {
+        self.armed = false;
+        std::mem::take(&mut self.path)
+    }
+}
+
+impl Drop for ClaimedDownloadDestination {
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            let _ = self.discard();
         }
     }
-    Err("No available download file name".to_string())
+}
+
+pub(crate) fn append_cleanup_error(error: String, cleanup: Result<(), String>) -> String {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup) => format!("{error}; {cleanup}"),
+    }
+}
+
+#[cfg(unix)]
+enum ClaimedCleanup {
+    Unix(UnixClaimCleanup),
+}
+
+#[cfg(windows)]
+enum ClaimedCleanup {
+    Windows,
+}
+
+#[cfg(unix)]
+struct UnixClaimCleanup {
+    dir: std::fs::File,
+    name: std::ffi::CString,
+}
+
+#[cfg(unix)]
+fn open_download_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "download directory contains NUL"))?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_candidate_at(dir: &std::fs::File, name: &std::ffi::CString) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn unlink_candidate_at(cleanup: &UnixClaimCleanup) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let rc = unsafe { libc::unlinkat(cleanup.dir.as_raw_fd(), cleanup.name.as_ptr(), 0) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn final_path_by_handle(file: &impl AsRawHandle) -> std::io::Result<PathBuf> {
+    let mut buffer = vec![0_u16; 512];
+    loop {
+        let written = unsafe {
+            GetFinalPathNameByHandleW(
+                HANDLE(file.as_raw_handle()),
+                &mut buffer,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if written == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if written < buffer.len() {
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written])));
+        }
+        buffer.resize(written.saturating_add(1), 0);
+    }
+}
+
+#[cfg(windows)]
+fn mark_delete_by_handle(file: &impl AsRawHandle) -> std::io::Result<()> {
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(file.as_raw_handle()),
+            FileDispositionInfo,
+            std::ptr::from_ref(&info).cast(),
+            std::mem::size_of_val(&info) as u32,
+        )
+    }
+    .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(windows)]
+fn open_windows_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(dir)
+}
+
+#[cfg(windows)]
+fn open_windows_candidate(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .access_mode((GENERIC_WRITE.0 | DELETE.0) as u32)
+        .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn same_parent(file_real: &Path, canonical_dir: &Path) -> bool {
+    file_real
+        .parent()
+        .is_some_and(|parent| parent.components().eq(canonical_dir.components()))
+}
+
+#[cfg(unix)]
+pub(crate) fn claim_download_destination(
+    dir: &Path,
+    file_name: &str,
+) -> Result<ClaimedDownloadDestination, String> {
+    let dir_file = open_download_dir(dir)
+        .map_err(|e| format!("Failed to open download directory: {e}"))?;
+    for name in unique_download_candidate_names(file_name) {
+        let name_c = match std::ffi::CString::new(name.as_bytes().to_vec()) {
+            Ok(name_c) => name_c,
+            Err(_) => continue,
+        };
+        match open_candidate_at(&dir_file, &name_c) {
+            Ok(file) => {
+                return Ok(ClaimedDownloadDestination {
+                    path: dir.join(&name),
+                    file: tokio::fs::File::from_std(file),
+                    cleanup: ClaimedCleanup::Unix(UnixClaimCleanup { dir: dir_file, name: name_c }),
+                    armed: true,
+                });
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => continue,
+            Err(e) => return Err(format!("Failed to prepare download destination: {e}")),
+        }
+    }
+    Err("No available download file name".into())
+}
+
+#[cfg(windows)]
+pub(crate) fn claim_download_destination(
+    dir: &Path,
+    file_name: &str,
+) -> Result<ClaimedDownloadDestination, String> {
+    let dir_file = open_windows_dir(dir)
+        .map_err(|e| format!("Failed to open download directory: {e}"))?;
+    let canonical_dir = final_path_by_handle(&dir_file)
+        .map_err(|e| format!("Failed to resolve download directory: {e}"))?;
+    for name in unique_download_candidate_names(file_name) {
+        let path = dir.join(&name);
+        match open_windows_candidate(&path) {
+            Ok(file) => {
+                let verification_error = match final_path_by_handle(&file) {
+                    Ok(real) if same_parent(&real, &canonical_dir) => None,
+                    Ok(_) => Some("Download destination changed during claim".to_string()),
+                    Err(e) => Some(format!("Failed to verify download destination: {e}")),
+                };
+                if let Some(mut error) = verification_error {
+                    if let Err(cleanup) = mark_delete_by_handle(&file) {
+                        error.push_str(&format!("; cleanup failed: {cleanup}"));
+                    }
+                    drop(file);
+                    return Err(error);
+                }
+                return Ok(ClaimedDownloadDestination {
+                    path,
+                    file: tokio::fs::File::from_std(file),
+                    cleanup: ClaimedCleanup::Windows,
+                    armed: true,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Failed to prepare download destination: {e}")),
+        }
+    }
+    Err("No available download file name".into())
 }
 
 /// Explicit user download: stream the remote file into a user-chosen
@@ -1627,10 +1878,7 @@ pub async fn sftp_download_to_dir(
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
     let safe_name = sanitize_file_name(file_name);
-    let destination = claim_download_destination(&downloads_dir, &safe_name)?;
-    if !destination.starts_with(&downloads_dir) {
-        return Err("Invalid download destination path".to_string());
-    }
+    let mut claimed = claim_download_destination(&downloads_dir, &safe_name)?;
 
     let total = connection
         .file_size_via_sftp(&remote_path)
@@ -1638,15 +1886,16 @@ pub async fn sftp_download_to_dir(
         .unwrap_or(None);
     let on_progress = make_download_progress_emitter(app.clone(), remote_path.clone(), total);
     let size = match connection
-        .download_file_via_sftp(&remote_path, &destination, u64::MAX, Some(&on_progress))
+        .download_file_via_sftp(&remote_path, claimed.file_mut(), u64::MAX, Some(&on_progress))
         .await
     {
         Ok(size) => size,
         Err(error) => {
-            let _ = std::fs::remove_file(&destination);
-            return Err(error.to_string());
+            let cleanup = claimed.discard();
+            return Err(append_cleanup_error(error.to_string(), cleanup));
         }
     };
+    let destination = claimed.commit();
 
     Ok(SftpDownloadedFile {
         remote_path,
@@ -1654,7 +1903,6 @@ pub async fn sftp_download_to_dir(
         size,
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
