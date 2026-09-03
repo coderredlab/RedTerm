@@ -795,7 +795,16 @@ pub async fn local_download_to_dir(
     let scoped_label = path.clone();
     let destination_path = claimed.path().to_path_buf();
 
-    match local_download(&app, &scoped, claimed.file_mut(), &destination_path, scoped_label, u64::MAX).await {
+    match local_download(
+        &app,
+        &scoped,
+        claimed.file_mut(),
+        &destination_path,
+        scoped_label,
+        u64::MAX,
+    )
+    .await
+    {
         Ok(mut downloaded) => {
             downloaded.local_path = claimed.commit().to_string_lossy().into_owned();
             Ok(downloaded)

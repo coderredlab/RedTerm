@@ -679,7 +679,6 @@ impl SshConnection {
 
         Ok(total)
     }
-
 }
 
 enum ChannelCommand {

@@ -1,6 +1,8 @@
 use russh::client::{self, Config};
 use russh::keys::PublicKeyOrCertificate;
 use std::collections::{HashMap, VecDeque};
+#[cfg(windows)]
+use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -11,15 +13,13 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
 #[cfg(windows)]
-use std::os::windows::{ffi::OsStringExt, fs::OpenOptionsExt, io::AsRawHandle};
-#[cfg(windows)]
 use windows::Win32::{
     Foundation::{GENERIC_WRITE, HANDLE},
     Storage::FileSystem::{
-        GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
-        FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileDispositionInfo, VOLUME_NAME_DOS,
+        FileDispositionInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
+        FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, VOLUME_NAME_DOS,
+        GETFINALPATHNAMEBYHANDLE_FLAGS,
     },
 };
 
@@ -1579,9 +1579,7 @@ pub(crate) fn sanitize_file_name(file_name: &str) -> String {
 /// Collision-safe destination candidates: the plain name first, then
 /// "name (1)", "name (2)", … — claim_download_destination stops at the
 /// first free name and errors out after the retry budget is exhausted.
-pub(crate) fn unique_download_candidate_names(
-    file_name: &str,
-) -> impl Iterator<Item = String> {
+pub(crate) fn unique_download_candidate_names(file_name: &str) -> impl Iterator<Item = String> {
     let stem = Path::new(file_name)
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -1590,9 +1588,8 @@ pub(crate) fn unique_download_candidate_names(
         .extension()
         .map(|s| format!(".{}", s.to_string_lossy()))
         .unwrap_or_default();
-    std::iter::once(file_name.to_string()).chain(
-        (1..1000u32).map(move |index| format!("{} ({}){}", stem, index, extension)),
-    )
+    std::iter::once(file_name.to_string())
+        .chain((1..1000u32).map(move |index| format!("{} ({}){}", stem, index, extension)))
 }
 
 /// Platform-neutral claimed destination: owns the exclusive write handle and
@@ -1675,8 +1672,12 @@ struct UnixClaimCleanup {
 #[cfg(unix)]
 fn open_download_dir(dir: &Path) -> std::io::Result<std::fs::File> {
     use std::os::fd::FromRawFd;
-    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "download directory contains NUL"))?;
+    let path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "download directory contains NUL",
+        )
+    })?;
     let fd = unsafe {
         libc::open(
             path.as_ptr(),
@@ -1690,7 +1691,10 @@ fn open_download_dir(dir: &Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(unix)]
-fn open_candidate_at(dir: &std::fs::File, name: &std::ffi::CString) -> std::io::Result<std::fs::File> {
+fn open_candidate_at(
+    dir: &std::fs::File,
+    name: &std::ffi::CString,
+) -> std::io::Result<std::fs::File> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let fd = unsafe {
         libc::openat(
@@ -1729,14 +1733,16 @@ fn final_path_by_handle(file: &impl AsRawHandle) -> std::io::Result<PathBuf> {
             GetFinalPathNameByHandleW(
                 HANDLE(file.as_raw_handle()),
                 &mut buffer,
-                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+                GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0),
             )
         } as usize;
         if written == 0 {
             return Err(std::io::Error::last_os_error());
         }
         if written < buffer.len() {
-            return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..written])));
+            return Ok(PathBuf::from(std::ffi::OsString::from_wide(
+                &buffer[..written],
+            )));
         }
         buffer.resize(written.saturating_add(1), 0);
     }
@@ -1787,8 +1793,8 @@ pub(crate) fn claim_download_destination(
     dir: &Path,
     file_name: &str,
 ) -> Result<ClaimedDownloadDestination, String> {
-    let dir_file = open_download_dir(dir)
-        .map_err(|e| format!("Failed to open download directory: {e}"))?;
+    let dir_file =
+        open_download_dir(dir).map_err(|e| format!("Failed to open download directory: {e}"))?;
     for name in unique_download_candidate_names(file_name) {
         let name_c = match std::ffi::CString::new(name.as_bytes().to_vec()) {
             Ok(name_c) => name_c,
@@ -1799,7 +1805,10 @@ pub(crate) fn claim_download_destination(
                 return Ok(ClaimedDownloadDestination {
                     path: dir.join(&name),
                     file: tokio::fs::File::from_std(file),
-                    cleanup: ClaimedCleanup::Unix(UnixClaimCleanup { dir: dir_file, name: name_c }),
+                    cleanup: ClaimedCleanup::Unix(UnixClaimCleanup {
+                        dir: dir_file,
+                        name: name_c,
+                    }),
                     armed: true,
                 });
             }
@@ -1815,8 +1824,8 @@ pub(crate) fn claim_download_destination(
     dir: &Path,
     file_name: &str,
 ) -> Result<ClaimedDownloadDestination, String> {
-    let dir_file = open_windows_dir(dir)
-        .map_err(|e| format!("Failed to open download directory: {e}"))?;
+    let dir_file =
+        open_windows_dir(dir).map_err(|e| format!("Failed to open download directory: {e}"))?;
     let canonical_dir = final_path_by_handle(&dir_file)
         .map_err(|e| format!("Failed to resolve download directory: {e}"))?;
     for name in unique_download_candidate_names(file_name) {
@@ -1886,7 +1895,12 @@ pub async fn sftp_download_to_dir(
         .unwrap_or(None);
     let on_progress = make_download_progress_emitter(app.clone(), remote_path.clone(), total);
     let size = match connection
-        .download_file_via_sftp(&remote_path, claimed.file_mut(), u64::MAX, Some(&on_progress))
+        .download_file_via_sftp(
+            &remote_path,
+            claimed.file_mut(),
+            u64::MAX,
+            Some(&on_progress),
+        )
         .await
     {
         Ok(size) => size,
