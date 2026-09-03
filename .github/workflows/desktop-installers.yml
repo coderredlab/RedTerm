@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - "desktop-v*"
+      - "v*"
 
 permissions:
   contents: read
@@ -107,7 +107,7 @@ jobs:
 
   release:
     name: Publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/desktop-v')
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -132,7 +132,7 @@ jobs:
       - name: Validate desktop release tag
         run: |
           VERSION=$(bun -e 'const config = await Bun.file("src-tauri/tauri.desktop.conf.json").json(); process.stdout.write(config.version)')
-          if [[ "$GITHUB_REF_NAME" != "desktop-v$VERSION" ]]; then
+          if [[ "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
             echo "Tag $GITHUB_REF_NAME does not match desktop version $VERSION"
             exit 1
           fi
@@ -195,7 +195,7 @@ jobs:
           done
 
           VERSION="$VERSION" \
-          BASE_URL="https://github.com/coderredlab/RedTerm/releases/download/desktop-v${VERSION}" \
+          BASE_URL="https://github.com/coderredlab/RedTerm/releases/download/v${VERSION}" \
           APPIMAGE_NAME="$(basename "$APPIMAGE")" \
           DEB_NAME="$(basename "$DEB")" \
           TAR_GZ_NAME="$(basename "$TAR_GZ")" \
