@@ -20,6 +20,8 @@ function createDesktopUpdate() {
   let phase = $state<DesktopUpdatePhase>({ kind: "idle" });
   /** App-level restart gate (session/document checks) registered by the desktop shell. */
   let restartHandler: (() => Promise<void>) | null = null;
+  /** App-level install confirmation modal; falls back to the native dialog when unset. */
+  let installConfirmHandler: (() => Promise<boolean>) | null = null;
 
   return {
     get phase() {
@@ -27,6 +29,9 @@ function createDesktopUpdate() {
     },
     setRestartHandler(handler: () => Promise<void>) {
       restartHandler = handler;
+    },
+    setInstallConfirmHandler(handler: () => Promise<boolean>) {
+      installConfirmHandler = handler;
     },
     /** Probe for an update without surfacing errors; returns the pending update if any. */
     async checkQuietly(): Promise<DesktopUpdateInfo | null> {
@@ -60,14 +65,13 @@ function createDesktopUpdate() {
     ): Promise<void> {
       if (phase.kind !== "available") return;
       const update = phase.update;
-      if (
-        navigator.userAgent.includes("Windows") &&
-        !options.platformWarningAcknowledged &&
-        !(await confirmAction(
-          "The update installer will close RedTerm to finish installing. Active terminal sessions will be disconnected. Continue?"
-        ))
-      ) {
-        return;
+      if (navigator.userAgent.includes("Windows") && !options.platformWarningAcknowledged) {
+        const confirmed = installConfirmHandler
+          ? await installConfirmHandler()
+          : await confirmAction(
+              "The update installer will close RedTerm to finish installing. Active terminal sessions will be disconnected. Continue?"
+            );
+        if (!confirmed) return;
       }
       phase = { kind: "downloading", downloaded: 0, total: null };
       try {

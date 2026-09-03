@@ -217,6 +217,15 @@
     desktopUpdateStore.setRestartHandler(() =>
       confirmAndCloseApplication(relaunchDesktopApp, RESTART_PROMPTS)
     );
+    desktopUpdateStore.setInstallConfirmHandler(() =>
+      requestClosePrompt({
+        title: "Install the update now?",
+        message: "The update installer will close RedTerm to finish installing.",
+        detail: "Active terminal sessions will be disconnected.",
+        confirmLabel: "Download and install",
+        destructive: false,
+      })
+    );
     const updateCheckTimer = setTimeout(() => {
       void autoCheckForUpdates();
     }, UPDATE_CHECK_DELAY_MS);
