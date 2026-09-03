@@ -425,14 +425,12 @@ export async function sftpHomeDir(sessionId: string): Promise<string> {
 export async function sftpDownloadToDir(
   sessionId: string,
   remotePath: string,
-  destinationDir?: string | null,
-  fileName?: string | null
+  destinationPath?: string | null
 ): Promise<SftpDownloadedFile> {
   return invoke<SftpDownloadedFile>("sftp_download_to_dir", {
     sessionId,
     remotePath,
-    destinationDir: destinationDir ?? null,
-    fileName: fileName ?? null,
+    destinationPath: destinationPath ?? null,
   });
 }
 
@@ -471,13 +469,11 @@ export async function localDownloadFile(path: string): Promise<SftpDownloadedFil
 
 export async function localDownloadToDir(
   path: string,
-  destinationDir?: string | null,
-  fileName?: string | null
+  destinationPath?: string | null
 ): Promise<SftpDownloadedFile> {
   return invoke<SftpDownloadedFile>("local_download_to_dir", {
     path,
-    destinationDir: destinationDir ?? null,
-    fileName: fileName ?? null,
+    destinationPath: destinationPath ?? null,
   });
 }
 
@@ -490,19 +486,6 @@ export async function chooseDownloadSavePath(
     title: "Save download as",
   });
   return result ?? null;
-}
-
-/** Split a save-dialog result into directory and file name (POSIX and Windows). */
-export function splitSavePath(
-  savePath: string
-): { directory: string; fileName: string } {
-  const separator = savePath.includes("\\") ? "\\" : "/";
-  const index = savePath.lastIndexOf(separator);
-  if (index <= 0) return { directory: savePath, fileName: "" };
-  return {
-    directory: savePath.slice(0, index),
-    fileName: savePath.slice(index + 1),
-  };
 }
 
 export interface DownloadProgressEvent {

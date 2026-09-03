@@ -3,7 +3,6 @@
   import {
     listenDownloadProgress,
     chooseDownloadSavePath,
-    splitSavePath,
     localDownloadToDir,
     localHomeDir,
     localListDir,
@@ -206,7 +205,6 @@
       saveTarget = null;
     }
     if (!saveTarget) return;
-    const { directory, fileName } = splitSavePath(saveTarget);
     if (downloadingPaths.includes(target)) return;
     downloadingPaths = [...downloadingPaths, target];
     downloads[target] = { transferred: 0, total: entry.size || null };
@@ -218,10 +216,10 @@
         leasedCachedPath = cachedLocalPath;
       }
       const saved = leasedCachedPath
-        ? await localDownloadToDir(leasedCachedPath, directory, fileName)
+        ? await localDownloadToDir(leasedCachedPath, saveTarget)
         : kind === "local"
-          ? await localDownloadToDir(target, directory, fileName)
-          : await sftpDownloadToDir(sessionId!, target, directory, fileName);
+          ? await localDownloadToDir(target, saveTarget)
+          : await sftpDownloadToDir(sessionId!, target, saveTarget);
       showStatus(`Saved to ${saved.local_path}`);
     } catch (error) {
       showStatus(

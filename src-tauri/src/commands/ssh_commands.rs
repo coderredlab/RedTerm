@@ -1866,18 +1866,14 @@ pub async fn sftp_download_to_dir(
     session_manager: State<'_, Arc<SessionManager>>,
     session_id: String,
     remote_path: String,
-    destination_dir: Option<String>,
-    file_name: Option<String>,
+    destination_path: Option<String>,
 ) -> Result<SftpDownloadedFile, String> {
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
 
-    let downloads_dir = match destination_dir.as_deref().map(str::trim) {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => app
-            .path()
-            .download_dir()
-            .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?,
-    };
+    let downloads_dir = app
+        .path()
+        .download_dir()
+        .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?;
     std::fs::create_dir_all(&downloads_dir)
         .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
 
@@ -1886,12 +1882,23 @@ pub async fn sftp_download_to_dir(
         .next()
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
-    let requested_name = file_name
+    let requested = destination_path
         .as_deref()
         .map(str::trim)
-        .filter(|name| !name.trim().is_empty());
-    let safe_name = sanitize_file_name(requested_name.unwrap_or(remote_base));
-    let mut claimed = claim_download_destination(&downloads_dir, &safe_name)?;
+        .filter(|candidate| !candidate.is_empty());
+    let destination_path = match requested {
+        Some(path) => PathBuf::from(path),
+        None => downloads_dir.join(remote_base),
+    };
+    let Some(parent) = destination_path.parent().map(|parent| parent.to_path_buf()) else {
+        return Err("Invalid download destination path".to_string());
+    };
+    let Some(leaf) = destination_path.file_name().map(|name| name.to_string_lossy().to_string())
+    else {
+        return Err("Invalid download file name".to_string());
+    };
+    let safe_name = sanitize_file_name(&leaf);
+    let mut claimed = claim_download_destination(&parent, &safe_name)?;
 
     let total = connection
         .file_size_via_sftp(&remote_path)

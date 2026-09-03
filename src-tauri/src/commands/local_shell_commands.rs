@@ -767,8 +767,7 @@ fn download_file_name(source: &Path, requested: Option<&str>) -> String {
 pub async fn local_download_to_dir(
     app: AppHandle,
     path: String,
-    destination_dir: Option<String>,
-    file_name: Option<String>,
+    destination_path: Option<String>,
 ) -> Result<SftpDownloadedFile, String> {
     let source = Path::new(&path);
     let scoped = match ensure_within_home(source) {
@@ -779,21 +778,32 @@ pub async fn local_download_to_dir(
     if !scoped.is_file() {
         return Err("File not found".to_string());
     }
-    let downloads_dir = match destination_dir.as_deref().map(str::trim) {
-        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
-        _ => app
-            .path()
-            .download_dir()
-            .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?,
-    };
+    let downloads_dir = app
+        .path()
+        .download_dir()
+        .map_err(|e| format!("Failed to resolve Downloads directory: {}", e))?;
     std::fs::create_dir_all(&downloads_dir)
         .map_err(|e| format!("Failed to prepare download directory: {}", e))?;
 
-    let file_name = download_file_name(&scoped, file_name.as_deref());
-    let safe_name = sanitize_file_name(&file_name);
-    let mut claimed = claim_download_destination(&downloads_dir, &safe_name)?;
+    let default_name = download_file_name(&scoped, None);
+    let requested = destination_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty());
+    let destination_path = match requested {
+        Some(path) => std::path::PathBuf::from(path),
+        None => downloads_dir.join(&default_name),
+    };
+    let Some(parent) = destination_path.parent().map(|parent| parent.to_path_buf()) else {
+        return Err("Invalid download destination path".to_string());
+    };
+    let Some(leaf) = destination_path.file_name().map(|name| name.to_string_lossy().to_string())
+    else {
+        return Err("Invalid download file name".to_string());
+    };
+    let safe_name = sanitize_file_name(&leaf);
+    let mut claimed = claim_download_destination(&parent, &safe_name)?;
     let scoped_label = path.clone();
-    let destination_path = claimed.path().to_path_buf();
 
     match local_download(
         &app,

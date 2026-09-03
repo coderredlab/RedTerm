@@ -43,7 +43,6 @@
     MAX_SFTP_DOWNLOAD_BYTES,
     MAX_SFTP_READ_BYTES,
     chooseDownloadSavePath,
-    splitSavePath,
     localDownloadFile,
     localDownloadToDir,
     localReadFile,
@@ -424,16 +423,15 @@
     if (downloading || (boundKind === "ssh" && !sessionId && !cachedPath)) return;
     const saveTarget = await chooseDownloadSavePath(document.name);
     if (!saveTarget) return;
-    const { directory, fileName } = splitSavePath(saveTarget);
     downloading = true;
     actionError = "";
     try {
       if (cachedPath) {
-        await localDownloadToDir(cachedPath, directory, fileName);
+        await localDownloadToDir(cachedPath, saveTarget);
       } else if (boundKind === "local") {
-        await localDownloadToDir(boundPath, directory, fileName);
+        await localDownloadToDir(boundPath, saveTarget);
       } else {
-        await sftpDownloadToDir(sessionId!, boundPath, directory, fileName);
+        await sftpDownloadToDir(sessionId!, boundPath, saveTarget);
       }
       downloadedHint = true;
       setTimeout(() => (downloadedHint = false), 1800);
