@@ -1007,6 +1007,7 @@
               visible={tab.id === tabsStore.activeTabId}
               interactive={
                 !showDialog &&
+                !settingsOpen &&
                 closePrompt === null &&
                 updateOfferPrompt === null &&
                 updateRestartPrompt === null &&
