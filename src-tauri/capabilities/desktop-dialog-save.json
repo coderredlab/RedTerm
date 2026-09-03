@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop-dialog-save",
+  "description": "Desktop-only native save dialog for choosing download destinations",
+  "windows": ["main"],
+  "platforms": ["linux", "macOS", "windows"],
+  "permissions": ["dialog:allow-save"]
+}

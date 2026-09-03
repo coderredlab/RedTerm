@@ -1543,33 +1543,37 @@ pub async fn sftp_home_dir(
         .map_err(|e| e.to_string())
 }
 
+#[cfg(windows)]
 const WINDOWS_RESERVED_NAMES: [&str; 22] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
-/// Strip characters that are invalid or dangerous in destination file names
-/// (separators, controls, Windows-reserved) so a remote name can never
-/// traverse or form an NTFS alternate data stream.
+/// Strip characters that are invalid in destination file names on the
+/// current host (separators, controls; on Windows also NTFS ADS characters
+/// and reserved device names) so a remote or dialog-provided name can never
+/// traverse. POSIX-legal characters such as ':' are preserved off-Windows.
 pub(crate) fn sanitize_file_name(file_name: &str) -> String {
     let safe_name: String = file_name
         .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !std::path::is_separator(*c)
-                // ':' would form an NTFS alternate data stream; harmless to
-                // drop everywhere.
-                && !matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*')
-        })
+        .filter(|c| !c.is_control() && !std::path::is_separator(*c))
         .collect();
-    let safe_name = if safe_name.is_empty() {
-        "download".to_string()
-    } else {
-        safe_name
+    #[cfg(windows)]
+    let safe_name: String = {
+        let stripped: String = safe_name
+            .chars()
+            // ':' would form an NTFS alternate data stream.
+            .filter(|c| !matches!(c, ':' | '<' | '>' | '"' | '|' | '?' | '*'))
+            .collect();
+        let stem = stripped.split('.').next().unwrap_or("").to_uppercase();
+        if WINDOWS_RESERVED_NAMES.contains(&stem.as_str()) {
+            format!("file-{}", stripped)
+        } else {
+            stripped
+        }
     };
-    let stem = safe_name.split('.').next().unwrap_or("").to_uppercase();
-    if WINDOWS_RESERVED_NAMES.contains(&stem.as_str()) {
-        format!("file-{}", safe_name)
+    if safe_name.is_empty() {
+        "download".to_string()
     } else {
         safe_name
     }
@@ -2201,5 +2205,26 @@ mod tests {
         prune_stale_sftp_previews(&dir);
         assert!(!path.exists());
         std::fs::remove_dir_all(dir).expect("preview test dir should be removed");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn sanitizer_preserves_posix_legal_characters_off_windows() {
+        assert_eq!(sanitize_file_name("a:b.txt"), "a:b.txt");
+        assert_eq!(sanitize_file_name("report*final?"), "report*final?");
+        assert_eq!(sanitize_file_name("con"), "con");
+        assert_eq!(sanitize_file_name("bad/name"), "badname");
+        assert_eq!(sanitize_file_name("a\u{7f}b"), "ab");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sanitizer_strips_windows_invalid_characters_and_reserved_names() {
+        assert_eq!(sanitize_file_name("a:b.txt"), "ab.txt");
+        assert_eq!(sanitize_file_name("report*final?"), "reportfinal");
+        assert_eq!(sanitize_file_name("con"), "file-con");
+        assert_eq!(sanitize_file_name("con.txt"), "file-con.txt");
+        assert_eq!(sanitize_file_name("bad/name"), "badname");
+        assert_eq!(sanitize_file_name(":"), "download");
     }
 }

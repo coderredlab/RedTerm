@@ -4,6 +4,7 @@
   import ConnectionDialog from "$lib/components/ConnectionDialog.svelte";
   import { tabsStore, type Pane, type PaneNode } from "$lib/stores/tabs.svelte";
   import { connectionsStore } from "$lib/stores/connections.svelte";
+  import { terminalModalGate } from "$lib/stores/terminal-modal-gate.svelte";
   import {
     confirmAction,
     exitApplication,
@@ -174,7 +175,7 @@
     updateOfferPrompt = null;
     if (!update) return;
     void (async () => {
-      await desktopUpdateStore.install();
+      await desktopUpdateStore.install({ platformWarningAcknowledged: true });
       if (desktopUpdateStore.phase.kind === "ready") {
         updateRestartPrompt = update;
       }
@@ -918,6 +919,7 @@
         closePrompt === null &&
         updateOfferPrompt === null &&
         updateRestartPrompt === null &&
+        !terminalModalGate.open &&
         sessionsReconciled,
       terminalTarget
     );

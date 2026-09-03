@@ -3,6 +3,7 @@ import {
   installDesktopUpdate,
   relaunchDesktopApp,
   checkDesktopUpdate,
+  confirmAction,
   type DesktopUpdateInfo,
 } from "$lib/tauri/commands";
 
@@ -54,9 +55,20 @@ function createDesktopUpdate() {
         };
       }
     },
-    async install(): Promise<void> {
+    async install(
+      options: { platformWarningAcknowledged?: boolean } = {}
+    ): Promise<void> {
       if (phase.kind !== "available") return;
       const update = phase.update;
+      if (
+        navigator.userAgent.includes("Windows") &&
+        !options.platformWarningAcknowledged &&
+        !(await confirmAction(
+          "The update installer will close RedTerm to finish installing. Active terminal sessions will be disconnected. Continue?"
+        ))
+      ) {
+        return;
+      }
       phase = { kind: "downloading", downloaded: 0, total: null };
       try {
         await installDesktopUpdate((downloaded, total) => {

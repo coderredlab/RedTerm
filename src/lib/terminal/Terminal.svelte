@@ -38,6 +38,7 @@
   import { modifiersStore } from "$lib/stores/modifiers.svelte";
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import { terminalModesStore } from "$lib/stores/terminal-modes.svelte";
+  import { terminalModalGate } from "$lib/stores/terminal-modal-gate.svelte";
   import { ctrlKey, altKey, getArrowKeyCode } from "$lib/utils/key-mapper";
   import { settingsStore, terminalFontStack } from "$lib/stores/settings.svelte";
   import { createStartupScriptDispatcher, type StartupScriptDispatcher } from "./startup-script";
@@ -179,6 +180,7 @@
   let osc52ApprovalResolver: ((decision: boolean) => void) | null = null;
 
   function requestOsc52Approval(): Promise<boolean> {
+    terminalModalGate.enter();
     osc52ApprovalOpen = true;
     return new Promise((resolve) => {
       osc52ApprovalResolver = resolve;
@@ -190,6 +192,7 @@
     const resolver = osc52ApprovalResolver;
     osc52ApprovalResolver = null;
     osc52ApprovalOpen = false;
+    terminalModalGate.exit();
     resolver(decision);
   }
   let keyPassphraseRetryCache = createKeyPassphraseRetryCache();
@@ -3516,6 +3519,7 @@
     connectionGeneration++;
     if (hostKeyPromptResolver) resolveHostKeyPrompt("cancel");
     if (keyPassphrasePromptResolver) resolveKeyPassphrasePrompt(null);
+    if (osc52ApprovalResolver) settleOsc52Approval(false);
     destroyed = true;
     parserGeneration++;
     const activeParser = parser;
