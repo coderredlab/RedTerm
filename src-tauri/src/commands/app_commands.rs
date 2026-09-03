@@ -8,6 +8,11 @@ pub fn exit_application(app: tauri::AppHandle) {
     crate::EXIT_CONFIRMED.store(true, Ordering::Release);
     app.exit(0);
 }
+#[tauri::command]
+pub fn restart_application(app: tauri::AppHandle) {
+    crate::EXIT_CONFIRMED.store(true, Ordering::Release);
+    app.restart();
+}
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn load_system_font_families() -> Result<Vec<String>, String> {

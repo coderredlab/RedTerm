@@ -9,6 +9,7 @@
     exitApplication,
     listenAppExitRequested,
     localShellDisconnect,
+    relaunchDesktopApp,
     showWarning,
     sshDisconnect,
     type SavedConnection,
@@ -163,20 +164,19 @@
     );
     if (!installAccepted) return;
     await desktopUpdateStore.install();
-    if (desktopUpdateStore.phase.kind !== "ready") return;
-    const restartAccepted = await confirmAction(
-      "The update has been installed. Restart RedTerm now? Active sessions will be closed."
-    );
-    if (restartAccepted) await desktopUpdateStore.restart();
+    if (desktopUpdateStore.phase.kind === "ready") await desktopUpdateStore.restart();
   }
+
   onMount(() => {
     void reconcilePersistedSessions();
     void retryPendingManagedKeyCleanup();
 
+    desktopUpdateStore.setRestartHandler(() =>
+      confirmAndCloseApplication(relaunchDesktopApp, RESTART_PROMPTS)
+    );
     const updateCheckTimer = setTimeout(() => {
       void autoCheckForUpdates();
     }, UPDATE_CHECK_DELAY_MS);
-
     let disposed = false;
     let unlistenAppExitRequested: (() => void) | undefined;
     let unlistenCloseRequested: (() => void) | undefined;
@@ -364,11 +364,29 @@
     resolve(confirmed);
   }
 
-  async function confirmAndCloseApplication(closeApplication: () => Promise<void>) {
+  interface RestartClosePrompts {
+    closeTitle: string;
+    closeMessage: string;
+    closeDetail: string;
+    closeConfirmLabel: string;
+  }
+
+  const RESTART_PROMPTS: RestartClosePrompts = {
+    closeTitle: "Restart RedTerm?",
+    closeMessage:
+      "RedTerm will restart to apply the update. Your active terminal sessions will be disconnected.",
+    closeDetail: "The update finishes installing when RedTerm restarts.",
+    closeConfirmLabel: "Restart RedTerm",
+  };
+
+  async function confirmAndCloseApplication(
+    closeApplication: () => Promise<void>,
+    prompts?: RestartClosePrompts
+  ) {
     if (windowCloseConfirmed || windowCloseConfirmationPending) return;
     windowCloseConfirmationPending = true;
     try {
-      if (!await confirmCloseApplication()) return;
+      if (!await confirmCloseApplication(prompts)) return;
       windowCloseConfirmed = true;
       await closeApplication();
     } catch (error) {
@@ -379,7 +397,7 @@
     }
   }
 
-  async function confirmCloseApplication(): Promise<boolean> {
+  async function confirmCloseApplication(prompts?: RestartClosePrompts): Promise<boolean> {
     const savingDocuments = tabsStore.tabs.flatMap((tab) =>
       tab.documents.filter((document) => document.saveState === "saving")
     );
@@ -396,10 +414,10 @@
     );
     if (dirtyDocuments.length === 0) {
       return requestClosePrompt({
-        title: "Close RedTerm?",
-        message: "Your active terminal sessions will be disconnected.",
-        detail: "You can reconnect when you open RedTerm again.",
-        confirmLabel: "Close RedTerm",
+        title: prompts?.closeTitle ?? "Close RedTerm?",
+        message: prompts?.closeMessage ?? "Your active terminal sessions will be disconnected.",
+        detail: prompts?.closeDetail ?? "You can reconnect when you open RedTerm again.",
+        confirmLabel: prompts?.closeConfirmLabel ?? "Close RedTerm",
         destructive: false,
       });
     }

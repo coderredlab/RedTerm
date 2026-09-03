@@ -6,7 +6,6 @@
   "platforms": ["linux", "macOS", "windows"],
   "permissions": [
     "updater:default",
-    "updater:allow-download-and-install",
-    "process:allow-restart"
+    "allow-restart-application"
   ]
 }

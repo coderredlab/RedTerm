@@ -2,8 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { confirm as confirmNative, message as messageNative, open } from "@tauri-apps/plugin-dialog";
-import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
+import type { Update } from "@tauri-apps/plugin-updater";
 import type { TerminalSnapshot } from "$lib/terminal/ansi-parser";
 import type {
   VoiceInputEvent,
@@ -28,6 +27,8 @@ export interface DesktopUpdateInfo {
 let pendingDesktopUpdate: Update | null = null;
 
 export async function checkDesktopUpdate(): Promise<DesktopUpdateInfo | null> {
+  // Lazy import: keeps the updater module out of test module graphs that mock core.
+  const { check } = await import("@tauri-apps/plugin-updater");
   pendingDesktopUpdate = await check();
   return pendingDesktopUpdate
     ? { version: pendingDesktopUpdate.version, notes: pendingDesktopUpdate.body ?? null }
@@ -55,10 +56,11 @@ export async function installDesktopUpdate(
   pendingDesktopUpdate = null;
 }
 
-/** Restart the app so an installed desktop update takes effect. */
+/** Restart through a custom command so the macOS exit-confirmation gate is bypassed cleanly. */
 export async function relaunchDesktopApp(): Promise<void> {
-  await relaunch();
+  await invoke("restart_application");
 }
+
 
 export async function listSystemFonts(): Promise<string[]> {
   return invoke<string[]>("list_system_fonts");

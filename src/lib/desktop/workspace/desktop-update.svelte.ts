@@ -1,6 +1,7 @@
 /** Desktop-only in-app update flow backed by the Tauri updater plugin. */
 import {
   checkDesktopUpdate,
+  confirmAction,
   installDesktopUpdate,
   relaunchDesktopApp,
   type DesktopUpdateInfo,
@@ -17,14 +18,19 @@ export type DesktopUpdatePhase =
 
 function createDesktopUpdate() {
   let phase = $state<DesktopUpdatePhase>({ kind: "idle" });
+  /** App-level restart gate (session/document checks) registered by the desktop shell. */
+  let restartHandler: (() => Promise<void>) | null = null;
 
   return {
     get phase() {
       return phase;
     },
+    setRestartHandler(handler: () => Promise<void>) {
+      restartHandler = handler;
+    },
     /** Probe for an update without surfacing errors; returns the pending update if any. */
     async checkQuietly(): Promise<DesktopUpdateInfo | null> {
-      if (phase.kind === "checking" || phase.kind === "downloading") return null;
+      if (phase.kind !== "idle") return null;
       phase = { kind: "checking" };
       try {
         const update = await checkDesktopUpdate();
@@ -52,6 +58,14 @@ function createDesktopUpdate() {
     async install(): Promise<void> {
       if (phase.kind !== "available") return;
       const update = phase.update;
+      if (
+        navigator.userAgent.includes("Windows") &&
+        !(await confirmAction(
+          "The update installer will close RedTerm to finish installing. Active terminal sessions will be disconnected. Continue?"
+        ))
+      ) {
+        return;
+      }
       phase = { kind: "downloading", downloaded: 0, total: null };
       try {
         await installDesktopUpdate((downloaded, total) => {
@@ -66,6 +80,10 @@ function createDesktopUpdate() {
       }
     },
     async restart(): Promise<void> {
+      if (restartHandler) {
+        await restartHandler();
+        return;
+      }
       await relaunchDesktopApp();
     },
   };

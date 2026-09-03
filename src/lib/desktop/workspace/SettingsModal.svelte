@@ -523,8 +523,8 @@
                 role="progressbar"
                 aria-label="Downloading update"
                 aria-valuemin="0"
-                aria-valuemax="100"
-                aria-valuenow={updateProgressPercent}
+                aria-valuemax={updatePhase.total ? 100 : undefined}
+                aria-valuenow={updatePhase.total ? updateProgressPercent : undefined}
               >
                 <div
                   class="update-progress-fill"
