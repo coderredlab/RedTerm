@@ -1,7 +1,14 @@
 /** Desktop-only layout preferences, persisted separately from app settings. */
+import {
+  DEFAULT_EXPLORER_SORT,
+  normalizeExplorerSort,
+  type ExplorerSort,
+} from "./explorer-sort";
+
 export interface DesktopPrefs {
   sidebarCollapsed: boolean;
   sidebarWidth: number;
+  explorerSort: ExplorerSort;
 }
 
 const STORAGE_KEY = "redterm.desktop.v1";
@@ -19,18 +26,21 @@ function clampWidth(width: number): number {
 
 function loadPrefs(): DesktopPrefs {
   if (!canUseStorage()) {
-    return { sidebarCollapsed: false, sidebarWidth: 280 };
+    return { sidebarCollapsed: false, sidebarWidth: 280, explorerSort: DEFAULT_EXPLORER_SORT };
   }
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { sidebarCollapsed: false, sidebarWidth: 280 };
+    if (!raw) {
+      return { sidebarCollapsed: false, sidebarWidth: 280, explorerSort: DEFAULT_EXPLORER_SORT };
+    }
     const parsed = JSON.parse(raw) as Partial<DesktopPrefs>;
     return {
       sidebarCollapsed: parsed.sidebarCollapsed === true,
       sidebarWidth: clampWidth(parsed.sidebarWidth as number),
+      explorerSort: normalizeExplorerSort(parsed.explorerSort),
     };
   } catch {
-    return { sidebarCollapsed: false, sidebarWidth: 280 };
+    return { sidebarCollapsed: false, sidebarWidth: 280, explorerSort: DEFAULT_EXPLORER_SORT };
   }
 }
 
@@ -66,6 +76,16 @@ function createDesktopPrefs() {
       const clamped = clampWidth(width);
       if (clamped === prefs.sidebarWidth) return;
       prefs = { ...prefs, sidebarWidth: clamped };
+      schedulePersist(prefs);
+    },
+    setExplorerSort(sort: ExplorerSort) {
+      if (
+        prefs.explorerSort.key === sort.key &&
+        prefs.explorerSort.direction === sort.direction
+      ) {
+        return;
+      }
+      prefs = { ...prefs, explorerSort: sort };
       schedulePersist(prefs);
     },
     /** Write any debounced change immediately (pagehide teardown). */

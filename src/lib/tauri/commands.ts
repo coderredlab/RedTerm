@@ -422,6 +422,18 @@ export async function sftpHomeDir(sessionId: string): Promise<string> {
   return invoke<string>("sftp_home_dir", { sessionId });
 }
 
+export async function sftpCreateDir(sessionId: string, path: string): Promise<void> {
+  return invoke<void>("sftp_create_dir", { sessionId, path });
+}
+
+export async function sftpCreateFile(sessionId: string, path: string): Promise<void> {
+  return invoke<void>("sftp_create_file", { sessionId, path });
+}
+
+export async function sftpRemovePath(sessionId: string, path: string): Promise<void> {
+  return invoke<void>("sftp_remove_path", { sessionId, path });
+}
+
 export async function sftpDownloadToDir(
   sessionId: string,
   remotePath: string,
@@ -436,6 +448,18 @@ export async function sftpDownloadToDir(
 
 export async function localHomeDir(): Promise<string> {
   return invoke<string>("local_home_dir");
+}
+
+export async function localCreateDir(path: string): Promise<void> {
+  return invoke<void>("local_create_dir", { path });
+}
+
+export async function localCreateFile(path: string): Promise<void> {
+  return invoke<void>("local_create_file", { path });
+}
+
+export async function localRemovePath(path: string): Promise<void> {
+  return invoke<void>("local_remove_path", { path });
 }
 
 export async function localListDir(path: string): Promise<SftpDirEntry[]> {

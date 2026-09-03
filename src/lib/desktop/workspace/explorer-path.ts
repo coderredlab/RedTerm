@@ -26,6 +26,18 @@ export function joinPath(dir: string, name: string): string {
   return `${dir.replace(/\/+$/, "")}/${name}`;
 }
 
+/** Reject names the create flow cannot accept on any platform. */
+export function isValidExplorerEntryName(name: string): boolean {
+  return (
+    name.length > 0 &&
+    name !== "." &&
+    name !== ".." &&
+    !name.includes("/") &&
+    !name.includes("\\") &&
+    !name.includes("\0")
+  );
+}
+
 export function breadcrumbSegments(
   current: string
 ): Array<{ label: string; path: string }> {

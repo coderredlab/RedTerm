@@ -4,14 +4,20 @@
     listenDownloadProgress,
     chooseDownloadSavePath,
     sanitizeDownloadDialogFileName,
+    localCreateDir,
+    localCreateFile,
     localDownloadToDir,
     localHomeDir,
     localListDir,
+    localRemovePath,
     previewCacheAcquire,
     previewCacheRelease,
+    sftpCreateDir,
+    sftpCreateFile,
     sftpDownloadToDir,
     sftpHomeDir,
     sftpListDir,
+    sftpRemovePath,
     type SftpDirEntry,
   } from "$lib/tauri/commands";
   import {
@@ -22,9 +28,14 @@
   import {
     breadcrumbSegments,
     isRootPath,
+    isValidExplorerEntryName,
     joinPath,
     parentPath,
   } from "./explorer-path";
+  import { sortExplorerEntries } from "./explorer-sort";
+  import { desktopPrefsStore } from "./desktop-prefs.svelte";
+  import CloseConfirmationModal from "./CloseConfirmationModal.svelte";
+  import ExplorerNameDialog from "./ExplorerNameDialog.svelte";
 
   interface Props {
     kind: "ssh" | "local" | null;
@@ -56,10 +67,112 @@
   let downloads = $state<Record<string, { transferred: number; total: number | null }>>({});
   let breadcrumbViewport: HTMLDivElement | undefined;
   let destroyed = false;
-
   const canBrowse = $derived(kind === "local" || Boolean(sessionId));
   // Local browsing is scoped to home: no navigation above it.
   const atLocalHome = $derived(kind === "local" && homePath !== null && path === homePath);
+  const sort = $derived(desktopPrefsStore.prefs.explorerSort);
+  const sortedEntries = $derived(entries === null ? null : sortExplorerEntries(entries, sort));
+
+  let contextMenu = $state<{ x: number; y: number; entry: SftpDirEntry | null } | null>(null);
+  let deleteTarget = $state<SftpDirEntry | null>(null);
+  let nameDialog = $state<{ mode: "file" | "folder" } | null>(null);
+
+  const menuPosition = $derived.by(() => {
+    if (contextMenu === null) return null;
+    return {
+      left: Math.max(4, Math.min(contextMenu.x, window.innerWidth - 172)),
+      top: Math.max(4, Math.min(contextMenu.y, window.innerHeight - 120)),
+    };
+  });
+
+  $effect(() => {
+    if (contextMenu === null) return;
+    const close = () => (contextMenu = null);
+    const onKeydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("resize", close);
+    window.addEventListener("keydown", onKeydown);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("resize", close);
+      window.removeEventListener("keydown", onKeydown);
+    };
+  });
+
+  function toggleSort(key: "name" | "date") {
+    const direction =
+      sort.key === key
+        ? sort.direction === "asc"
+          ? "desc"
+          : "asc"
+        : key === "date"
+          ? "desc"
+          : "asc";
+    desktopPrefsStore.setExplorerSort({ key, direction });
+  }
+
+  function openEntryContextMenu(event: MouseEvent, entry: SftpDirEntry) {
+    event.preventDefault();
+    event.stopPropagation();
+    contextMenu = { x: event.clientX, y: event.clientY, entry };
+  }
+
+  function openBackgroundContextMenu(event: MouseEvent) {
+    event.preventDefault();
+    contextMenu = { x: event.clientX, y: event.clientY, entry: null };
+  }
+
+  function startCreate(mode: "file" | "folder") {
+    closeContextMenu();
+    nameDialog = { mode };
+  }
+
+  function closeContextMenu() {
+    contextMenu = null;
+  }
+
+  async function createEntry(mode: "file" | "folder", name: string) {
+    nameDialog = null;
+    if (!canBrowse) return;
+    if (!isValidExplorerEntryName(name)) {
+      showStatus("That name cannot be used.");
+      return;
+    }
+    const target = joinPath(path, name);
+    try {
+      if (kind === "local") {
+        if (mode === "folder") await localCreateDir(target);
+        else await localCreateFile(target);
+      } else if (mode === "folder") {
+        await sftpCreateDir(sessionId!, target);
+      } else {
+        await sftpCreateFile(sessionId!, target);
+      }
+      showStatus(`Created ${name}`);
+    } catch (error) {
+      showStatus(`Create failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    await navigate(path);
+  }
+
+  async function removeEntry() {
+    const entry = deleteTarget;
+    deleteTarget = null;
+    if (!entry || !canBrowse) return;
+    const target = joinPath(path, entry.name);
+    try {
+      if (kind === "local") await localRemovePath(target);
+      else await sftpRemovePath(sessionId!, target);
+      showStatus(`Deleted ${entry.name}`);
+    } catch (error) {
+      showStatus(`Delete failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    await navigate(path);
+  }
 
   onDestroy(() => {
     destroyed = true;
@@ -285,6 +398,24 @@
     >⟳</button>
   </div>
 
+  <div class="sort-bar" role="group" aria-label="Sort entries">
+    <button
+      class="sort-btn"
+      class:active={sort.key === "name"}
+      title="Sort by name"
+      onclick={() => toggleSort("name")}
+    >
+      Name{sort.key === "name" ? (sort.direction === "asc" ? " ↑" : " ↓") : ""}
+    </button>
+    <button
+      class="sort-btn"
+      class:active={sort.key === "date"}
+      title="Sort by date"
+      onclick={() => toggleSort("date")}
+    >
+      Date{sort.key === "date" ? (sort.direction === "asc" ? " ↑" : " ↓") : ""}
+    </button>
+  </div>
   {#if statusMessage}
     <div class="explorer-toast" role="status">{statusMessage}</div>
   {/if}
@@ -311,7 +442,7 @@
     </div>
   {/each}
 
-  <div class="entry-list">
+  <div class="entry-list" role="list" oncontextmenu={openBackgroundContextMenu}>
     {#if !canBrowse}
       <div class="explorer-status">Connect to a server to browse files.</div>
     {:else if loading}
@@ -328,8 +459,13 @@
           <span class="entry-name">..</span>
         </button>
       {/if}
-      {#each entries as entry (entry.name)}
-        <div class="entry" class:dir={entry.is_dir}>
+      {#each sortedEntries as entry (entry.name)}
+        <div
+          class="entry"
+          class:dir={entry.is_dir}
+          role="listitem"
+          oncontextmenu={(event) => openEntryContextMenu(event, entry)}
+        >
           <button
             class="entry-main"
             aria-label={entry.name}
@@ -377,6 +513,65 @@
       {/each}
     {/if}
   </div>
+
+  {#if contextMenu !== null && menuPosition !== null}
+    <div
+      class="entry-context-menu"
+      role="menu"
+      style:left="{menuPosition.left}px"
+      style:top="{menuPosition.top}px"
+    >
+      {#if contextMenu.entry !== null && !contextMenu.entry.is_dir && !downloadingPaths.includes(joinPath(path, contextMenu.entry.name))}
+        <button
+          type="button"
+          role="menuitem"
+          onclick={() => {
+            const entry = contextMenu?.entry ?? null;
+            closeContextMenu();
+            if (entry) void downloadEntry(entry);
+          }}
+        >Download</button>
+      {/if}
+      <button type="button" role="menuitem" onclick={() => startCreate("file")}>New file</button>
+      <button type="button" role="menuitem" onclick={() => startCreate("folder")}>New folder</button>
+      {#if contextMenu.entry !== null}
+        <button
+          type="button"
+          role="menuitem"
+          class="danger"
+          onclick={() => {
+            const entry = contextMenu?.entry ?? null;
+            closeContextMenu();
+            deleteTarget = entry;
+          }}
+        >Delete</button>
+      {/if}
+    </div>
+  {/if}
+
+  <ExplorerNameDialog
+    open={nameDialog !== null}
+    title={nameDialog?.mode === "folder" ? "New folder" : "New file"}
+    label="Name"
+    confirmLabel={nameDialog?.mode === "folder" ? "Create folder" : "Create file"}
+    onCancel={() => (nameDialog = null)}
+    onConfirm={(value) => void createEntry(nameDialog?.mode ?? "file", value)}
+  />
+
+  <CloseConfirmationModal
+    open={deleteTarget !== null}
+    title="Delete"
+    message={deleteTarget !== null ? `Delete "${deleteTarget.name}"?` : ""}
+    detail={
+      deleteTarget?.is_dir
+        ? "Everything inside this folder will also be deleted. This cannot be undone."
+        : "This cannot be undone."
+    }
+    confirmLabel="Delete"
+    destructive={true}
+    onCancel={() => (deleteTarget = null)}
+    onConfirm={() => void removeEntry()}
+  />
 </div>
 
 <style>
@@ -662,6 +857,67 @@
   }
 
   .explorer-error {
+    color: var(--status-error);
+  }
+
+  .sort-bar {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border-secondary);
+  }
+
+  .sort-btn {
+    padding: 3px 7px;
+    font-size: 10px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .sort-btn:hover {
+    color: var(--text-primary);
+  }
+
+  .sort-btn.active {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  .entry-context-menu {
+    position: fixed;
+    z-index: 80;
+    min-width: 140px;
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4);
+  }
+
+  .entry-context-menu button {
+    padding: 7px 10px;
+    text-align: left;
+    font-size: 12px;
+    color: var(--text-primary);
+    background: transparent;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+
+  .entry-context-menu button:hover {
+    background: var(--bg-tertiary);
+  }
+
+  .entry-context-menu button.danger {
     color: var(--status-error);
   }
 </style>

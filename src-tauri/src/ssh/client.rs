@@ -453,6 +453,87 @@ impl SshConnection {
         Ok(entries)
     }
 
+    pub async fn create_dir_via_sftp(&self, path: &str) -> Result<(), SshError> {
+        let sftp = self.open_sftp().await?;
+        sftp.create_dir(path)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))
+    }
+
+    pub async fn create_file_via_sftp(&self, path: &str) -> Result<(), SshError> {
+        let sftp = self.open_sftp().await?;
+        let file_permissions = FileAttributes {
+            permissions: Some(0o644),
+            ..FileAttributes::default()
+        };
+        let mut file = sftp
+            .open_with_flags_and_attributes(
+                path,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                file_permissions,
+            )
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        file.shutdown()
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))
+    }
+
+    pub async fn remove_path_via_sftp(&self, path: &str) -> Result<(), SshError> {
+        let sftp = self.open_sftp().await?;
+        // LSTAT semantics: a symlink to a directory is unlinked as a link
+        // instead of deleting the target's contents.
+        let metadata = sftp
+            .symlink_metadata(path)
+            .await
+            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        if !metadata.file_type().is_dir() {
+            return sftp
+                .remove_file(path)
+                .await
+                .map_err(|e| SshError::SessionError(e.to_string()));
+        }
+        // Depth-first removal with an explicit stack: pop order records the
+        // directory hierarchy, so a reverse pass removes deepest-first.
+        let mut pending = vec![path.to_string()];
+        let mut dir_order = Vec::new();
+        while let Some(dir) = pending.pop() {
+            dir_order.push(dir.clone());
+            let mut file_children = Vec::new();
+            for entry in sftp
+                .read_dir(&dir)
+                .await
+                .map_err(|e| SshError::SessionError(e.to_string()))?
+            {
+                let name = entry.file_name();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                let child = if dir.ends_with('/') {
+                    format!("{dir}{name}")
+                } else {
+                    format!("{dir}/{name}")
+                };
+                if entry.metadata().file_type().is_dir() {
+                    pending.push(child);
+                } else {
+                    file_children.push(child);
+                }
+            }
+            for child in file_children {
+                sftp.remove_file(&child)
+                    .await
+                    .map_err(|e| SshError::SessionError(e.to_string()))?;
+            }
+        }
+        for dir in dir_order.iter().rev() {
+            sftp.remove_dir(dir)
+                .await
+                .map_err(|e| SshError::SessionError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub async fn read_file_via_sftp(
         &self,
         path: &str,

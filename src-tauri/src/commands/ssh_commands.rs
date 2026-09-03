@@ -1543,6 +1543,62 @@ pub async fn sftp_home_dir(
         .map_err(|e| e.to_string())
 }
 
+/// Reject remote paths that could escape the browsed directory: the UI only
+/// ever joins a validated leaf onto the currently listed path.
+fn validate_sftp_browse_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/')
+        || path.contains('\0')
+        || path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+    {
+        return Err("Invalid remote path".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn sftp_create_dir(
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
+    validate_sftp_browse_path(&path)?;
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+    connection
+        .create_dir_via_sftp(&path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn sftp_create_file(
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
+    validate_sftp_browse_path(&path)?;
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+    connection
+        .create_file_via_sftp(&path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn sftp_remove_path(
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
+    validate_sftp_browse_path(&path)?;
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+    connection
+        .remove_path_via_sftp(&path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[cfg(windows)]
 const WINDOWS_RESERVED_NAMES: [&str; 22] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -2226,5 +2282,16 @@ mod tests {
         assert_eq!(sanitize_file_name("con.txt"), "file-con.txt");
         assert_eq!(sanitize_file_name("bad/name"), "badname");
         assert_eq!(sanitize_file_name(":"), "download");
+    }
+
+    #[test]
+    fn sftp_browse_path_validation_rejects_traversal_and_relative_paths() {
+        assert!(validate_sftp_browse_path("/home/user").is_ok());
+        assert!(validate_sftp_browse_path("/").is_ok());
+        assert!(validate_sftp_browse_path("home/user").is_err());
+        assert!(validate_sftp_browse_path("").is_err());
+        assert!(validate_sftp_browse_path("/a/../b").is_err());
+        assert!(validate_sftp_browse_path("/a/./b").is_err());
+        assert!(validate_sftp_browse_path("/a/\0b").is_err());
     }
 }

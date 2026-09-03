@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-local-create-file"
+description = "Enables the local_create_file command without any pre-configured scope."
+commands.allow = ["local_create_file"]
+
+[[permission]]
+identifier = "deny-local-create-file"
+description = "Denies the local_create_file command without any pre-configured scope."
+commands.deny = ["local_create_file"]

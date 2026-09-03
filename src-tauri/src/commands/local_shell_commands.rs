@@ -409,6 +409,74 @@ pub async fn local_home_dir() -> Result<String, String> {
     local_home_dir_command()
 }
 
+fn validate_local_entry_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err("Invalid file name".to_string());
+    }
+    Ok(())
+}
+
+/// Scope a create/delete target by validating its leaf name and requiring the
+/// (existing) parent to be inside the home directory. Validating the parent
+/// instead of the full path keeps a symlinked parent from escaping home on
+/// create and lets deletes operate on the link itself rather than its target.
+fn ensure_within_home_entry(path: &Path) -> Result<std::path::PathBuf, String> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or("Invalid path")?;
+    let leaf = path.file_name().ok_or("Invalid path")?;
+    validate_local_entry_name(&leaf.to_string_lossy())?;
+    let scoped_parent = ensure_within_home(parent)?;
+    Ok(scoped_parent.join(leaf))
+}
+
+#[tauri::command]
+pub async fn local_create_dir(path: String) -> Result<(), String> {
+    let scoped = ensure_within_home_entry(Path::new(&path))?;
+    if tokio::fs::symlink_metadata(&scoped).await.is_ok() {
+        return Err("Path already exists".to_string());
+    }
+    tokio::fs::create_dir(&scoped)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn local_create_file(path: String) -> Result<(), String> {
+    let scoped = ensure_within_home_entry(Path::new(&path))?;
+    if tokio::fs::symlink_metadata(&scoped).await.is_ok() {
+        return Err("Path already exists".to_string());
+    }
+    tokio::fs::File::create_new(&scoped)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn local_remove_path(path: String) -> Result<(), String> {
+    let scoped = ensure_within_home_entry(Path::new(&path))?;
+    let metadata = tokio::fs::symlink_metadata(&scoped)
+        .await
+        .map_err(|e| e.to_string())?;
+    if metadata.is_dir() {
+        tokio::fs::remove_dir_all(&scoped)
+            .await
+            .map_err(|e| e.to_string())
+    } else {
+        tokio::fs::remove_file(&scoped)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[tauri::command]
 pub async fn local_list_dir(path: String) -> Result<Vec<SftpDirEntry>, String> {
     // Windows: a bare drive ("C:") reads the process CWD; make it the root.
@@ -1022,5 +1090,34 @@ mod tests {
         tokio::fs::remove_file(&path)
             .await
             .expect("remove test file");
+    }
+
+    #[test]
+    fn local_entry_name_validation_rejects_separators_and_relative_names() {
+        assert!(validate_local_entry_name("notes.txt").is_ok());
+        assert!(validate_local_entry_name("my folder").is_ok());
+        assert!(validate_local_entry_name("").is_err());
+        assert!(validate_local_entry_name(".").is_err());
+        assert!(validate_local_entry_name("..").is_err());
+        assert!(validate_local_entry_name("a/b").is_err());
+        assert!(validate_local_entry_name("a\\b").is_err());
+        assert!(validate_local_entry_name("a\0b").is_err());
+    }
+
+    #[test]
+    fn local_entry_scope_rejects_out_of_home_parents_and_bad_leafs() {
+        let home = local_home_dir_path().expect("home directory should resolve");
+        let expected_parent = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
+        let inside = ensure_within_home_entry(&home.join("new-folder"));
+        assert!(inside.is_ok());
+        assert_eq!(
+            inside.expect("scoped entry").parent(),
+            Some(expected_parent.as_path())
+        );
+        assert!(ensure_within_home_entry(Path::new("/usr/local/bin/new-file")).is_err());
+        assert!(ensure_within_home_entry(Path::new("../new-file")).is_err());
+        assert!(ensure_within_home_entry(&home.join(".")).is_err());
+        // A leaf separator is rejected before the path is ever split.
+        assert!(validate_local_entry_name("a/b").is_err());
     }
 }
