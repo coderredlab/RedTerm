@@ -29,7 +29,7 @@ describe("Osc52SessionGate", () => {
     expect(confirmCalls).toBe(1);
   });
 
-  test("remembers denial for the same generation", async () => {
+  test("asks again on every attempt after a denial for the same generation", async () => {
     const gate = new Osc52SessionGate();
     let confirmCalls = 0;
     const confirm = async () => {
@@ -39,7 +39,8 @@ describe("Osc52SessionGate", () => {
 
     expect(await gate.resolve("first", false, 1, confirm)).toBeNull();
     expect(await gate.resolve("second", false, 1, confirm)).toBeNull();
-    expect(confirmCalls).toBe(1);
+    expect(await gate.resolve("third", false, 1, confirm)).toBeNull();
+    expect(confirmCalls).toBe(3);
   });
 
   test("asks again when the connection generation moves", async () => {
