@@ -293,7 +293,8 @@
       if (
         submission.authType === "password" &&
         !isUsingStoredPassword &&
-        submission.password.length === 0
+        submission.password.length === 0 &&
+        !saveOnly
       ) {
         throw new Error("Password is required");
       }

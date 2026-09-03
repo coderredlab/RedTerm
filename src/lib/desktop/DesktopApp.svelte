@@ -140,6 +140,8 @@
       !showDialog &&
       !settingsOpen &&
       closePrompt === null &&
+      updateOfferPrompt === null &&
+      updateRestartPrompt === null &&
       sessionsReconciled;
     if (
       !tab ||
@@ -914,6 +916,8 @@
         !showDialog &&
         !settingsOpen &&
         closePrompt === null &&
+        updateOfferPrompt === null &&
+        updateRestartPrompt === null &&
         sessionsReconciled,
       terminalTarget
     );
@@ -1002,9 +1006,10 @@
               node={tab.layout}
               visible={tab.id === tabsStore.activeTabId}
               interactive={
-                !showDialog &&
                 !settingsOpen &&
                 closePrompt === null &&
+                updateOfferPrompt === null &&
+                updateRestartPrompt === null &&
                 tab.id === tabsStore.activeTabId}
               activePaneId={tab.activePaneId}
             />
