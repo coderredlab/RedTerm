@@ -42,6 +42,7 @@
   let saveConnectionChecked = $state(false);
   let savePasswordChecked = $state(false);
   let connecting = $state(false);
+  let saveOnlySubmit = $state(false);
   let keyUploading = $state(false);
   let error = $state<string | null>(null);
   let startupScript = $state("");
@@ -226,8 +227,12 @@
     }
   }
 
-  async function handleConnect() {
+  async function handleConnect(
+    options: { connectAfterSave: boolean } = { connectAfterSave: true }
+  ) {
     if (connecting || keyUploading) return;
+    const connectAfterSave = options.connectAfterSave;
+    const saveOnly = !connectAfterSave;
 
     const submission = {
       name,
@@ -239,7 +244,7 @@
       keyPassphrase,
       keyName: selectedKeyName,
       authType,
-      saveConnection: saveConnectionChecked,
+      saveConnection: saveConnectionChecked || saveOnly,
       savePassword: savePasswordChecked,
       startupScript: startupScript.trim().length > 0 ? startupScript : undefined,
       startupScriptReadyText: startupScriptReadyText.trim() || undefined,
@@ -253,6 +258,7 @@
 
     error = null;
     connecting = true;
+    saveOnlySubmit = saveOnly;
 
     try {
       if (!submission.host) {
@@ -390,39 +396,41 @@
         } satisfies PaneConnection);
       }
 
-      if (submission.editPane) {
-        tabsStore.updatePaneConnection(
-          submission.editPane.tabId,
-          submission.editPane.paneId,
-          {
-            host: submission.host,
-            port: submission.port,
-            auth: authPlan.auth,
+      if (connectAfterSave) {
+        if (submission.editPane) {
+          tabsStore.updatePaneConnection(
+            submission.editPane.tabId,
+            submission.editPane.paneId,
+            {
+              host: submission.host,
+              port: submission.port,
+              auth: authPlan.auth,
+              connectionId,
+              canRestorePassword,
+              startupScript: submission.startupScript,
+              keyName:
+                submission.authType === "key"
+                  ? submission.keyName || undefined
+                  : undefined,
+              saveConnection: submission.saveConnection,
+              savePassword: submission.saveConnection && submission.savePassword,
+              startupScriptReadyText: submission.startupScriptReadyText,
+            }
+          );
+        } else {
+          tabsStore.addTab(
+            submission.host,
+            submission.port,
+            authPlan.auth,
             connectionId,
             canRestorePassword,
-            startupScript: submission.startupScript,
-            keyName:
-              submission.authType === "key"
-                ? submission.keyName || undefined
-                : undefined,
-            saveConnection: submission.saveConnection,
-            savePassword: submission.saveConnection && submission.savePassword,
-            startupScriptReadyText: submission.startupScriptReadyText,
-          }
-        );
-      } else {
-        tabsStore.addTab(
-          submission.host,
-          submission.port,
-          authPlan.auth,
-          connectionId,
-          canRestorePassword,
-          submission.startupScript,
-          submission.startupScriptReadyText,
-          submission.authType === "key" ? submission.keyName || undefined : undefined,
-          submission.saveConnection,
-          submission.saveConnection && submission.savePassword
-        );
+            submission.startupScript,
+            submission.startupScriptReadyText,
+            submission.authType === "key" ? submission.keyName || undefined : undefined,
+            submission.saveConnection,
+            submission.saveConnection && submission.savePassword
+          );
+        }
       }
 
       if (submissionKeyLease) {
@@ -464,6 +472,7 @@
         await cleanupUnreferencedManagedKeys([pendingLease.keyId]);
       }
       connecting = false;
+      saveOnlySubmit = false;
     }
   }
 
@@ -772,8 +781,24 @@
           >
             Cancel
           </button>
+          {#if editConnection && !editPane}
+            <button
+              type="button"
+              class="btn-save"
+              disabled={connecting || keyUploading}
+              onclick={() => void handleConnect({ connectAfterSave: false })}
+            >
+              {saveOnlySubmit ? "Saving..." : "Save"}
+            </button>
+          {/if}
           <button type="submit" class="btn-connect" disabled={connecting || keyUploading}>
-            {connecting ? "Connecting..." : "Connect"}
+            {#if connecting}
+              Connecting...
+            {:else if editConnection && !editPane}
+              Save & connect
+            {:else}
+              Connect
+            {/if}
           </button>
         </div>
       </form>
@@ -1057,6 +1082,26 @@
   }
 
   .btn-cancel,
+  .btn-save,
+  .btn-connect {
+    flex: 1;
+    padding: 12px;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.15s;
+  }
+
+  .btn-save {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+
+  .btn-save:hover {
+    background: var(--bg-tertiary);
+  }
   .btn-connect {
     flex: 1;
     padding: 12px;

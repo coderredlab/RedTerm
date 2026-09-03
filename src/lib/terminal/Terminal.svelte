@@ -49,6 +49,7 @@
     resolveTerminalClipboardImagePath,
     writeTerminalClipboardText,
   } from "./terminal-clipboard";
+  import CloseConfirmationModal from "../desktop/workspace/CloseConfirmationModal.svelte";
   import { Osc52SessionGate } from "./terminal-osc52";
   import { SshOutputDecoder } from "./ssh-output-decoder";
   import { cleanupFailedSessionAttach } from "./session-attach-cleanup";
@@ -173,6 +174,24 @@
   let pendingKeyPassphrasePrompt = $state<{ keyId: string } | null>(null);
   let keyPassphraseInput = $state("");
   let keyPassphrasePromptResolver: ((passphrase: string | null) => void) | null = null;
+
+  let osc52ApprovalOpen = $state(false);
+  let osc52ApprovalResolver: ((decision: boolean) => void) | null = null;
+
+  function requestOsc52Approval(): Promise<boolean> {
+    osc52ApprovalOpen = true;
+    return new Promise((resolve) => {
+      osc52ApprovalResolver = resolve;
+    });
+  }
+
+  function settleOsc52Approval(decision: boolean) {
+    if (!osc52ApprovalResolver) return;
+    const resolver = osc52ApprovalResolver;
+    osc52ApprovalResolver = null;
+    osc52ApprovalOpen = false;
+    resolver(decision);
+  }
   let keyPassphraseRetryCache = createKeyPassphraseRetryCache();
   let keyPassphraseRetryKeyId: string | null = null;
   const TERMINAL_SNAPSHOT_STORAGE_KEY = "redterm.sessionSnapshots.v1";
@@ -2385,10 +2404,7 @@
           event.text,
           kind === "local",
           generation,
-          () =>
-            confirmAction(
-              "The remote server requested to write to your clipboard (OSC 52). Allow clipboard writes from this server while this session is open?"
-            )
+          requestOsc52Approval
         )
         .then((text) => {
           if (text === null) return;
@@ -4097,6 +4113,17 @@
     {/if}
   </div>
 </div>
+
+  <CloseConfirmationModal
+    open={osc52ApprovalOpen}
+    title="Clipboard access requested"
+    message="The remote server requested to write to your clipboard (OSC 52)."
+    detail="Allow clipboard writes from this server while this session is open?"
+    confirmLabel="Allow"
+    destructive={false}
+    onCancel={() => settleOsc52Approval(false)}
+    onConfirm={() => settleOsc52Approval(true)}
+  />
 
 <style>
   .terminal-wrapper {

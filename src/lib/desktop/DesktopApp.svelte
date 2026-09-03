@@ -13,6 +13,7 @@
     showWarning,
     sshDisconnect,
     type SavedConnection,
+    type DesktopUpdateInfo,
   } from "$lib/tauri/commands";
   import {
     loadRuntimeInstanceId,
@@ -60,6 +61,9 @@
 
   let closePrompt = $state<ClosePrompt | null>(null);
   let resolveClosePrompt: ((confirmed: boolean) => void) | null = null;
+
+  let updateOfferPrompt = $state<DesktopUpdateInfo | null>(null);
+  let updateRestartPrompt = $state<DesktopUpdateInfo | null>(null);
 
   const terminals = new Map<string, Terminal>();
   const confirmingTabIds = new Set<string>();
@@ -155,16 +159,52 @@
   });
 
   const UPDATE_CHECK_DELAY_MS = 3000;
+  const IS_WINDOWS_PLATFORM = navigator.userAgent.includes("Windows");
 
   async function autoCheckForUpdates() {
     const update = await desktopUpdateStore.checkQuietly();
     if (!update) return;
-    const installAccepted = await confirmAction(
-      `RedTerm Desktop ${update.version} is available. Download and install it now?`
+    updateOfferPrompt = update;
+  }
+
+  function acceptUpdateOffer() {
+    const update = updateOfferPrompt;
+    updateOfferPrompt = null;
+    if (!update) return;
+    void (async () => {
+      await desktopUpdateStore.install();
+      if (desktopUpdateStore.phase.kind === "ready") {
+        updateRestartPrompt = update;
+      }
+    })();
+  }
+
+  async function restartForUpdate() {
+    const savingDocuments = tabsStore.tabs.flatMap((tab) =>
+      tab.documents.filter((document) => document.saveState === "saving")
     );
-    if (!installAccepted) return;
-    await desktopUpdateStore.install();
-    if (desktopUpdateStore.phase.kind === "ready") await desktopUpdateStore.restart();
+    if (savingDocuments.length > 0) {
+      await showWarning("Please wait for documents to finish saving before restarting RedTerm.");
+      return;
+    }
+    const dirtyDocuments = tabsStore.tabs.flatMap((tab) =>
+      tab.documents.filter((document) => document.dirty)
+    );
+    if (dirtyDocuments.length > 0) {
+      const label =
+        dirtyDocuments.length === 1
+          ? `"${dirtyDocuments[0]!.name}"`
+          : `${dirtyDocuments.length} documents`;
+      const discard = await requestClosePrompt({
+        title: "Discard unsaved changes?",
+        message: `Unsaved changes in ${label} will be lost.`,
+        detail: "The update will finish installing after RedTerm restarts.",
+        confirmLabel: "Discard & Restart",
+        destructive: true,
+      });
+      if (!discard) return;
+    }
+    await relaunchDesktopApp();
   }
 
   onMount(() => {
@@ -991,6 +1031,40 @@
   />
 
   <SettingsModal open={settingsOpen} onClose={() => (settingsOpen = false)} />
+
+  <CloseConfirmationModal
+    open={updateOfferPrompt !== null}
+    title="Update available"
+    message={
+      updateOfferPrompt
+        ? `RedTerm Desktop ${updateOfferPrompt.version} is available.`
+        : ""
+    }
+    detail={
+      IS_WINDOWS_PLATFORM
+        ? "The update installer will close RedTerm during installation. Active terminal sessions will be disconnected."
+        : "The update downloads and installs in the background. RedTerm will ask to restart when it's ready."
+    }
+    confirmLabel="Download and install"
+    destructive={false}
+    onCancel={() => (updateOfferPrompt = null)}
+    onConfirm={() => void acceptUpdateOffer()}
+  />
+
+  <CloseConfirmationModal
+    open={updateRestartPrompt !== null}
+    title="Restart to apply the update?"
+    message={
+      updateRestartPrompt
+        ? `RedTerm Desktop ${updateRestartPrompt.version} is installed.`
+        : ""
+    }
+    detail="Restarting applies the update immediately. Active terminal sessions will be disconnected."
+    confirmLabel="Restart RedTerm"
+    destructive={false}
+    onCancel={() => (updateRestartPrompt = null)}
+    onConfirm={() => void restartForUpdate()}
+  />
 
   <CloseConfirmationModal
     open={closePrompt !== null}

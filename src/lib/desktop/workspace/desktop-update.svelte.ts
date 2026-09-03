@@ -1,9 +1,8 @@
 /** Desktop-only in-app update flow backed by the Tauri updater plugin. */
 import {
-  checkDesktopUpdate,
-  confirmAction,
   installDesktopUpdate,
   relaunchDesktopApp,
+  checkDesktopUpdate,
   type DesktopUpdateInfo,
 } from "$lib/tauri/commands";
 
@@ -58,14 +57,6 @@ function createDesktopUpdate() {
     async install(): Promise<void> {
       if (phase.kind !== "available") return;
       const update = phase.update;
-      if (
-        navigator.userAgent.includes("Windows") &&
-        !(await confirmAction(
-          "The update installer will close RedTerm to finish installing. Active terminal sessions will be disconnected. Continue?"
-        ))
-      ) {
-        return;
-      }
       phase = { kind: "downloading", downloaded: 0, total: null };
       try {
         await installDesktopUpdate((downloaded, total) => {
