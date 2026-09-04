@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import {
@@ -36,6 +38,41 @@
     navigator.userAgent.includes("Macintosh") ||
     navigator.platform.startsWith("Mac");
   const showWindowControls = !isMacOS;
+  let isFullscreen = $state(false);
+
+  onMount(() => {
+    if (!isMacOS || !("__TAURI_INTERNALS__" in window)) return;
+
+    const appWindow = getCurrentWindow();
+    let disposed = false;
+    let syncGeneration = 0;
+    let unlistenResized: (() => void) | undefined;
+    const syncFullscreenState = () => {
+      const generation = ++syncGeneration;
+      void appWindow
+        .isFullscreen()
+        .then((fullscreen) => {
+          if (!disposed && generation === syncGeneration) {
+            isFullscreen = fullscreen;
+          }
+        })
+        .catch((error) => console.error("Fullscreen state error:", error));
+    };
+
+    syncFullscreenState();
+    void appWindow
+      .onResized(syncFullscreenState)
+      .then((unlisten) => {
+        if (disposed) unlisten();
+        else unlistenResized = unlisten;
+      })
+      .catch((error) => console.error("Window resize listener error:", error));
+
+    return () => {
+      disposed = true;
+      unlistenResized?.();
+    };
+  });
 
   // Resolved lazily: calling getCurrentWindow() at module scope throws in
   // non-Tauri contexts (plain browser) and would kill the whole import
@@ -221,7 +258,13 @@
   }
 </script>
 
-<div class="tabstrip" class:overlay-titlebar={isMacOS} bind:this={stripEl} data-tauri-drag-region>
+<div
+  class="tabstrip"
+  class:overlay-titlebar={isMacOS}
+  class:fullscreen-titlebar={isMacOS && isFullscreen}
+  bind:this={stripEl}
+  data-tauri-drag-region
+>
   <button
     class="strip-action sidebar-toggle"
     title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
@@ -444,6 +487,10 @@
   /* macOS traffic lights float over this strip: reserve their space. */
   .tabstrip.overlay-titlebar {
     padding-left: 78px;
+  }
+
+  .tabstrip.fullscreen-titlebar {
+    padding-left: 0;
   }
 
   .window-controls {
