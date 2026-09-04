@@ -126,6 +126,19 @@ pub fn run() {
     builder
         .setup(|app| {
             install_keyboard_layout_change_listener(app.handle());
+            // The window config keeps native decorations so macOS can pair
+            // titleBarStyle Overlay with working traffic lights (their
+            // position contract requires decorated windows). Windows and
+            // Linux drop decorations here so the app-owned tab strip is the
+            // only title bar; wry re-attaches its undecorated resize
+            // borders when this call flips the flag.
+            #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
+            {
+                use tauri::Manager as _;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_decorations(false);
+                }
+            }
             Ok(())
         })
         .manage(session_manager)

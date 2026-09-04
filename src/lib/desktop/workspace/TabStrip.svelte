@@ -1,5 +1,6 @@
 <script lang="ts">
   import { tabsStore } from "$lib/stores/tabs.svelte";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import {
     dragTargets,
     resetTabDrag,
@@ -28,6 +29,30 @@
 
   let stripEl: HTMLDivElement | null = $state(null);
   let suppressClick = false;
+
+  // macOS keeps the native traffic lights over this strip; Windows and
+  // Linux render app-owned window controls instead.
+  const isMacOS =
+    navigator.userAgent.includes("Macintosh") ||
+    navigator.platform.startsWith("Mac");
+  const showWindowControls = !isMacOS;
+
+  // Resolved lazily: calling getCurrentWindow() at module scope throws in
+  // non-Tauri contexts (plain browser) and would kill the whole import
+  // chain the desktop app shell depends on.
+  function minimizeWindow() {
+    void getCurrentWindow().minimize();
+  }
+
+  function toggleMaximizeWindow() {
+    void getCurrentWindow().toggleMaximize();
+  }
+
+  function closeWindow() {
+    // close() raises close-requested, so the app's close confirmation flow
+    // stays in charge; destroy() would bypass it.
+    void getCurrentWindow().close();
+  }
 
   let dragArmed = false;
   let dragTabId: string | null = null;
@@ -196,7 +221,7 @@
   }
 </script>
 
-<div class="tabstrip" bind:this={stripEl}>
+<div class="tabstrip" class:overlay-titlebar={isMacOS} bind:this={stripEl} data-tauri-drag-region>
   <button
     class="strip-action sidebar-toggle"
     title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}
@@ -209,7 +234,7 @@
     </svg>
   </button>
 
-  <div class="tabs" role="tablist" aria-label="Terminal sessions">
+  <div class="tabs" role="tablist" aria-label="Terminal sessions" data-tauri-drag-region>
     {#each tabsStore.tabs as tab, index (tab.id)}
       <div
         class="session-tab"
@@ -251,7 +276,6 @@
     {/if}
   </div>
 
-
   <button
     class="strip-action"
     title="Settings"
@@ -265,6 +289,23 @@
       />
     </svg>
   </button>
+
+  {#if showWindowControls}
+    <div class="window-controls">
+      <button class="window-control" aria-label="Minimize" title="Minimize" onclick={minimizeWindow}>
+        <svg viewBox="0 0 12 12" aria-hidden="true"><line x1="2" y1="6" x2="10" y2="6" /></svg>
+      </button>
+      <button class="window-control" aria-label="Maximize" title="Maximize" onclick={toggleMaximizeWindow}>
+        <svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.5" y="2.5" width="7" height="7" rx="0.8" /></svg>
+      </button>
+      <button class="window-control close" aria-label="Close" title="Close" onclick={closeWindow}>
+        <svg viewBox="0 0 12 12" aria-hidden="true">
+          <line x1="3" y1="3" x2="9" y2="9" /><line x1="9" y1="3" x2="3" y2="9" />
+        </svg>
+      </button>
+    </div>
+  {/if}
+
 </div>
 
 <style>
@@ -394,7 +435,46 @@
     border-radius: 2px;
     background: var(--accent-primary);
   }
+  /* macOS traffic lights float over this strip: reserve their space. */
+  .tabstrip.overlay-titlebar {
+    padding-left: 78px;
+  }
 
+  .window-controls {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: stretch;
+    height: 100%;
+  }
+
+  .window-control {
+    width: 46px;
+    display: grid;
+    place-items: center;
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+
+  .window-control:hover {
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+
+  .window-control.close:hover {
+    background: var(--status-error);
+    color: #ffffff;
+  }
+
+  .window-control svg {
+    width: 12px;
+    height: 12px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.1;
+    stroke-linecap: round;
+  }
 
   .strip-action {
     flex: 0 0 auto;

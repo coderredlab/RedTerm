@@ -949,6 +949,16 @@
   <title>RedTerm Desktop</title>
 </svelte:head>
 
+<div class="desktop-shell">
+  <TabStrip
+    onSelectTab={handleSelectTab}
+    onCloseTab={(tabId) => void closeTabById(tabId)}
+    onOpenSettings={handleOpenSettings}
+    onToggleSidebar={() => desktopPrefsStore.toggleSidebar()}
+    sidebarCollapsed={desktopPrefsStore.prefs.sidebarCollapsed}
+    onDropToWorkspace={(sourceTabId, zone) =>
+      void handleTabDropIntoWorkspace(sourceTabId, zone)}
+  />
 <div
   class="desktop-app"
   style:grid-template-columns="{sidebarColumn} minmax(0, 1fr)"
@@ -975,16 +985,6 @@
   />
 
   <section class="workspace">
-    <TabStrip
-      onSelectTab={handleSelectTab}
-      onCloseTab={(tabId) => void closeTabById(tabId)}
-      onOpenSettings={handleOpenSettings}
-      onToggleSidebar={() => desktopPrefsStore.toggleSidebar()}
-      sidebarCollapsed={desktopPrefsStore.prefs.sidebarCollapsed}
-      onDropToWorkspace={(sourceTabId, zone) =>
-        void handleTabDropIntoWorkspace(sourceTabId, zone)}
-    />
-
     <main class="terminal-workspace" bind:this={workspaceEl}>
       {#if tabsStore.tabs.length === 0}
         <div class="empty-workspace">
@@ -1105,6 +1105,7 @@
     </div>
   {/if}
 </div>
+</div>
 
 <style>
   :global(*) {
@@ -1124,16 +1125,26 @@
     font-family: "Sarasa Term K Nerd", "JetBrains Mono", monospace;
   }
 
-  .desktop-app {
+  .desktop-shell {
     position: fixed;
     inset: 0;
+    display: grid;
+    /* Tab strip is the full-width top row and doubles as the window
+       title bar; the app grid fills the rest. */
+    grid-template-rows: auto minmax(0, 1fr);
+    min-width: 760px;
+    min-height: 520px;
+    overflow: hidden;
+    background: var(--bg-primary);
+  }
+
+  .desktop-app {
     display: grid;
     grid-template-columns: 280px minmax(0, 1fr);
     /* Pin the row height so tall sidebar content (file list) scrolls
        inside its own flex column instead of growing the row. */
     grid-template-rows: minmax(0, 1fr);
-    min-width: 760px;
-    min-height: 520px;
+    min-height: 0;
     overflow: hidden;
     background: var(--bg-primary);
     /* Widen the shared ConnectionDialog for desktop. */
