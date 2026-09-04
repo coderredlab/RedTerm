@@ -32,11 +32,12 @@
     { value: 50000, label: "50k" },
   ];
 
-  type SettingsSection = "terminal" | "appearance" | "shortcuts" | "updates";
+  type SettingsSection = "terminal" | "appearance" | "notifications" | "shortcuts" | "updates";
 
   const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string }> = [
     { id: "terminal", label: "Terminal" },
     { id: "appearance", label: "Appearance" },
+    { id: "notifications", label: "Notifications" },
     { id: "shortcuts", label: "Shortcuts" },
     { id: "updates", label: "Updates" },
   ];
@@ -540,6 +541,25 @@
                 <div class="theme-name">{theme.name}</div>
               </button>
             {/each}
+          </div>
+        </section>
+        {:else if activeSection === "notifications"}
+        <section class="settings-section">
+          <div class="section-label">Notifications</div>
+          <div class="toggle-row">
+            <div class="toggle-copy">
+              <span class="control-label" id="bell-notifications-label">Terminal bell notifications</span>
+              <span class="control-hint">Show a system notification when a background session rings the terminal bell.</span>
+            </div>
+            <button
+              type="button"
+              class="toggle"
+              class:active={settingsStore.bellNotifications}
+              role="switch"
+              aria-checked={settingsStore.bellNotifications}
+              aria-labelledby="bell-notifications-label"
+              onclick={() => settingsStore.setBellNotifications(!settingsStore.bellNotifications)}
+            ><span class="toggle-knob"></span></button>
           </div>
         </section>
         {:else if activeSection === "shortcuts"}
@@ -1144,5 +1164,50 @@
     margin: 10px 0 0;
     color: var(--text-muted);
     font-size: 10px;
+  }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .toggle-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .toggle {
+    position: relative;
+    flex: 0 0 auto;
+    width: 40px;
+    height: 22px;
+    border: none;
+    border-radius: 11px;
+    padding: 0;
+    background: var(--bg-tertiary);
+    cursor: pointer;
+    transition: background 120ms ease;
+  }
+
+  .toggle.active {
+    background: var(--accent-primary);
+  }
+
+  .toggle-knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--text-primary);
+    transition: transform 120ms ease;
+  }
+
+  .toggle.active .toggle-knob {
+    transform: translateX(18px);
   }
 </style>

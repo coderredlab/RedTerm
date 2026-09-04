@@ -192,6 +192,7 @@
     // Only surface a system notification when the session is out of sight.
     if (!("__TAURI_INTERNALS__" in window)) return;
     if (interactive && document.hasFocus()) return;
+    if (!settingsStore.bellNotifications) return;
     const now = Date.now();
     if (now - lastBellNotificationAt < BELL_NOTIFICATION_COOLDOWN_MS) return;
     lastBellNotificationAt = now;

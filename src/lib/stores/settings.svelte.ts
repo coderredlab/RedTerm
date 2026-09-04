@@ -25,6 +25,7 @@ export interface SettingsData {
   keepScreenOn: boolean;
   tabBarPosition: TabBarPosition;
   scrollbackLines: number;
+  bellNotifications: boolean;
 }
 
 const DEFAULTS: SettingsData = {
@@ -35,6 +36,7 @@ const DEFAULTS: SettingsData = {
   keepScreenOn: false,
   tabBarPosition: "top",
   scrollbackLines: 1000,
+  bellNotifications: true,
 };
 
 function canUseStorage(): boolean {
@@ -62,6 +64,10 @@ function loadFromStorage(): SettingsData {
       extraKeysHeight: clamp(parsed.extraKeysHeight ?? DEFAULTS.extraKeysHeight, 4, 20),
       tabBarPosition: parsed.tabBarPosition === "bottom" ? "bottom" : "top",
       scrollbackLines: clamp(parsed.scrollbackLines ?? DEFAULTS.scrollbackLines, 0, 50000),
+      bellNotifications:
+        typeof parsed.bellNotifications === "boolean"
+          ? parsed.bellNotifications
+          : DEFAULTS.bellNotifications,
     };
   } catch {
     return { ...DEFAULTS };
@@ -89,6 +95,7 @@ function createSettingsStore() {
   let keepScreenOn = $state(DEFAULTS.keepScreenOn);
   let tabBarPosition = $state<TabBarPosition>(DEFAULTS.tabBarPosition);
   let scrollbackLines = $state(DEFAULTS.scrollbackLines);
+  let bellNotifications = $state(DEFAULTS.bellNotifications);
 
   function load() {
     const data = loadFromStorage();
@@ -99,6 +106,7 @@ function createSettingsStore() {
     keepScreenOn = data.keepScreenOn;
     tabBarPosition = data.tabBarPosition;
     scrollbackLines = data.scrollbackLines;
+    bellNotifications = data.bellNotifications;
   }
 
   function persist() {
@@ -108,6 +116,7 @@ function createSettingsStore() {
       theme,
       extraKeysHeight,
       keepScreenOn,
+      bellNotifications,
       tabBarPosition,
       scrollbackLines,
     });
@@ -121,6 +130,7 @@ function createSettingsStore() {
     get keepScreenOn() { return keepScreenOn; },
     get tabBarPosition() { return tabBarPosition; },
     get scrollbackLines() { return scrollbackLines; },
+    get bellNotifications() { return bellNotifications; },
 
     load,
 
@@ -159,6 +169,11 @@ function createSettingsStore() {
 
     setTabBarPosition(v: TabBarPosition) {
       tabBarPosition = v;
+      persist();
+    },
+
+    setBellNotifications(v: boolean) {
+      bellNotifications = v;
       persist();
     },
 
