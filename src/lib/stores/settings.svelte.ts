@@ -27,6 +27,7 @@ export interface SettingsData {
   scrollbackLines: number;
   bellNotifications: boolean;
   updateCheckOnStartup: boolean;
+  cursorBlink: boolean;
 }
 
 const DEFAULTS: SettingsData = {
@@ -38,6 +39,7 @@ const DEFAULTS: SettingsData = {
   tabBarPosition: "top",
   scrollbackLines: 1000,
   updateCheckOnStartup: true,
+  cursorBlink: true,
   bellNotifications: true,
 };
 
@@ -74,6 +76,10 @@ function loadFromStorage(): SettingsData {
         typeof parsed.updateCheckOnStartup === "boolean"
           ? parsed.updateCheckOnStartup
           : DEFAULTS.updateCheckOnStartup,
+      cursorBlink:
+        typeof parsed.cursorBlink === "boolean"
+          ? parsed.cursorBlink
+          : DEFAULTS.cursorBlink,
     };
   } catch {
     return { ...DEFAULTS };
@@ -102,6 +108,7 @@ function createSettingsStore() {
   let tabBarPosition = $state<TabBarPosition>(DEFAULTS.tabBarPosition);
   let scrollbackLines = $state(DEFAULTS.scrollbackLines);
   let updateCheckOnStartup = $state(DEFAULTS.updateCheckOnStartup);
+  let cursorBlink = $state(DEFAULTS.cursorBlink);
   let bellNotifications = $state(DEFAULTS.bellNotifications);
 
   function load() {
@@ -114,6 +121,7 @@ function createSettingsStore() {
     tabBarPosition = data.tabBarPosition;
     scrollbackLines = data.scrollbackLines;
     updateCheckOnStartup = data.updateCheckOnStartup;
+    cursorBlink = data.cursorBlink;
     bellNotifications = data.bellNotifications;
   }
 
@@ -125,6 +133,7 @@ function createSettingsStore() {
       extraKeysHeight,
       keepScreenOn,
       updateCheckOnStartup,
+      cursorBlink,
       bellNotifications,
       tabBarPosition,
       scrollbackLines,
@@ -140,6 +149,7 @@ function createSettingsStore() {
     get tabBarPosition() { return tabBarPosition; },
     get scrollbackLines() { return scrollbackLines; },
     get updateCheckOnStartup() { return updateCheckOnStartup; },
+    get cursorBlink() { return cursorBlink; },
     get bellNotifications() { return bellNotifications; },
 
     load,
@@ -189,6 +199,11 @@ function createSettingsStore() {
 
     setUpdateCheckOnStartup(v: boolean) {
       updateCheckOnStartup = v;
+      persist();
+    },
+
+    setCursorBlink(v: boolean) {
+      cursorBlink = v;
       persist();
     },
 

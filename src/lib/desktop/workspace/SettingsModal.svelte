@@ -493,6 +493,21 @@
             </div>
             <span class="control-hint">Terminal lines kept above the viewport.</span>
           </div>
+          <div class="toggle-row">
+            <div class="toggle-copy">
+              <span class="control-label" id="cursor-blink-label">Cursor blink</span>
+              <span class="control-hint">Blink the terminal cursor while the session is idle.</span>
+            </div>
+            <button
+              type="button"
+              class="toggle"
+              class:active={settingsStore.cursorBlink}
+              role="switch"
+              aria-checked={settingsStore.cursorBlink}
+              aria-labelledby="cursor-blink-label"
+              onclick={() => settingsStore.setCursorBlink(!settingsStore.cursorBlink)}
+            ><span class="toggle-knob"></span></button>
+          </div>
         </section>
         {:else if activeSection === "appearance"}
 

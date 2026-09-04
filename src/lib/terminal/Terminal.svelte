@@ -149,6 +149,24 @@
   $effect(() => {
     parser?.setMaxScrollback(settingsStore.scrollbackLines);
   });
+
+  // Cursor blink follows the user setting; off keeps a solid cursor.
+  $effect(() => {
+    if (cursorInterval !== null) {
+      window.clearInterval(cursorInterval);
+      cursorInterval = null;
+    }
+    if (!settingsStore.cursorBlink) {
+      cursorVisible = true;
+      requestRedraw();
+      return;
+    }
+    cursorInterval = window.setInterval(() => {
+      if (destroyed) return;
+      cursorVisible = !cursorVisible;
+      requestRedraw();
+    }, 530);
+  });
   let sessionId: string | null = null;
   let unlisten: (() => void) | null = null;
   let unlistenExit: (() => void) | null = null;
@@ -1045,13 +1063,6 @@
       await loadBrowserKeyboardLayout();
     }
     if (destroyed) return;
-
-    // Cursor blink
-    cursorInterval = window.setInterval(() => {
-      if (destroyed) return;
-      cursorVisible = !cursorVisible;
-      requestRedraw();
-    }, 530);
 
     // Setup input handlers BEFORE initTerminal
     await tick();
