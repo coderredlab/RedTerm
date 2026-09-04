@@ -9,10 +9,11 @@ use tokio::sync::{mpsc, RwLock};
 
 use super::ssh_commands::{
     append_cleanup_error, claim_download_destination, ensure_local_sftp_preview_dir,
-    make_download_progress_emitter, resolve_sftp_preview_cache_file, sanitize_file_name,
-    SftpDownloadedFile, SftpFileContent, MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
+    make_download_progress_emitter, make_remove_progress_emitter, resolve_sftp_preview_cache_file,
+    sanitize_file_name, RemoveOrigin, SftpDownloadedFile, SftpFileContent,
+    MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
 };
-use crate::ssh::SftpDirEntry;
+use crate::ssh::{RemovePhase, RemoveProgress, SftpDirEntry};
 
 const MAX_LOCAL_PREVIEW_READ_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_LOCAL_LIST_ENTRIES: usize = 10_000;
@@ -468,22 +469,118 @@ pub async fn local_create_file(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn local_remove_path(path: String) -> Result<(), String> {
+pub async fn local_remove_path(
+    app: AppHandle,
+    path: String,
+    origin_id: String,
+) -> Result<(), String> {
     let scoped = ensure_within_home_entry(Path::new(&path))?;
     let metadata = tokio::fs::symlink_metadata(&scoped)
         .await
         .map_err(|e| e.to_string())?;
-    if metadata.is_dir() {
-        tokio::fs::remove_dir_all(&scoped)
+    if !metadata.is_dir() {
+        return tokio::fs::remove_file(&scoped)
             .await
-            .map_err(|e| e.to_string())
-    } else {
-        tokio::fs::remove_file(&scoped)
-            .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string());
     }
+    // The emitter label uses the caller-facing path; deletion itself uses the
+    // scoped path resolved above.
+    let on_progress = make_remove_progress_emitter(
+        app,
+        path,
+        RemoveOrigin {
+            origin_id: origin_id,
+        },
+    );
+    remove_dir_all_with_progress(&scoped, &on_progress).await
 }
 
+/// Local twin of the SSH recursive delete: collect the tree first, unlink
+/// files, then remove directories in reverse discovery order, reporting each
+/// finished entry so the explorer progress bar behaves identically for local
+/// and remote paths. Symlinks are unlinked, never traversed — the same
+/// LSTAT semantics as the SSH path.
+async fn remove_dir_all_with_progress(
+    root: &Path,
+    on_progress: &impl Fn(RemoveProgress),
+) -> Result<(), String> {
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut queue = vec![root.to_path_buf()];
+    while let Some(dir) = queue.pop() {
+        dirs.push(dir.clone());
+        on_progress(RemoveProgress {
+            phase: RemovePhase::Scanning,
+            deleted: 0,
+            total: None,
+            current: display_leaf(&dir),
+        });
+        let mut reader = tokio::fs::read_dir(&dir).await.map_err(|e| e.to_string())?;
+        while let Some(entry) = reader.next_entry().await.map_err(|e| e.to_string())? {
+            let child = entry.path();
+            // DirEntry::file_type does not follow symlinks.
+            let file_type = entry.file_type().await.map_err(|e| e.to_string())?;
+            if file_type.is_dir() {
+                queue.push(child);
+            } else if is_dir_link(&file_type) {
+                dirs.push(child);
+            } else {
+                files.push(child);
+            }
+        }
+    }
+    let total = files.len() + dirs.len();
+    let mut deleted = 0usize;
+    for file in &files {
+        tokio::fs::remove_file(file)
+            .await
+            .map_err(|e| e.to_string())?;
+        deleted += 1;
+        on_progress(RemoveProgress {
+            phase: RemovePhase::Deleting,
+            deleted,
+            total: Some(total),
+            current: display_leaf(file),
+        });
+    }
+    for dir in dirs.iter().rev() {
+        tokio::fs::remove_dir(dir)
+            .await
+            .map_err(|e| e.to_string())?;
+        deleted += 1;
+        on_progress(RemoveProgress {
+            phase: RemovePhase::Deleting,
+            deleted,
+            total: Some(total),
+            current: display_leaf(dir),
+        });
+    }
+    Ok(())
+}
+
+/// Windows-only: directory symlinks and junctions report `is_dir() == false`
+/// from `DirEntry::file_type` (like any symlink), and `remove_file` cannot
+/// unlink them — they must go through `remove_dir`, which removes the
+/// reparse point itself without touching the target. `is_symlink_dir`
+/// classifies both from the entry's file type, no extra stat needed.
+#[cfg(windows)]
+fn is_dir_link(file_type: &std::fs::FileType) -> bool {
+    use std::os::windows::fs::FileTypeExt;
+    file_type.is_symlink_dir()
+}
+
+#[cfg(not(windows))]
+fn is_dir_link(_file_type: &std::fs::FileType) -> bool {
+    // Unix directory symlinks are unlinked as files, matching the SSH path's
+    // LSTAT semantics.
+    false
+}
+
+fn display_leaf(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
 #[tauri::command]
 pub async fn local_list_dir(path: String) -> Result<Vec<SftpDirEntry>, String> {
     // Windows: a bare drive ("C:") reads the process CWD; make it the root.
@@ -1126,5 +1223,132 @@ mod tests {
         assert!(ensure_within_home_entry(&home.join(".")).is_err());
         // A leaf separator is rejected before the path is ever split.
         assert!(validate_local_entry_name("a/b").is_err());
+    }
+
+    /// Collect progress events behind an Fn + Send + Sync closure like the
+    /// real emitter.
+    fn event_collector() -> (
+        impl Fn(RemoveProgress) + Send + Sync,
+        std::sync::Arc<std::sync::Mutex<Vec<RemoveProgress>>>,
+    ) {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        (
+            move |progress: RemoveProgress| {
+                sink.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(progress);
+            },
+            events,
+        )
+    }
+
+    fn unique_test_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "redterm-remove-progress-{}-{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    #[tokio::test]
+    async fn remove_dir_progress_reports_scan_then_every_entry() {
+        let root = unique_test_root("tree");
+        let nested = root.join("a/b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("file.txt"), "root file").unwrap();
+        std::fs::write(nested.join("deep.txt"), "deep file").unwrap();
+        let root_name = root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap();
+        // root, a, b = 3 directories; 2 files = 5 deletable entries.
+        let expected_total = 5usize;
+
+        let (on_progress, events) = event_collector();
+        remove_dir_all_with_progress(&root, &on_progress)
+            .await
+            .expect("delete tree");
+
+        assert!(!root.exists(), "tree should be fully removed");
+        let events = events.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(events
+            .iter()
+            .any(|event| event.phase == RemovePhase::Scanning && event.current == root_name));
+        let deletes: Vec<&RemoveProgress> = events
+            .iter()
+            .filter(|event| event.phase == RemovePhase::Deleting)
+            .collect();
+        assert_eq!(deletes.len(), expected_total);
+        // Files are unlinked before any directory is removed, and the root
+        // directory itself is the final entry.
+        assert_eq!(deletes[0].current, "file.txt");
+        assert_eq!(deletes.last().expect("final event").current, root_name);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn remove_dir_progress_unlinks_windows_dir_links() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = unique_test_root("win-link");
+        let outside = unique_test_root("win-link-outside");
+        std::fs::create_dir_all(outside.join("target")).unwrap();
+        std::fs::write(outside.join("target/kept.txt"), "must survive").unwrap();
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        // Creating a directory symlink needs developer mode or privilege;
+        // skip the assertion path when the environment disallows it.
+        if symlink_dir(&outside.join("target"), root.join("link")).is_err() {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+        // root, dir, and the link = 3 entries; the link must go through
+        // remove_dir, not remove_file.
+        let expected_total = 3usize;
+
+        let (on_progress, events) = event_collector();
+        remove_dir_all_with_progress(&root, &on_progress)
+            .await
+            .expect("delete tree with directory link");
+
+        assert!(!root.exists());
+        assert!(outside.join("target/kept.txt").exists(), "target untouched");
+        let events = events.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let last = events.last().expect("completion event");
+        assert_eq!(last.phase, RemovePhase::Deleting);
+        assert_eq!(last.total, Some(expected_total));
+        assert_eq!(last.deleted, expected_total);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_dir_progress_does_not_follow_symlinks() {
+        let root = unique_test_root("symlink");
+        let outside = unique_test_root("symlink-outside");
+        std::fs::create_dir_all(outside.join("target")).unwrap();
+        std::fs::write(outside.join("target/kept.txt"), "must survive").unwrap();
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::os::unix::fs::symlink(&outside.join("target"), root.join("link")).unwrap();
+        // link is deleted as an entry; dir adds one directory. The linked
+        // target's contents must not appear in the count.
+        let expected_total = 3usize;
+
+        let (on_progress, events) = event_collector();
+        remove_dir_all_with_progress(&root, &on_progress)
+            .await
+            .expect("delete tree with symlink");
+
+        assert!(!root.exists());
+        assert!(outside.join("target/kept.txt").exists(), "target untouched");
+        let events = events.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let last = events.last().expect("completion event");
+        assert_eq!(last.phase, RemovePhase::Deleting);
+        assert_eq!(last.total, Some(expected_total));
+        assert_eq!(last.deleted, expected_total);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

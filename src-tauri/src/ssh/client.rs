@@ -131,6 +131,40 @@ pub struct SshConnection {
     handle: Handle<ClientHandler>,
 }
 
+/// Phase of a recursive delete reported through the `sftp-remove-progress`
+/// event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovePhase {
+    Scanning,
+    Deleting,
+}
+
+impl RemovePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemovePhase::Scanning => "scanning",
+            RemovePhase::Deleting => "deleting",
+        }
+    }
+}
+
+/// One finished step of a recursive delete, forwarded to the webview so the
+/// explorer can render a live progress bar.
+#[derive(Clone, Debug)]
+pub struct RemoveProgress {
+    pub phase: RemovePhase,
+    pub deleted: usize,
+    pub total: Option<usize>,
+    pub current: String,
+}
+
+fn last_path_segment(path: &str) -> String {
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
 impl SshConnection {
     pub async fn connect(
         host: &str,
@@ -483,7 +517,11 @@ impl SshConnection {
             .map_err(|e| SshError::SessionError(e.to_string()))
     }
 
-    pub async fn remove_path_via_sftp(&self, path: &str) -> Result<(), SshError> {
+    pub async fn remove_path_via_sftp(
+        &self,
+        path: &str,
+        on_progress: Option<&(dyn Fn(RemoveProgress) + Send + Sync)>,
+    ) -> Result<(), SshError> {
         let sftp = self.open_sftp().await?;
         // LSTAT semantics: a symlink to a directory is unlinked as a link
         // instead of deleting the target's contents.
@@ -509,6 +547,14 @@ impl SshConnection {
         let mut queue = vec![path.to_string()];
         while let Some(dir) = queue.pop() {
             dirs.push(dir.clone());
+            if let Some(progress) = on_progress {
+                progress(RemoveProgress {
+                    phase: RemovePhase::Scanning,
+                    deleted: 0,
+                    total: None,
+                    current: last_path_segment(&dir),
+                });
+            }
             if dirs.len() > MAX_SFTP_DELETE_DIRS {
                 return Err(SshError::SessionError(format!(
                     "Refusing to delete: directory tree exceeds {MAX_SFTP_DELETE_DIRS} directories"
@@ -547,16 +593,36 @@ impl SshConnection {
                 }
             }
         }
+        let total = files.len() + dirs.len();
+        let mut deleted = 0usize;
         for file in &files {
             sftp.remove_file(file)
                 .await
                 .map_err(|e| SshError::SessionError(e.to_string()))?;
+            deleted += 1;
+            if let Some(progress) = on_progress {
+                progress(RemoveProgress {
+                    phase: RemovePhase::Deleting,
+                    deleted,
+                    total: Some(total),
+                    current: last_path_segment(file),
+                });
+            }
         }
         // Reverse discovery order removes deepest directories first.
         for dir in dirs.iter().rev() {
             sftp.remove_dir(dir)
                 .await
                 .map_err(|e| SshError::SessionError(e.to_string()))?;
+            deleted += 1;
+            if let Some(progress) = on_progress {
+                progress(RemoveProgress {
+                    phase: RemovePhase::Deleting,
+                    deleted,
+                    total: Some(total),
+                    current: last_path_segment(dir),
+                });
+            }
         }
         Ok(())
     }

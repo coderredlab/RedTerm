@@ -430,8 +430,12 @@ export async function sftpCreateFile(sessionId: string, path: string): Promise<v
   return invoke<void>("sftp_create_file", { sessionId, path });
 }
 
-export async function sftpRemovePath(sessionId: string, path: string): Promise<void> {
-  return invoke<void>("sftp_remove_path", { sessionId, path });
+export async function sftpRemovePath(
+  sessionId: string,
+  path: string,
+  originId: string
+): Promise<void> {
+  return invoke<void>("sftp_remove_path", { sessionId, path, originId });
 }
 
 export async function sftpDownloadToDir(
@@ -458,8 +462,8 @@ export async function localCreateFile(path: string): Promise<void> {
   return invoke<void>("local_create_file", { path });
 }
 
-export async function localRemovePath(path: string): Promise<void> {
-  return invoke<void>("local_remove_path", { path });
+export async function localRemovePath(path: string, originId: string): Promise<void> {
+  return invoke<void>("local_remove_path", { path, originId });
 }
 
 export async function localListDir(path: string): Promise<SftpDirEntry[]> {
@@ -540,6 +544,22 @@ export async function listenDownloadProgress(
   callback: (event: DownloadProgressEvent) => void
 ): Promise<UnlistenFn> {
   return listen<DownloadProgressEvent>("sftp-download-progress", (event) => {
+    callback(event.payload);
+  });
+}
+
+export interface RemoveProgressEvent {
+  path: string;
+  originId: string;
+  phase: "scanning" | "deleting";
+  deleted: number;
+  total: number | null;
+  current: string;
+}
+export async function listenRemoveProgress(
+  callback: (event: RemoveProgressEvent) => void
+): Promise<UnlistenFn> {
+  return listen<RemoveProgressEvent>("sftp-remove-progress", (event) => {
     callback(event.payload);
   });
 }

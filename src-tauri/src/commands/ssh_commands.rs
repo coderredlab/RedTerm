@@ -27,7 +27,9 @@ use crate::ssh::known_hosts::{
     list_known_hosts as list_known_hosts_entries, trust_host_key, HostKeyCheckResult,
     KnownHostEntry,
 };
-use crate::ssh::{AuthConfig, AuthMethod, SftpDirEntry, SshConnection, SshError, SshSession};
+use crate::ssh::{
+    AuthConfig, AuthMethod, RemoveProgress, SftpDirEntry, SshConnection, SshError, SshSession,
+};
 use crate::storage::{load_saved_password_for_connection, resolve_uploaded_key_for_auth};
 #[cfg(target_os = "android")]
 use tauri_plugin_redterm_android_paste::read_clipboard_image as read_native_clipboard_image;
@@ -1231,6 +1233,61 @@ pub(crate) fn make_download_progress_emitter(
     }
 }
 
+/// Identifies which explorer instance owns a recursive delete so the webview
+/// can ignore events emitted for other panes' operations. The id is minted
+/// by the frontend per explorer and passed to the delete command.
+#[derive(Clone)]
+pub(crate) struct RemoveOrigin {
+    pub origin_id: String,
+}
+
+/// Progress emitter for recursive deletes. Each entry removal is one SFTP
+/// round trip, so events are throttled by time and always fire on phase
+/// changes and completion so the progress bar never stalls or overshoots.
+pub(crate) fn make_remove_progress_emitter(
+    app: AppHandle,
+    path: String,
+    origin: RemoveOrigin,
+) -> impl Fn(RemoveProgress) + Send + Sync {
+    let state = std::sync::Mutex::new((
+        Option::<std::time::Instant>::None,
+        Option::<&'static str>::None,
+    ));
+    move |progress: RemoveProgress| {
+        let phase = progress.phase.as_str();
+        let finished = progress
+            .total
+            .is_some_and(|total| progress.deleted >= total);
+        let should_emit = {
+            let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+            let (last_emitted_at, last_phase) = &mut *guard;
+            let phase_changed = *last_phase != Some(phase);
+            let due = last_emitted_at
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(100));
+            if phase_changed || due || finished {
+                *last_emitted_at = Some(std::time::Instant::now());
+                *last_phase = Some(phase);
+                true
+            } else {
+                false
+            }
+        };
+        if should_emit {
+            let _ = app.emit(
+                "sftp-remove-progress",
+                serde_json::json!({
+                    "path": path,
+                    "originId": origin.origin_id,
+                    "phase": phase,
+                    "deleted": progress.deleted,
+                    "total": progress.total,
+                    "current": progress.current,
+                }),
+            );
+        }
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 pub struct SftpFileContent {
     pub path: String,
@@ -1587,14 +1644,23 @@ pub async fn sftp_create_file(
 
 #[tauri::command]
 pub async fn sftp_remove_path(
+    app: AppHandle,
     session_manager: State<'_, Arc<SessionManager>>,
     session_id: String,
     path: String,
+    origin_id: String,
 ) -> Result<(), String> {
     validate_sftp_browse_path(&path)?;
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+    let on_progress = make_remove_progress_emitter(
+        app,
+        path.clone(),
+        RemoveOrigin {
+            origin_id: origin_id,
+        },
+    );
     connection
-        .remove_path_via_sftp(&path)
+        .remove_path_via_sftp(&path, Some(&on_progress))
         .await
         .map_err(|e| e.to_string())
 }

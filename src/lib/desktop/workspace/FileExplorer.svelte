@@ -2,6 +2,7 @@
   import { onDestroy, untrack } from "svelte";
   import {
     listenDownloadProgress,
+    listenRemoveProgress,
     chooseDownloadSavePath,
     sanitizeDownloadDialogFileName,
     localCreateDir,
@@ -65,6 +66,16 @@
   let downloadingPaths = $state<string[]>([]);
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
   let downloads = $state<Record<string, { transferred: number; total: number | null }>>({});
+  let removals = $state<
+    Record<
+      string,
+      { phase: "scanning" | "deleting"; deleted: number; total: number | null; current: string }
+    >
+
+  >({});
+  // Identifies this explorer instance in delete progress events so a long
+  // delete in one pane can never leak into another pane's progress UI.
+  const removeOriginId = crypto.randomUUID();
   let breadcrumbViewport: HTMLDivElement | undefined;
   let destroyed = false;
   const canBrowse = $derived(kind === "local" || Boolean(sessionId));
@@ -167,13 +178,21 @@
     if (pending.path !== path) return;
     const entry = pending.entry;
     const target = joinPath(path, entry.name);
+    // One deletion per target: the progress bar identifies the running one.
+    if (removals[target] !== undefined) return;
+    removals[target] = { phase: "scanning", deleted: 0, total: null, current: entry.name };
     try {
-      if (kind === "local") await localRemovePath(target);
-      else await sftpRemovePath(sessionId!, target);
+      if (kind === "local") await localRemovePath(target, removeOriginId);
+      else await sftpRemovePath(sessionId!, target, removeOriginId);
       showStatus(`Deleted ${entry.name}`);
     } catch (error) {
       showStatus(`Delete failed: ${error instanceof Error ? error.message : String(error)}`);
       return;
+    } finally {
+      const finished = target;
+      setTimeout(() => {
+        delete removals[finished];
+      }, 1500);
     }
     await navigate(path);
   }
@@ -195,6 +214,39 @@
         const target = event.path;
         setTimeout(() => {
           delete downloads[target];
+        }, 1500);
+      }
+    }).then((fn) => {
+      if (cancelled) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  });
+
+  $effect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    listenRemoveProgress((event) => {
+      // Progress events are app-global; only accept the ones emitted by
+      // this explorer instance, so a long delete in another pane never
+      // renders here or trips the duplicate-delete guard.
+      if (event.originId !== removeOriginId) return;
+      removals[event.path] = {
+        phase: event.phase,
+        deleted: event.deleted,
+        total: event.total,
+        current: event.current,
+      };
+      if (event.total !== null && event.deleted >= event.total) {
+        const target = event.path;
+        setTimeout(() => {
+          delete removals[target];
         }, 1500);
       }
     }).then((fn) => {
@@ -445,6 +497,30 @@
           class:indeterminate={progress.total === null}
           style:width={progress.total !== null && progress.total > 0
             ? `${Math.min(100, (progress.transferred / progress.total) * 100)}%`
+            : "100%"}
+        ></div>
+      </div>
+    </div>
+  {/each}
+
+  {#each Object.entries(removals) as [target, progress] (target)}
+    <div class="download-progress">
+      <div class="download-progress-info">
+        <span class="download-progress-name">{baseName(target)}</span>
+        <span class="download-progress-bytes">
+          {progress.phase === "scanning"
+            ? "Scanning…"
+            : progress.total !== null
+              ? `${progress.deleted} / ${progress.total}`
+              : `${progress.deleted} deleted`}
+        </span>
+      </div>
+      <div class="download-track">
+        <div
+          class="download-fill"
+          class:indeterminate={progress.phase === "scanning" || progress.total === null}
+          style:width={progress.total !== null && progress.total > 0
+            ? `${Math.min(100, (progress.deleted / progress.total) * 100)}%`
             : "100%"}
         ></div>
       </div>

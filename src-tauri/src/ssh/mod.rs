@@ -7,4 +7,4 @@ pub mod session;
 mod known_hosts_tests;
 
 pub use auth::*;
-pub use client::{SftpDirEntry, SshConnection, SshError, SshSession};
+pub use client::{RemovePhase, RemoveProgress, SftpDirEntry, SshConnection, SshError, SshSession};
