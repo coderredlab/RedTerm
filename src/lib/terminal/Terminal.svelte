@@ -1048,9 +1048,31 @@
       };
       hiddenInput.addEventListener('paste', pasteHandler);
 
-      blurHandler = () => {
+      blurHandler = (event: FocusEvent) => {
         if (suppressBlurRefocus) {
           suppressBlurRefocus = false;
+          return;
+        }
+
+        // A focus that has moved into another editable surface (modal
+        // dialogs, document editors) is intentional; recapturing would steal
+        // typing away from it. relatedTarget is the element receiving focus
+        // and is reliable mid-transition, unlike document.activeElement,
+        // which can still report body while focus steps are in flight —
+        // fall back to it only when relatedTarget is absent (focus leaving
+        // the document, e.g. a window switch).
+        const destination =
+          event.relatedTarget instanceof HTMLElement
+            ? event.relatedTarget
+            : document.activeElement instanceof HTMLElement
+              ? document.activeElement
+              : null;
+        if (
+          destination !== null &&
+          (destination.tagName === 'INPUT' ||
+            destination.tagName === 'TEXTAREA' ||
+            destination.isContentEditable)
+        ) {
           return;
         }
 
@@ -2708,14 +2730,23 @@
 
     if (suppressNextFocus) {
       suppressNextFocus = false;
-      return;
     }
 
     if (selectionMode) {
       if (!selectedText.trim()) {
         exitSelectionMode();
+      } else {
+        // Keep an active selection (and its toolbar) focused off.
+        return;
       }
-      return;
+    }
+
+    // The pointerdown handlers preventDefault, so a mouse click never moves
+    // focus on its own. Restore it on desktop, otherwise focus lost to a
+    // modal, a window switch, or an earlier selection stays lost and typing
+    // silently dies until some other surface refocuses the pane.
+    if (isDesktopTarget) {
+      focusInput();
     }
   }
 
