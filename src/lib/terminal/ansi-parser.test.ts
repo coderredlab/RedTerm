@@ -3223,3 +3223,33 @@ describe("AnsiParser scrollback limit", () => {
     expect(restored.getScrollbackLength()).toBe(2);
   });
 });
+
+describe("AnsiParser bell events", () => {
+  test("fires the bell handler for BEL and keeps OSC terminators silent", () => {
+    const parser = new AnsiParser(20, 3);
+    let bells = 0;
+    parser.setBellHandler(() => {
+      bells++;
+    });
+
+    parser.write("a\x07b\x07");
+    parser.write("\x1b]2;title\x07");
+
+    expect(bells).toBe(2);
+    // BEL renders nothing and the OSC terminator consumes only its own sequence.
+    expect(visibleRowText(parser).trimEnd()).toBe("ab");
+  });
+
+  test("allows unregistering the bell handler", () => {
+    const parser = new AnsiParser(20, 3);
+    let bells = 0;
+    parser.setBellHandler(() => {
+      bells++;
+    });
+    parser.setBellHandler(null);
+
+    parser.write("a\x07");
+
+    expect(bells).toBe(0);
+  });
+});

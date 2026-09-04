@@ -29,6 +29,7 @@
     localShellWrite,
     localShellResize,
     localShellDisconnect,
+    sendDesktopBellNotification,
     listenLocalData,
     listenLocalExit,
     type AuthConfig,
@@ -183,6 +184,19 @@
 
   let osc52ApprovalOpen = $state(false);
   let osc52ApprovalResolver: ((decision: boolean) => void) | null = null;
+
+  const BELL_NOTIFICATION_COOLDOWN_MS = 2000;
+  let lastBellNotificationAt = 0;
+
+  function notifyBell() {
+    // Only surface a system notification when the session is out of sight.
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    if (interactive && document.hasFocus()) return;
+    const now = Date.now();
+    if (now - lastBellNotificationAt < BELL_NOTIFICATION_COOLDOWN_MS) return;
+    lastBellNotificationAt = now;
+    void sendDesktopBellNotification(kind === "local" ? "Local shell" : host);
+  }
 
   function requestOsc52Approval(): Promise<boolean> {
     terminalModalGate.enter();
@@ -2458,6 +2472,7 @@
     parser = new AnsiParser(cols, rows);
     parser.setCellSize(charWidth, charHeight);
     parser.setMaxScrollback(settingsStore.scrollbackLines);
+    parser.setBellHandler(notifyBell);
     const theme = getThemeById(settingsStore.theme) ?? THEMES[0];
     renderer?.updateConfig({
       defaultFg: theme.colors.terminalFg,

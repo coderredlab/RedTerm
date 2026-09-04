@@ -503,6 +503,7 @@ export class AnsiParser {
   private kittyKeyboardMainStack: number[] = [];
   private kittyKeyboardAlternateStack: number[] = [];
   private bracketedPasteMode = false;
+  private bellHandler: (() => void) | null = null;
   private cursorVisible = true;
   private usingAlternateScreen = false;
   private mainScreenBuffer: Cell[][] | null = null;
@@ -987,7 +988,7 @@ export class AnsiParser {
           // Tab to next 8-column boundary
           this.cursorX = Math.min(this.cols - 1, (Math.floor(this.cursorX / 8) + 1) * 8);
         } else if (char === '\x07') {
-          // Bell - ignore
+          this.bellHandler?.();
         } else if (char >= ' ') {
           this.putChar(char);
         }
@@ -5105,6 +5106,11 @@ export class AnsiParser {
       this.scrollback = this.scrollback.slice(overflow);
     }
     this.markAllRowsDirty();
+  }
+
+  /** Registers a callback fired whenever the application writes a BEL in the normal stream. */
+  setBellHandler(handler: (() => void) | null): void {
+    this.bellHandler = handler;
   }
 
   getScrollbackLength(): number {

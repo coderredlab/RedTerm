@@ -66,6 +66,23 @@ export async function relaunchDesktopApp(): Promise<void> {
   await invoke("restart_application");
 }
 
+/** Sends a desktop notification when a background session rings the terminal bell. */
+export async function sendDesktopBellNotification(sourceLabel: string): Promise<void> {
+  // Dynamic import on purpose: test module graphs replace @tauri-apps/api/core with a
+  // partial mock, so a static plugin import would fail to load there (same as the updater).
+  const { isPermissionGranted, requestPermission, sendNotification } =
+    await import("@tauri-apps/plugin-notification");
+  let granted = await isPermissionGranted();
+  if (!granted) {
+    granted = (await requestPermission()) === "granted";
+  }
+  if (!granted) return;
+  sendNotification({
+    title: `${sourceLabel}: terminal bell`,
+    body: "A background session is requesting attention.",
+  });
+}
+
 
 export async function listSystemFonts(): Promise<string[]> {
   return invoke<string[]>("list_system_fonts");
