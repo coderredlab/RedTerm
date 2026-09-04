@@ -4,5 +4,9 @@
   "description": "Desktop-only system notifications for terminal bells in background sessions",
   "windows": ["main"],
   "platforms": ["linux", "macOS", "windows"],
-  "permissions": ["notification:default"]
+  "permissions": [
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "notification:allow-notify"
+  ]
 }

@@ -67,7 +67,10 @@ function loadFromStorage(): SettingsData {
       keepScreenOn: typeof parsed.keepScreenOn === "boolean" ? parsed.keepScreenOn : DEFAULTS.keepScreenOn,
       extraKeysHeight: clamp(parsed.extraKeysHeight ?? DEFAULTS.extraKeysHeight, 4, 20),
       tabBarPosition: parsed.tabBarPosition === "bottom" ? "bottom" : "top",
-      scrollbackLines: clamp(parsed.scrollbackLines ?? DEFAULTS.scrollbackLines, 0, 50000),
+      scrollbackLines:
+        typeof parsed.scrollbackLines === "number" && Number.isFinite(parsed.scrollbackLines)
+          ? clamp(parsed.scrollbackLines, 0, 50000)
+          : DEFAULTS.scrollbackLines,
       bellNotifications:
         typeof parsed.bellNotifications === "boolean"
           ? parsed.bellNotifications

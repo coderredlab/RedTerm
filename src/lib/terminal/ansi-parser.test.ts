@@ -3222,6 +3222,29 @@ describe("AnsiParser scrollback limit", () => {
 
     expect(restored.getScrollbackLength()).toBe(2);
   });
+
+  test("keeps none when the limit is zero, including snapshot restore", () => {
+    const source = new AnsiParser(20, 3);
+    source.write("a\r\nb\r\nc\r\nd\r\ne");
+    const snapshot = source.createSnapshot();
+
+    const restored = new AnsiParser(20, 3);
+    restored.setMaxScrollback(0);
+    restored.restoreSnapshot(snapshot);
+
+    expect(restored.getScrollbackLength()).toBe(0);
+    expect(visibleRowText(restored).trimEnd()).toBe("c");
+  });
+  test("evicts trimmed rows from the full buffer immediately", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write("a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh");
+    expect(parser.getScrollbackLength()).toBe(5);
+
+    parser.setMaxScrollback(2);
+
+    expect(parser.getScrollbackLength()).toBe(2);
+    expect(parser.getFullBuffer().length).toBe(5);
+  });
 });
 
 describe("AnsiParser bell events", () => {

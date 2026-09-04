@@ -629,8 +629,8 @@ export class AnsiParser {
     snapshotCursorY: number,
     preserveLatestLines: boolean,
   ): { buffer: Cell[][]; scrollback: Cell[][]; cursorY: number; removedTopRows: number } {
-    const normalizedScrollback = (snapshotScrollbackRows ?? [])
-      .slice(-this.maxScrollback)
+    const normalizedScrollback = this
+      .tailScrollback(snapshotScrollbackRows ?? [])
       .map((row) => this.snapshotRowToBufferRow(row));
     let removedTopRows = Math.max(0, (snapshotScrollbackRows?.length ?? 0) - normalizedScrollback.length);
     let nextScrollback = normalizedScrollback;
@@ -642,7 +642,7 @@ export class AnsiParser {
         const overflowCount = visibleRows.length - this.rows;
         const combinedScrollback = normalizedScrollback.concat(visibleRows.slice(0, overflowCount));
         removedTopRows += Math.max(0, combinedScrollback.length - this.maxScrollback);
-        nextScrollback = combinedScrollback.slice(-this.maxScrollback);
+        nextScrollback = this.tailScrollback(combinedScrollback);
         visibleRows = visibleRows.slice(overflowCount);
         nextCursorY = Math.max(0, snapshotCursorY - overflowCount);
       } else if (visibleRows.length < this.rows) {
@@ -743,10 +743,10 @@ export class AnsiParser {
         const trimmedCount = Math.max(0, oldCursorY - (rows - 1));
         const trimmedRows = oldBuffer.slice(0, trimmedCount);
         const trimmedOrigins = nextBufferOrigins.slice(0, trimmedCount);
-        nextScrollback = oldScrollback.concat(trimmedRows).slice(-this.maxScrollback);
-        nextScrollbackOrigins = nextScrollbackOrigins
-          .concat(trimmedOrigins)
-          .slice(-this.maxScrollback);
+        nextScrollback = this.tailScrollback(oldScrollback.concat(trimmedRows));
+        nextScrollbackOrigins = this.tailScrollback(
+          nextScrollbackOrigins.concat(trimmedOrigins),
+        );
         nextBufferRows = oldBuffer.slice(trimmedCount);
         nextBufferOrigins = nextBufferOrigins.slice(trimmedCount);
         nextCursorY = Math.max(0, oldCursorY - trimmedCount);
@@ -856,12 +856,12 @@ export class AnsiParser {
       const overflowCount = Math.max(0, finalRows.length - rows);
       if (overflowCount > 0) {
         if (!this.usingAlternateScreen) {
-          nextScrollback = nextScrollback
-            .concat(finalRows.slice(0, overflowCount))
-            .slice(-this.maxScrollback);
-          nextScrollbackOrigins = nextScrollbackOrigins
-            .concat(finalOrigins.slice(0, overflowCount))
-            .slice(-this.maxScrollback);
+          nextScrollback = this.tailScrollback(
+            nextScrollback.concat(finalRows.slice(0, overflowCount)),
+          );
+          nextScrollbackOrigins = this.tailScrollback(
+            nextScrollbackOrigins.concat(finalOrigins.slice(0, overflowCount)),
+          );
         }
         finalRows = finalRows.slice(overflowCount);
         finalOrigins = finalOrigins.slice(overflowCount);
@@ -3957,9 +3957,14 @@ export class AnsiParser {
     this.mainScreenBuffer = null;
     this.mainScreenScrollback = [];
     this.images = this.mainScreenImages;
-    this.mainScreenImages = [];
     this.kittyVirtualPlacements = this.mainScreenKittyVirtualPlacements;
     this.kittyRelativePlacements = this.mainScreenKittyRelativePlacements;
+    // A shrunken scrollback limit may have dropped saved main-screen rows;
+    // rebase only after the main-screen maps are back in place.
+    if (restoredMainScreen.removedTopRows > 0) {
+      this.rebaseImageRows(restoredMainScreen.removedTopRows);
+    }
+    this.mainScreenImages = [];
     this.mainScreenKittyVirtualPlacements = new Map();
     this.mainScreenKittyRelativePlacements = new Map();
     this.pendingKittyImage = null;
@@ -5095,8 +5100,8 @@ export class AnsiParser {
     return result.filter(intersectsVisibleRows);
   }
 
-  /** Applies a user-configured scrollback ceiling and trims the overflow immediately. */
   setMaxScrollback(max: number): void {
+    if (!Number.isFinite(max)) return;
     const bounded = Math.max(0, Math.min(50000, Math.floor(max)));
     if (bounded === this.maxScrollback) return;
     this.maxScrollback = bounded;
@@ -5104,8 +5109,15 @@ export class AnsiParser {
     if (overflow > 0) {
       for (let i = 0; i < overflow; i++) this.eraseTextSizingInAbsoluteRow(i);
       this.scrollback = this.scrollback.slice(overflow);
+      this.rebaseImageRows(overflow);
     }
+    this.markFullBufferDirty();
     this.markAllRowsDirty();
+  }
+
+  /** Tail-trims rows to the configured scrollback limit; a limit of 0 keeps none. */
+  private tailScrollback<T>(rows: T[]): T[] {
+    return this.maxScrollback === 0 ? [] : rows.slice(-this.maxScrollback);
   }
 
   /** Registers a callback fired whenever the application writes a BEL in the normal stream. */

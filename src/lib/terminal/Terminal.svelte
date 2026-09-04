@@ -148,6 +148,9 @@
   // Keep every parser instance aligned with the configured scrollback size.
   $effect(() => {
     parser?.setMaxScrollback(settingsStore.scrollbackLines);
+    // Force a full refresh without the auto-stick-to-bottom jump so a reader
+    // keeps their viewport when the limit grows or shrinks.
+    updateBuffer(true, { preserveViewport: true });
   });
 
   // Cursor blink follows the user setting; off keeps a solid cursor.
@@ -211,6 +214,7 @@
     if (!("__TAURI_INTERNALS__" in window)) return;
     if (interactive && document.hasFocus()) return;
     if (!settingsStore.bellNotifications) return;
+    if (!isDesktopTarget) return;
     const now = Date.now();
     if (now - lastBellNotificationAt < BELL_NOTIFICATION_COOLDOWN_MS) return;
     lastBellNotificationAt = now;
@@ -1493,15 +1497,14 @@
     }, Math.max(MIN_IMAGE_ANIMATION_DELAY_MS, delay));
   }
 
-  function updateBuffer(force = false) {
+  function updateBuffer(force = false, options: { preserveViewport?: boolean } = {}) {
     // force=true: 앱 복귀 시 selection/throttle 무시하고 강제 렌더링
     if (!force && selectionMode) {
       pendingSelectionRefresh = true;
       return;
     }
 
-    // 강제 렌더링 시 stickToBottom 복원 + pending 무시
-    if (force) {
+    if (force && !options.preserveViewport) {
       autoStickToBottom = true;
     }
 

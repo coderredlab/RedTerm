@@ -70,6 +70,7 @@
   let updateDownload = $derived(
     desktopUpdateStore.phase.kind === "downloading" ? desktopUpdateStore.phase : null
   );
+  let updateErrorPrompt = $state<string | null>(null);
 
   const terminals = new Map<string, Terminal>();
   const confirmingTabIds = new Set<string>();
@@ -148,6 +149,8 @@
       closePrompt === null &&
       updateOfferPrompt === null &&
       updateRestartPrompt === null &&
+      updateErrorPrompt === null &&
+      updateDownload === null &&
       sessionsReconciled;
     if (
       !tab ||
@@ -185,7 +188,7 @@
       if (desktopUpdateStore.phase.kind === "ready") {
         updateRestartPrompt = update;
       } else if (desktopUpdateStore.phase.kind === "error") {
-        await showWarning(desktopUpdateStore.phase.message);
+        updateErrorPrompt = desktopUpdateStore.phase.message;
       }
     })();
   }
@@ -936,6 +939,8 @@
         closePrompt === null &&
         updateOfferPrompt === null &&
         updateRestartPrompt === null &&
+        updateErrorPrompt === null &&
+        updateDownload === null &&
         !terminalModalGate.open &&
         sessionsReconciled,
       terminalTarget
@@ -1030,6 +1035,8 @@
                 closePrompt === null &&
                 updateOfferPrompt === null &&
                 updateRestartPrompt === null &&
+                updateErrorPrompt === null &&
+                updateDownload === null &&
                 tab.id === tabsStore.activeTabId}
               activePaneId={tab.activePaneId}
             />
@@ -1096,6 +1103,17 @@
     version={updateDownload?.version ?? null}
     downloaded={updateDownload?.downloaded ?? 0}
     total={updateDownload?.total ?? null}
+  />
+
+  <CloseConfirmationModal
+    open={updateErrorPrompt !== null}
+    title="Update failed"
+    message={updateErrorPrompt ?? ""}
+    detail="The current version keeps running. You can retry from Settings → Updates."
+    confirmLabel="Close"
+    destructive={false}
+    onCancel={() => (updateErrorPrompt = null)}
+    onConfirm={() => (updateErrorPrompt = null)}
   />
 
   <CloseConfirmationModal

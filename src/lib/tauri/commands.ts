@@ -57,7 +57,7 @@ export async function installDesktopUpdate(
       downloaded += event.data.chunkLength;
       onProgress?.(downloaded, total);
     }
-  });
+  }, { timeout: 120_000 });
   pendingDesktopUpdate = null;
 }
 
@@ -65,6 +65,10 @@ export async function installDesktopUpdate(
 export async function relaunchDesktopApp(): Promise<void> {
   await invoke("restart_application");
 }
+
+/** Global cooldown so background sessions cannot flood the OS notification center. */
+const BELL_NOTIFICATION_GLOBAL_COOLDOWN_MS = 2000;
+let lastBellNotificationSentAt = 0;
 
 /** Sends a desktop notification when a background session rings the terminal bell. */
 export async function sendDesktopBellNotification(sourceLabel: string): Promise<void> {
@@ -77,6 +81,9 @@ export async function sendDesktopBellNotification(sourceLabel: string): Promise<
     granted = (await requestPermission()) === "granted";
   }
   if (!granted) return;
+  const now = Date.now();
+  if (now - lastBellNotificationSentAt < BELL_NOTIFICATION_GLOBAL_COOLDOWN_MS) return;
+  lastBellNotificationSentAt = now;
   sendNotification({
     title: `${sourceLabel}: terminal bell`,
     body: "A background session is requesting attention.",
