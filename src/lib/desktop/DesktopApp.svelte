@@ -32,6 +32,7 @@
   import TabStrip from "./workspace/TabStrip.svelte";
   import SettingsModal from "./workspace/SettingsModal.svelte";
   import CloseConfirmationModal from "./workspace/CloseConfirmationModal.svelte";
+  import UpdateProgressModal from "./workspace/UpdateProgressModal.svelte";
   import { desktopPrefsStore } from "./workspace/desktop-prefs.svelte";
   import { desktopUpdateStore } from "./workspace/desktop-update.svelte";
   import {
@@ -65,6 +66,9 @@
 
   let updateOfferPrompt = $state<DesktopUpdateInfo | null>(null);
   let updateRestartPrompt = $state<DesktopUpdateInfo | null>(null);
+  let updateDownload = $derived(
+    desktopUpdateStore.phase.kind === "downloading" ? desktopUpdateStore.phase : null
+  );
 
   const terminals = new Map<string, Terminal>();
   const confirmingTabIds = new Set<string>();
@@ -178,6 +182,8 @@
       await desktopUpdateStore.install({ platformWarningAcknowledged: true });
       if (desktopUpdateStore.phase.kind === "ready") {
         updateRestartPrompt = update;
+      } else if (desktopUpdateStore.phase.kind === "error") {
+        await showWarning(desktopUpdateStore.phase.message);
       }
     })();
   }
@@ -1081,6 +1087,13 @@
     destructive={false}
     onCancel={() => (updateRestartPrompt = null)}
     onConfirm={() => void restartForUpdate()}
+  />
+
+  <UpdateProgressModal
+    open={updateDownload !== null}
+    version={updateDownload?.version ?? null}
+    downloaded={updateDownload?.downloaded ?? 0}
+    total={updateDownload?.total ?? null}
   />
 
   <CloseConfirmationModal

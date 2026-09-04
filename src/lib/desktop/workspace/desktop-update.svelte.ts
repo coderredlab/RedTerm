@@ -12,7 +12,7 @@ export type DesktopUpdatePhase =
   | { kind: "checking" }
   | { kind: "upToDate" }
   | { kind: "available"; update: DesktopUpdateInfo }
-  | { kind: "downloading"; downloaded: number; total: number | null }
+  | { kind: "downloading"; version: string; downloaded: number; total: number | null }
   | { kind: "ready"; update: DesktopUpdateInfo }
   | { kind: "error"; message: string };
 
@@ -73,10 +73,10 @@ function createDesktopUpdate() {
             );
         if (!confirmed) return;
       }
-      phase = { kind: "downloading", downloaded: 0, total: null };
+      phase = { kind: "downloading", version: update.version, downloaded: 0, total: null };
       try {
         await installDesktopUpdate((downloaded, total) => {
-          phase = { kind: "downloading", downloaded, total };
+          phase = { kind: "downloading", version: update.version, downloaded, total };
         });
         phase = { kind: "ready", update };
       } catch {
