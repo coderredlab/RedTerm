@@ -5094,6 +5094,19 @@ export class AnsiParser {
     return result.filter(intersectsVisibleRows);
   }
 
+  /** Applies a user-configured scrollback ceiling and trims the overflow immediately. */
+  setMaxScrollback(max: number): void {
+    const bounded = Math.max(0, Math.min(50000, Math.floor(max)));
+    if (bounded === this.maxScrollback) return;
+    this.maxScrollback = bounded;
+    const overflow = this.scrollback.length - bounded;
+    if (overflow > 0) {
+      for (let i = 0; i < overflow; i++) this.eraseTextSizingInAbsoluteRow(i);
+      this.scrollback = this.scrollback.slice(overflow);
+    }
+    this.markAllRowsDirty();
+  }
+
   getScrollbackLength(): number {
     return this.scrollback.length;
   }

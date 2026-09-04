@@ -143,6 +143,11 @@
   let currentDirectoryUri: string | null = null;
   let hiddenInput: HTMLTextAreaElement;
   let parser: AnsiParser | null = null;
+
+  // Keep every parser instance aligned with the configured scrollback size.
+  $effect(() => {
+    parser?.setMaxScrollback(settingsStore.scrollbackLines);
+  });
   let sessionId: string | null = null;
   let unlisten: (() => void) | null = null;
   let unlistenExit: (() => void) | null = null;
@@ -2452,6 +2457,7 @@
     if (notifyTitleReset) onTitleChange?.("");
     parser = new AnsiParser(cols, rows);
     parser.setCellSize(charWidth, charHeight);
+    parser.setMaxScrollback(settingsStore.scrollbackLines);
     const theme = getThemeById(settingsStore.theme) ?? THEMES[0];
     renderer?.updateConfig({
       defaultFg: theme.colors.terminalFg,

@@ -23,6 +23,14 @@
   let highlightedFontIndex = $state(0);
   let fontTypeahead = "";
   let fontTypeaheadTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const SCROLLBACK_OPTIONS = [
+    { value: 1000, label: "1k" },
+    { value: 5000, label: "5k" },
+    { value: 10000, label: "10k" },
+    { value: 20000, label: "20k" },
+    { value: 50000, label: "50k" },
+  ];
   let fontOptions = $derived([
     "",
     ...(fontListStatus !== "ready" &&
@@ -444,6 +452,24 @@
         </section>
 
         <section class="settings-section">
+          <div class="section-label">Scrollback</div>
+          <div class="scrollback-field">
+            <span class="control-label" id="scrollback-size-label">Buffer size</span>
+            <div class="theme-filter" role="group" aria-labelledby="scrollback-size-label">
+              {#each SCROLLBACK_OPTIONS as option (option.value)}
+                <button
+                  type="button"
+                  class:active={settingsStore.scrollbackLines === option.value}
+                  aria-pressed={settingsStore.scrollbackLines === option.value}
+                  onclick={() => settingsStore.setScrollbackLines(option.value)}
+                >{option.label}</button>
+              {/each}
+            </div>
+            <span class="control-hint">Terminal lines kept above the viewport.</span>
+          </div>
+        </section>
+
+        <section class="settings-section">
           <div class="theme-heading">
             <div class="section-label">Theme</div>
             <div class="theme-filter" role="group" aria-label="Theme appearance">
@@ -688,7 +714,8 @@
   }
 
   .font-family-field,
-  .font-size-field {
+  .font-size-field,
+  .scrollback-field {
     display: flex;
     flex-direction: column;
     gap: 6px;

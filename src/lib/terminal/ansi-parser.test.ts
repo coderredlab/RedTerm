@@ -3180,3 +3180,46 @@ describe("AnsiParser reflow wide-char boundaries", () => {
     ]);
   });
 });
+
+describe("AnsiParser scrollback limit", () => {
+  test("caps scrollback at the configured limit", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.setMaxScrollback(5);
+    parser.write("a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh");
+
+    expect(parser.getScrollbackLength()).toBe(5);
+  });
+
+  test("trims existing scrollback immediately when the limit shrinks", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.write("a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh");
+    expect(parser.getScrollbackLength()).toBe(5);
+
+    parser.setMaxScrollback(2);
+
+    expect(parser.getScrollbackLength()).toBe(2);
+  });
+
+  test("clamps the configured limit into the supported range", () => {
+    const parser = new AnsiParser(20, 3);
+    parser.setMaxScrollback(-10);
+    parser.write("a\r\nb\r\nc\r\nd");
+    expect(parser.getScrollbackLength()).toBe(0);
+
+    parser.setMaxScrollback(999999);
+    parser.write("\r\ne\r\nf\r\ng\r\nh");
+    expect(parser.getScrollbackLength()).toBe(4);
+  });
+
+  test("applies the limit when restoring a snapshot", () => {
+    const source = new AnsiParser(20, 3);
+    source.write("a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng\r\nh");
+    const snapshot = source.createSnapshot();
+
+    const restored = new AnsiParser(20, 3);
+    restored.setMaxScrollback(2);
+    restored.restoreSnapshot(snapshot);
+
+    expect(restored.getScrollbackLength()).toBe(2);
+  });
+});

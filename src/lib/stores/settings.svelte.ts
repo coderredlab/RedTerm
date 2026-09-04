@@ -24,6 +24,7 @@ export interface SettingsData {
   extraKeysHeight: number;
   keepScreenOn: boolean;
   tabBarPosition: TabBarPosition;
+  scrollbackLines: number;
 }
 
 const DEFAULTS: SettingsData = {
@@ -33,6 +34,7 @@ const DEFAULTS: SettingsData = {
   extraKeysHeight: 10,
   keepScreenOn: false,
   tabBarPosition: "top",
+  scrollbackLines: 1000,
 };
 
 function canUseStorage(): boolean {
@@ -56,9 +58,10 @@ function loadFromStorage(): SettingsData {
           ? parsed.terminalFontFamily
           : DEFAULTS.terminalFontFamily,
       theme: getThemeById(parsed.theme) ? parsed.theme : DEFAULTS.theme,
-      extraKeysHeight: clamp(parsed.extraKeysHeight ?? DEFAULTS.extraKeysHeight, 4, 20),
       keepScreenOn: typeof parsed.keepScreenOn === "boolean" ? parsed.keepScreenOn : DEFAULTS.keepScreenOn,
+      extraKeysHeight: clamp(parsed.extraKeysHeight ?? DEFAULTS.extraKeysHeight, 4, 20),
       tabBarPosition: parsed.tabBarPosition === "bottom" ? "bottom" : "top",
+      scrollbackLines: clamp(parsed.scrollbackLines ?? DEFAULTS.scrollbackLines, 0, 50000),
     };
   } catch {
     return { ...DEFAULTS };
@@ -85,6 +88,7 @@ function createSettingsStore() {
   let extraKeysHeight = $state(DEFAULTS.extraKeysHeight);
   let keepScreenOn = $state(DEFAULTS.keepScreenOn);
   let tabBarPosition = $state<TabBarPosition>(DEFAULTS.tabBarPosition);
+  let scrollbackLines = $state(DEFAULTS.scrollbackLines);
 
   function load() {
     const data = loadFromStorage();
@@ -94,6 +98,7 @@ function createSettingsStore() {
     extraKeysHeight = data.extraKeysHeight;
     keepScreenOn = data.keepScreenOn;
     tabBarPosition = data.tabBarPosition;
+    scrollbackLines = data.scrollbackLines;
   }
 
   function persist() {
@@ -104,6 +109,7 @@ function createSettingsStore() {
       extraKeysHeight,
       keepScreenOn,
       tabBarPosition,
+      scrollbackLines,
     });
   }
 
@@ -114,6 +120,7 @@ function createSettingsStore() {
     get extraKeysHeight() { return extraKeysHeight; },
     get keepScreenOn() { return keepScreenOn; },
     get tabBarPosition() { return tabBarPosition; },
+    get scrollbackLines() { return scrollbackLines; },
 
     load,
 
@@ -152,6 +159,11 @@ function createSettingsStore() {
 
     setTabBarPosition(v: TabBarPosition) {
       tabBarPosition = v;
+      persist();
+    },
+
+    setScrollbackLines(v: number) {
+      scrollbackLines = clamp(v, 0, 50000);
       persist();
     },
 
