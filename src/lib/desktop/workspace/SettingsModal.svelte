@@ -31,6 +31,17 @@
     { value: 20000, label: "20k" },
     { value: 50000, label: "50k" },
   ];
+
+  type SettingsSection = "terminal" | "appearance" | "shortcuts" | "updates";
+
+  const SETTINGS_SECTIONS: Array<{ id: SettingsSection; label: string }> = [
+    { id: "terminal", label: "Terminal" },
+    { id: "appearance", label: "Appearance" },
+    { id: "shortcuts", label: "Shortcuts" },
+    { id: "updates", label: "Updates" },
+  ];
+
+  let activeSection = $state<SettingsSection>("terminal");
   let fontOptions = $derived([
     "",
     ...(fontListStatus !== "ready" &&
@@ -334,7 +345,21 @@
         >×</button>
       </header>
 
-      <div class="settings-body">
+      <div class="settings-layout">
+        <nav class="settings-nav" aria-label="Settings sections">
+          {#each SETTINGS_SECTIONS as section (section.id)}
+            <button
+              type="button"
+              class="settings-nav-item"
+              class:active={activeSection === section.id}
+              aria-current={activeSection === section.id}
+              onclick={() => (activeSection = section.id)}
+            >{section.label}</button>
+          {/each}
+        </nav>
+
+        <div class="settings-body">
+        {#if activeSection === "terminal"}
         <section class="settings-section">
           <div class="section-label">Terminal typography</div>
           <div class="font-controls">
@@ -468,6 +493,7 @@
             <span class="control-hint">Terminal lines kept above the viewport.</span>
           </div>
         </section>
+        {:else if activeSection === "appearance"}
 
         <section class="settings-section">
           <div class="theme-heading">
@@ -516,6 +542,7 @@
             {/each}
           </div>
         </section>
+        {:else if activeSection === "shortcuts"}
 
         <section class="settings-section">
           <div class="section-label">Keyboard shortcuts</div>
@@ -532,6 +559,7 @@
             meaning while a terminal has focus.
           </p>
         </section>
+        {:else if activeSection === "updates"}
 
         <section class="settings-section">
           <div class="section-label">Updates</div>
@@ -578,6 +606,8 @@
             {/if}
           </div>
         </section>
+        {/if}
+      </div>
       </div>
 
       <footer class="settings-footer">
@@ -610,7 +640,7 @@
 
   .settings-modal {
     position: relative;
-    width: min(640px, calc(100vw - 48px));
+    width: min(760px, calc(100vw - 48px));
     max-height: min(680px, calc(100vh - 64px));
     display: flex;
     flex-direction: column;
@@ -666,8 +696,50 @@
     color: var(--text-primary);
   }
 
-  .settings-body {
+  .settings-layout {
     min-height: 0;
+    flex: 1 1 auto;
+    display: flex;
+    align-items: stretch;
+  }
+
+  .settings-nav {
+    flex: 0 0 148px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 14px 8px;
+    border-right: 1px solid var(--border-primary);
+    background: var(--bg-secondary);
+  }
+
+  .settings-nav-item {
+    height: 30px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .settings-nav-item:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+  }
+
+  .settings-nav-item.active {
+    background: var(--bg-tertiary);
+    color: var(--accent-primary);
+  }
+
+  .settings-body {
+    min-width: 0;
+    min-height: 0;
+    flex: 1 1 auto;
     overflow-y: auto;
     padding: 18px;
   }
