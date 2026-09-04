@@ -35,6 +35,7 @@
   import UpdateProgressModal from "./workspace/UpdateProgressModal.svelte";
   import { desktopPrefsStore } from "./workspace/desktop-prefs.svelte";
   import { desktopUpdateStore } from "./workspace/desktop-update.svelte";
+  import { settingsStore } from "$lib/stores/settings.svelte";
   import {
     dragTargets,
     tabDrag,
@@ -169,6 +170,7 @@
   const IS_WINDOWS_PLATFORM = navigator.userAgent.includes("Windows");
 
   async function autoCheckForUpdates() {
+    if (!settingsStore.updateCheckOnStartup) return;
     const update = await desktopUpdateStore.checkQuietly();
     if (!update) return;
     updateOfferPrompt = update;

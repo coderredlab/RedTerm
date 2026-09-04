@@ -583,6 +583,21 @@
 
         <section class="settings-section">
           <div class="section-label">Updates</div>
+          <div class="toggle-row">
+            <div class="toggle-copy">
+              <span class="control-label" id="auto-update-label">Check for updates automatically</span>
+              <span class="control-hint">Look for a new version when RedTerm starts. You can always check manually below.</span>
+            </div>
+            <button
+              type="button"
+              class="toggle"
+              class:active={settingsStore.updateCheckOnStartup}
+              role="switch"
+              aria-checked={settingsStore.updateCheckOnStartup}
+              aria-labelledby="auto-update-label"
+              onclick={() => settingsStore.setUpdateCheckOnStartup(!settingsStore.updateCheckOnStartup)}
+            ><span class="toggle-knob"></span></button>
+          </div>
           <div class="update-controls">
             <p
               class="update-status"

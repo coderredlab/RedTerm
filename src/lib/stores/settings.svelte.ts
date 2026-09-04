@@ -26,6 +26,7 @@ export interface SettingsData {
   tabBarPosition: TabBarPosition;
   scrollbackLines: number;
   bellNotifications: boolean;
+  updateCheckOnStartup: boolean;
 }
 
 const DEFAULTS: SettingsData = {
@@ -36,6 +37,7 @@ const DEFAULTS: SettingsData = {
   keepScreenOn: false,
   tabBarPosition: "top",
   scrollbackLines: 1000,
+  updateCheckOnStartup: true,
   bellNotifications: true,
 };
 
@@ -68,6 +70,10 @@ function loadFromStorage(): SettingsData {
         typeof parsed.bellNotifications === "boolean"
           ? parsed.bellNotifications
           : DEFAULTS.bellNotifications,
+      updateCheckOnStartup:
+        typeof parsed.updateCheckOnStartup === "boolean"
+          ? parsed.updateCheckOnStartup
+          : DEFAULTS.updateCheckOnStartup,
     };
   } catch {
     return { ...DEFAULTS };
@@ -95,6 +101,7 @@ function createSettingsStore() {
   let keepScreenOn = $state(DEFAULTS.keepScreenOn);
   let tabBarPosition = $state<TabBarPosition>(DEFAULTS.tabBarPosition);
   let scrollbackLines = $state(DEFAULTS.scrollbackLines);
+  let updateCheckOnStartup = $state(DEFAULTS.updateCheckOnStartup);
   let bellNotifications = $state(DEFAULTS.bellNotifications);
 
   function load() {
@@ -106,6 +113,7 @@ function createSettingsStore() {
     keepScreenOn = data.keepScreenOn;
     tabBarPosition = data.tabBarPosition;
     scrollbackLines = data.scrollbackLines;
+    updateCheckOnStartup = data.updateCheckOnStartup;
     bellNotifications = data.bellNotifications;
   }
 
@@ -116,6 +124,7 @@ function createSettingsStore() {
       theme,
       extraKeysHeight,
       keepScreenOn,
+      updateCheckOnStartup,
       bellNotifications,
       tabBarPosition,
       scrollbackLines,
@@ -130,6 +139,7 @@ function createSettingsStore() {
     get keepScreenOn() { return keepScreenOn; },
     get tabBarPosition() { return tabBarPosition; },
     get scrollbackLines() { return scrollbackLines; },
+    get updateCheckOnStartup() { return updateCheckOnStartup; },
     get bellNotifications() { return bellNotifications; },
 
     load,
@@ -174,6 +184,11 @@ function createSettingsStore() {
 
     setBellNotifications(v: boolean) {
       bellNotifications = v;
+      persist();
+    },
+
+    setUpdateCheckOnStartup(v: boolean) {
+      updateCheckOnStartup = v;
       persist();
     },
 
