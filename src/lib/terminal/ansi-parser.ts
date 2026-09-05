@@ -192,8 +192,6 @@ interface KittyRelativePlacement {
 }
 
 interface PendingKittyImage {
-  row: number;
-  col: number;
   params: Map<string, string>;
   chunks: string[];
   encodedLength: number;
@@ -284,8 +282,6 @@ export interface TerminalSnapshot {
   parserSavedCursor?: { x: number; y: number };
   parserLastPrintedChar?: string;
   pendingKittyImage?: {
-    row: number;
-    col: number;
     params: Array<[string, string]>;
     chunks: string[];
     encodedLength: number;
@@ -2079,16 +2075,24 @@ export class AnsiParser {
       return;
     }
 
-    const startsTransfer = params.has('a') || params.has('f') || params.has('s') || params.has('v') || params.has('t');
+    const continuesAnimation = action === 'f' && this.pendingKittyImage?.params.get('a') === 'f';
+    const startsTransfer = (params.has('a') && !continuesAnimation) ||
+      params.has('f') || params.has('s') || params.has('v') || params.has('t');
     if (startsTransfer) {
       this.pendingKittyImage = {
-        row: this.scrollback.length + this.cursorY,
-        col: this.cursorX,
         params,
         chunks: [],
         encodedLength: 0,
       };
     } else if (this.pendingKittyImage) {
+      for (const key of params.keys()) {
+        if (key !== 'm' && key !== 'q' && !(key === 'a' && continuesAnimation)) {
+          const rejected = this.pendingKittyImage;
+          this.pendingKittyImage = null;
+          this.sendKittyResponse(rejected.params, false, 'EINVAL:invalid continuation metadata', null, true);
+          return;
+        }
+      }
       for (const [key, value] of params) {
         this.pendingKittyImage.params.set(key, value);
       }
@@ -2185,7 +2189,10 @@ export class AnsiParser {
     }
 
     if (action === 'T') {
-      const placed = this.addKittyPlacement(transfer.row, transfer.col, params, imageData, imageId);
+      // Kitty places a transfer at the cursor position when its final chunk arrives.
+      const placed = this.addKittyPlacement(
+        this.scrollback.length + this.cursorY, this.cursorX, params, imageData, imageId,
+      );
       if (!placed.ok) {
         this.sendKittyResponse(params, false, placed.error, imageId, true);
         return;
@@ -5332,8 +5339,6 @@ export class AnsiParser {
       parserLastPrintedChar: this.lastPrintedChar,
       pendingKittyImage: this.pendingKittyImage
         ? {
-            row: this.pendingKittyImage.row,
-            col: this.pendingKittyImage.col,
             params: [...this.pendingKittyImage.params],
             chunks: [...this.pendingKittyImage.chunks],
             encodedLength: this.pendingKittyImage.encodedLength,
@@ -5601,7 +5606,7 @@ export class AnsiParser {
     });
   }
 
-  private restoreParserStreamState(snapshot: TerminalSnapshot, removedTopRows: number) {
+  private restoreParserStreamState(snapshot: TerminalSnapshot) {
     const escapeBuffer = typeof snapshot.parserEscapeBuffer === 'string'
       ? snapshot.parserEscapeBuffer
       : '';
@@ -5637,21 +5642,13 @@ export class AnsiParser {
     const kitty = snapshot.pendingKittyImage;
     const kittyParams = this.restoreSnapshotStringMap(kitty?.params);
     const kittyPayload = this.restoreSnapshotChunks(kitty?.chunks);
-    this.pendingKittyImage =
-      kitty &&
-      Number.isInteger(kitty.row) &&
-      Number.isInteger(kitty.col) &&
-      kitty.row >= removedTopRows &&
-      kittyParams &&
-      kittyPayload
-        ? {
-            row: kitty.row - removedTopRows,
-            col: Math.min(this.cols - 1, Math.max(0, kitty.col)),
-            params: kittyParams,
-            chunks: kittyPayload.chunks,
-            encodedLength: kittyPayload.encodedLength,
-          }
-        : null;
+    this.pendingKittyImage = kittyParams && kittyPayload
+      ? {
+          params: kittyParams,
+          chunks: kittyPayload.chunks,
+          encodedLength: kittyPayload.encodedLength,
+        }
+      : null;
 
     const iTerm2 = snapshot.pendingITerm2File;
     const iTerm2Args = this.restoreSnapshotStringMap(iTerm2?.args);
@@ -5752,7 +5749,7 @@ export class AnsiParser {
     ) {
       this.clearRestoredImagePlaceholders();
     }
-    this.restoreParserStreamState(snapshot, restoredState.removedTopRows);
+    this.restoreParserStreamState(snapshot);
     this.restoreOscState(snapshot);
     this.markFullBufferDirty();
     this.markAllRowsDirty();

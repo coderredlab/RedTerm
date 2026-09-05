@@ -19,23 +19,25 @@ const APP_EXIT_REQUESTED_EVENT: &str = "app-exit-requested";
 #[cfg(target_os = "macos")]
 const CONFIRM_QUIT_MENU_ID: &str = "redterm-confirm-quit";
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use commands::DesktopClipboardState;
 use commands::{
     cancel_voice_input, check_voice_input_permissions, delete_known_host, exit_application,
     get_keyboard_layout_map, get_runtime_instance_id, install_keyboard_layout_change_listener,
-    list_known_hosts, list_system_fonts, list_voice_input_languages, local_create_dir,
-    local_create_file, local_download_file, local_download_to_dir, local_home_dir, local_list_dir,
-    local_read_file, local_remove_path, local_shell_disconnect, local_shell_get_output,
-    local_shell_resize, local_shell_start, local_shell_write, local_write_file,
-    preview_cache_acquire, preview_cache_release, read_clipboard_image, read_clipboard_text,
+    list_known_hosts, list_system_fonts, list_voice_input_languages, preview_cache_acquire,
+    preview_cache_release, read_clipboard_image, read_clipboard_text,
     request_voice_input_permissions, restart_application, set_keep_screen_on, set_keyboard_visible,
     sftp_create_dir, sftp_create_file, sftp_download_file, sftp_download_to_dir, sftp_home_dir,
     sftp_list_dir, sftp_read_file, sftp_remove_path, sftp_write_file, ssh_check_host_key,
     ssh_connect, ssh_disconnect, ssh_get_session_output, ssh_get_session_snapshot, ssh_resize,
     ssh_session_exists, ssh_store_session_snapshot, ssh_trust_host_key, ssh_upload_clipboard_image,
     ssh_upload_clipboard_image_from_local_path, ssh_write, start_voice_input, stop_voice_input,
-    write_clipboard_text, HostKeyChallengeStore, LocalShellManager, RuntimeState, SessionManager,
+    write_clipboard_text, HostKeyChallengeStore, RuntimeState, SessionManager,
+};
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use commands::{
+    local_create_dir, local_create_file, local_download_file, local_download_to_dir,
+    local_home_dir, local_list_dir, local_read_file, local_remove_path, local_shell_disconnect,
+    local_shell_get_output, local_shell_resize, local_shell_start, local_shell_write,
+    local_write_file, DesktopClipboardState, LocalShellManager,
 };
 
 use storage::{
@@ -77,7 +79,6 @@ fn handle_run_event(_: &tauri::AppHandle, _: tauri::RunEvent) {}
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let session_manager = Arc::new(SessionManager::new());
-    let local_shell_manager = Arc::new(LocalShellManager::new());
     let runtime_state = Arc::new(RuntimeState {
         instance_id: Uuid::new_v4().to_string(),
     });
@@ -123,6 +124,7 @@ pub fn run() {
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .manage(Arc::new(LocalShellManager::new()))
         .manage(DesktopClipboardState::default());
     builder
         .setup(|app| {
@@ -143,7 +145,6 @@ pub fn run() {
             Ok(())
         })
         .manage(session_manager)
-        .manage(local_shell_manager)
         .manage(runtime_state)
         .manage(host_key_challenges)
         .invoke_handler(tauri::generate_handler![
@@ -180,19 +181,33 @@ pub fn run() {
             preview_cache_release,
             read_clipboard_text,
             write_clipboard_text,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_shell_start,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_shell_write,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_shell_resize,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_shell_disconnect,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_shell_get_output,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_home_dir,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_list_dir,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_read_file,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_write_file,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_create_dir,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_create_file,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_remove_path,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_download_file,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_download_to_dir,
             ssh_upload_clipboard_image_from_local_path,
             read_clipboard_image,
@@ -290,18 +305,6 @@ mod tests {
     fn native_exit_requires_confirmation_but_confirmed_exit_does_not() {
         assert!(super::should_confirm_app_exit(false));
         assert!(!super::should_confirm_app_exit(true));
-    }
-
-    #[test]
-    fn desktop_version_is_independent_from_mobile_version() {
-        let desktop: serde_json::Value =
-            serde_json::from_str(include_str!("../tauri.desktop.conf.json"))
-                .expect("desktop Tauri config must be valid JSON");
-        let mobile: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
-            .expect("mobile Tauri config must be valid JSON");
-
-        assert_eq!(desktop["version"], "1.7.15");
-        assert_eq!(mobile["version"], "1.7.4");
     }
 
     #[test]

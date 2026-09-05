@@ -3030,22 +3030,24 @@
         !longPressTriggered &&
         touchPointerStart
       ) {
+        // Match mouse clicks: rendered URLs take precedence over TUI mouse reporting.
+        const match = findUrlAtCell(buffer, pointerToCell(e));
+        resetTouchLongPressState();
+        if (match) {
+          e.preventDefault();
+          void confirmAndOpenTerminalUrl(match.url);
+          focusInput();
+          return;
+        }
+
         if (shouldForwardTerminalMouseEvents()) {
           const point = pointerToViewportCell(e);
           sendMouseButton(0, point, true, e);
           sendMouseButton(0, point, false, e);
         } else {
-          const match = e.type === "pointerup" ? findUrlAtCell(buffer, pointerToCell(e)) : null;
-          resetTouchLongPressState();
-          if (match) {
-            e.preventDefault();
-            void confirmAndOpenTerminalUrl(match.url);
-            focusInput();
-            return;
-          }
           focusInput();
-          return;
         }
+        return;
       }
       resetTouchLongPressState();
     }

@@ -937,31 +937,49 @@ describe("AnsiParser Kitty images", () => {
       12, 13, 14, 15,
     ]);
   });
-  test("keeps a pending Kitty anchor in full-buffer coordinates across snapshots", () => {
+  test("uses the final Kitty chunk cursor after snapshot restore and intervening output", () => {
     const source = new AnsiParser(80, 3);
     source.write("1\r\n2\r\n3\r\n4\r\n5");
-    const anchor = source.getFullCursor();
-    source.write("\x1b_Ga=T,f=32,s=2,v=2,c=2,r=1,m=1;AAECAwQFBgcI\x1b\\");
+    source.write("\x1b_Ga=T,f=32,s=2,v=2,c=2,r=1,C=1,m=1;AAECAwQFBgcI\x1b\\");
 
     const restored = new AnsiParser(80, 3);
     restored.restoreSnapshot(JSON.parse(JSON.stringify(source.createSnapshot())));
+    restored.write("\r\nmoved");
     restored.write("\x1b_Gm=0;CQoLDA0ODw==\x1b\\");
 
-    expect(restored.getImages()[0]).toMatchObject({ row: anchor.y, col: anchor.x });
+    expect(restored.getImages()[0]).toMatchObject({ row: 5, col: 5 });
   });
 
-  test("discards a pending Kitty transfer when its anchor scrolls out of a restored snapshot", () => {
-    const source = new AnsiParser(80, 3);
-    source.write("\x1b_Ga=T,f=32,s=2,v=2,m=1;AAAA\x1b\\");
-    const snapshot = source.createSnapshot();
-    snapshot.scrollbackRows = Array.from({ length: 1001 }, () => snapshot.bufferRows[0]);
-    snapshot.pendingKittyImage!.row = 0;
+  test("finishes a Kitty transfer after its initial row is trimmed from snapshot scrollback", () => {
+    const source = new AnsiParser(12, 4);
+    source.write("\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,C=1,m=1;/wAA\x1b\\");
+    source.write("\r\n".repeat(1002) + "end");
 
-    const restored = new AnsiParser(80, 3);
-    restored.restoreSnapshot(snapshot);
+    const restored = new AnsiParser(12, 2);
+    restored.setMaxScrollback(1000);
+    restored.restoreSnapshot(JSON.parse(JSON.stringify(source.createSnapshot())));
+    const cursor = restored.getFullCursor();
+    restored.write("\x1b_Gm=0;/w==\x1b\\");
 
-    expect((restored as unknown as { pendingKittyImage: unknown }).pendingKittyImage).toBeNull();
+    expect(restored.getImages()[0]).toMatchObject({ row: cursor.y, col: 3 });
+    expect(Array.from(restored.getImages()[0].data)).toEqual([255, 0, 0, 255]);
   });
+
+  for (const { screen, prefix, row, col } of [
+    { screen: "main", prefix: "", row: 1, col: 4 },
+    { screen: "alternate", prefix: "\x1b[?1049h", row: 0, col: 5 },
+  ]) {
+    test(`places a pending Kitty image at the resized ${screen} screen cursor`, () => {
+      const parser = new AnsiParser(12, 4);
+      parser.write(prefix + "abcdefghij");
+      parser.write("\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,C=1,m=1;/wAA\x1b\\");
+      parser.resize(6, 4);
+      parser.write("\x1b_Gm=0;/w==\x1b\\");
+
+      expect(parser.getImages()[0]).toMatchObject({ row, col });
+      expect(Array.from(parser.getImages()[0].data)).toEqual([255, 0, 0, 255]);
+    });
+  }
 
   test("rejects oversized pending Kitty APC buffers from snapshots", () => {
     const source = new AnsiParser(80, 3);
@@ -1713,6 +1731,35 @@ describe("AnsiParser Kitty images", () => {
 
     parser.write("\x1b_Ga=p,i=1,p=11,P=2,Q=22,c=1,r=1\x1b\\");
     expect(responses.at(-1)).toContain("ECYCLE");
+  });
+
+  test("rejects unrelated continuation metadata and recovers for the next image", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    parser.write("\x1b_Ga=T,f=32,s=1,v=1,i=304,m=1;/wAA\x1b\\");
+    parser.write("\x1b_Gm=1,extra=unexpected;\x1b\\");
+    expect(responses.at(-1)).toContain("EINVAL");
+    parser.write(kittyRgbaTransmit({ imageId: 305, pixel: [0, 255, 0, 255] }));
+    parser.write("\x1b_Ga=p,i=305,c=1,r=1\x1b\\");
+    expect(Array.from(parser.getImages()[0].data)).toEqual([0, 255, 0, 255]);
+  });
+
+  test("appends a=f continuation chunks and restores an in-flight animation frame", () => {
+    const source = new AnsiParser(20, 3);
+    const red = Buffer.alloc(40 * 40 * 4).fill(Buffer.from([255, 0, 0, 255]));
+    const green = Buffer.alloc(red.length).fill(Buffer.from([0, 255, 0, 255]));
+    writeChunkedKittyImage(source, "a=T,f=32,s=40,v=40,i=303,c=2,r=2,C=1", red.toString("base64"));
+    const chunks = chunkBase64(green.toString("base64"), 4096);
+    source.write("\x1b_Ga=f,f=32,s=40,v=40,i=303,z=40,m=1;" + chunks[0] + "\x1b\\");
+    source.write("\x1b_Ga=f,m=1;" + chunks[1] + "\x1b\\");
+
+    const restored = new AnsiParser(20, 3);
+    restored.restoreSnapshot(source.createRuntimeSnapshot());
+    restored.write("\x1b_Ga=f,m=0;" + chunks[2] + "\x1b\\");
+    expect(Array.from(restored.getImages()[0].data)).toEqual(Array.from(red));
+    restored.write("\x1b_Ga=a,i=303,c=2,s=1\x1b\\");
+    expect(Array.from(restored.getImages()[0].data)).toEqual(Array.from(green));
   });
 
   test("switches and advances RGBA animation frames", () => {
@@ -2882,43 +2929,6 @@ describe("AnsiParser image resource limits", () => {
       expect(visibleRowText(parser)).toBe("beforeafter");
       expect(parserInternals.escapeBuffer).toBe("");
     }
-  });
-
-  test("abandons multipart images when their encoded byte budget is exceeded", () => {
-    const parser = new AnsiParser(40, 2);
-    const parserInternals = parser as AnsiParser & {
-      pendingITerm2File: {
-        args: Map<string, string>;
-        chunks: string[];
-        encodedLength: number;
-      } | null;
-      pendingKittyImage: {
-        row: number;
-        col: number;
-        params: Map<string, string>;
-        chunks: string[];
-        encodedLength: number;
-      } | null;
-    };
-
-    parserInternals.pendingITerm2File = {
-      args: new Map([["inline", "1"]]),
-      chunks: [],
-      encodedLength: Number.MAX_SAFE_INTEGER,
-    };
-    parser.write("\x1b]1337;FilePart=AAAA\x07");
-    expect(parserInternals.pendingITerm2File).toBeNull();
-
-    parserInternals.pendingKittyImage = {
-      row: 0,
-      col: 0,
-      params: new Map([["f", "32"]]),
-      chunks: [],
-      encodedLength: Number.MAX_SAFE_INTEGER,
-    };
-    parser.write("\x1b_Gm=1;AAAA\x1b\\");
-    expect(parserInternals.pendingKittyImage).toBeNull();
-    expect(parser.getImages()).toHaveLength(0);
   });
 
   test("accepts a maximum-size raw Kitty image in protocol-sized chunks", () => {

@@ -1,4 +1,4 @@
-v1.7.4
-- Keep saved passwords inside native credential storage during SSH connections
-- Bind imported SSH keys and host-key approvals to verified connection targets
-- Harden terminal links, automatic responses, and high-rate SSH output handling
+v1.7.5
+- Fix tapping terminal links while TUI mouse reporting is active
+- Fix cursor placement after chunked Kitty images and continuation of animation frames
+- Keep the Android keyboard toolbar visible when the system keyboard opens
