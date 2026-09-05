@@ -1,4 +1,3 @@
-v1.7.5
-- Fix tapping terminal links while TUI mouse reporting is active
-- Fix cursor placement after chunked Kitty images and continuation of animation frames
-- Keep the Android keyboard toolbar visible when the system keyboard opens
+v1.7.6
+- Add native support for Android devices with 16 KB memory pages
+- Update the Android native build toolchain

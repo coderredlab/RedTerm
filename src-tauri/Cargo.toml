@@ -1,6 +1,6 @@
 [package]
 name = "redterm"
-version = "1.7.5"
+version = "1.7.6"
 description = "A cross-platform SSH terminal built with Tauri, Svelte, and Rust"
 license = "Apache-2.0"
 repository = "https://github.com/coderredlab/RedTerm"
