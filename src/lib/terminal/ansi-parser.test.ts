@@ -95,6 +95,29 @@ function rgbaPngBase64(width: number, height: number, rgba: number[]): string {
     depth: 8,
   })).toString("base64");
 }
+function pngChunk(type: string, data: Uint8Array): Buffer {
+  const chunk = Buffer.alloc(data.length + 12);
+  chunk.writeUInt32BE(data.length, 0);
+  chunk.write(type, 4, 4, "ascii");
+  chunk.set(data, 8);
+  chunk.writeUInt32BE(Bun.hash.crc32(chunk.subarray(4, -4)), chunk.length - 4);
+  return chunk;
+}
+
+function rawPng(
+  width: number, height: number, depth: number, colorType: number,
+  scanlines: Uint8Array, chunks: Buffer[] = [], interlace = 0,
+): Buffer {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([depth, colorType, 0, 0, interlace], 8);
+  return Buffer.concat([
+    TINY_PNG_BYTES.subarray(0, 8), pngChunk("IHDR", header), ...chunks,
+    pngChunk("IDAT", zlibSync(scanlines)), pngChunk("IEND", new Uint8Array()),
+  ]);
+}
+
 function kittyPngApc(options = {}): string {
   const {
     payload = TINY_PNG_BASE64,
@@ -760,6 +783,25 @@ describe("AnsiParser OSC 66 text sizing", () => {
     expect(parser.getBuffer()[1][3].char).toBe("q");
     expect(parser.getBuffer().flat().some((cell) => cell.textSizing)).toBe(false);
     expect(parser.getCursor()).toEqual({ x: 4, y: 1 });
+  });
+
+  test("overwrites a continuation when the bottom row cannot advance outside the scroll region", () => {
+    const parser = new AnsiParser(4, 4);
+    parser.write("\x1b[1;2r\x1b[3;1H\x1b]66;s=2:w=2;X\x07\x1b[4;1Hq");
+
+    expect(parser.getBuffer()[3][0].char).toBe("q");
+    expect(parser.getBuffer().flat().some((cell) => cell.textSizing)).toBe(false);
+    expect(parser.getCursor()).toEqual({ x: 1, y: 3 });
+  });
+
+  test("overwrites a continuation when a wide character cannot fit beyond it without wrapping", () => {
+    const parser = new AnsiParser(5, 4);
+    parser.write("\x1b[1;3H\x1b]66;s=2;X\x07\x1b[2;4H\x1b[?7l가");
+
+    expect(parser.getBuffer()[1][3].char).toBe("가");
+    expect(parser.getBuffer()[1][4].char).toBe("");
+    expect(parser.getBuffer().flat().some((cell) => cell.textSizing)).toBe(false);
+    expect(parser.getCursor()).toEqual({ x: 5, y: 1 });
   });
 
   test("preserves an existing block when partial-region overflow rejects replacement", () => {
@@ -1859,6 +1901,125 @@ describe("AnsiParser Kitty images", () => {
     ]);
   });
 
+  test("bounds PNG profile inflation before frame replacement and recovers", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    parser.write(kittyRgbaTransmit({ imageId: 70 }));
+    parser.write("\x1b_Ga=p,i=70,C=1\x1b\\");
+    const png = Buffer.from(rgbaPngBase64(1, 1, [13, 27, 49, 128]), "base64");
+    const withProfile = (size: number) => Buffer.concat([
+      png.subarray(0, 33),
+      pngChunk("iCCP", Buffer.concat([Buffer.from("profile\0\0"), zlibSync(new Uint8Array(size))])),
+      png.subarray(33),
+    ]).toString("base64");
+
+    writeChunkedKittyImage(parser, "a=f,f=100,i=70,r=1,X=1", withProfile(16 * 1024 * 1024 + 1));
+    expect(responses.at(-1)).toContain("EINVAL:");
+    expect(Array.from(parser.getImages()[0].data)).toEqual([1, 2, 3, 4]);
+
+    writeChunkedKittyImage(parser, "a=f,f=100,i=70,r=1,X=1", withProfile(16 * 1024 * 1024));
+    expect(responses.at(-1)).toContain(";OK");
+    expect(Array.from(parser.getImages()[0].data)).toEqual([13, 27, 49, 128]);
+  });
+
+  test("bounds combined PNG IDAT inflation to the exact scanline size", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    parser.write(kittyRgbaTransmit({ imageId: 70 }));
+    parser.write("\x1b_Ga=p,i=70,C=1\x1b\\");
+    const header = Buffer.from(rgbaPngBase64(1, 1, [13, 27, 49, 128]), "base64").subarray(0, 33);
+    const withScanlines = (scanlines: Uint8Array) => {
+      const compressed = zlibSync(scanlines);
+      const split = Math.floor(compressed.length / 2);
+      return Buffer.concat([
+        header,
+        pngChunk("IDAT", compressed.subarray(0, split)),
+        pngChunk("IDAT", compressed.subarray(split)),
+        pngChunk("IEND", new Uint8Array()),
+      ]).toString("base64");
+    };
+
+    writeChunkedKittyImage(parser, "a=f,f=100,i=70,r=1,X=1", withScanlines(Uint8Array.of(0, 13, 27, 49, 128, 0)));
+    expect(responses.at(-1)).toContain("EINVAL:");
+    expect(Array.from(parser.getImages()[0].data)).toEqual([1, 2, 3, 4]);
+
+    writeChunkedKittyImage(parser, "a=f,f=100,i=70,r=1,X=1", withScanlines(Uint8Array.of(0, 13, 27, 49, 128)));
+    expect(responses.at(-1)).toContain(";OK");
+    expect(Array.from(parser.getImages()[0].data)).toEqual([13, 27, 49, 128]);
+  });
+
+  test("bounds PNG Adam7 scanlines without losing sixteen-bit color and alpha", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    const expected = Array.from({length: 36}, (_, index) => (index * 13) % 256);
+    const scanlines: number[] = [];
+    for (const [x, y, dx, dy] of [[0,0,8,8],[4,0,8,8],[0,4,4,8],[2,0,4,4],[0,2,2,4],[1,0,2,2],[0,1,1,2]]) {
+      for (let row = y; row < 3 && x < 3; row += dy) {
+        scanlines.push(0);
+        for (let col = x; col < 3; col += dx) {
+          for (const byte of expected.slice((row * 3 + col) * 4, (row * 3 + col + 1) * 4)) scanlines.push(byte, byte);
+        }
+      }
+    }
+    writeChunkedKittyImage(parser, "a=T,f=32,s=3,v=3,i=70,C=1", Buffer.alloc(36).toString("base64"));
+    const params = "a=f,f=100,i=70,r=1,X=1";
+    writeChunkedKittyImage(parser, params, rawPng(3, 3, 16, 6, Uint8Array.from([...scanlines, 0]), [], 1).toString("base64"));
+    expect(responses.at(-1)).toContain("EINVAL:");
+    expect(Array.from(parser.getImages()[0].data)).toEqual(Array(36).fill(0));
+    writeChunkedKittyImage(parser, params, rawPng(3, 3, 16, 6, Uint8Array.from(scanlines), [], 1).toString("base64"));
+    expect(responses.at(-1)).toContain(";OK");
+    expect(Array.from(parser.getImages()[0].data)).toEqual(expected);
+  });
+
+  test("rejects PNG header replacement, disjoint IDAT, and invalid CRC before changing frames", () => {
+    const png = Buffer.from(rgbaPngBase64(1, 1, [13, 27, 49, 128]), "base64");
+    const duplicateHeader = Buffer.concat([png.subarray(0, 33), png.subarray(8)]);
+    const compressed = zlibSync(Uint8Array.of(0, 13, 27, 49, 128));
+    const disjointData = Buffer.concat([
+      png.subarray(0, 33), pngChunk("IDAT", compressed.subarray(0, 5)),
+      pngChunk("tEXt", Buffer.from("note\0text")), pngChunk("IDAT", compressed.subarray(5)),
+      pngChunk("IEND", new Uint8Array()),
+    ]);
+    const invalidCrc = Buffer.from(png);
+    invalidCrc[29] ^= 1;
+    const lateProfile = Buffer.concat([
+      png.subarray(0, -12), pngChunk("iCCP", Buffer.concat([Buffer.from("profile\0\0"), zlibSync(new Uint8Array(128))])),
+      png.subarray(-12),
+    ]);
+    for (const invalid of [duplicateHeader, disjointData, invalidCrc, lateProfile]) {
+      const parser = new AnsiParser(20, 3);
+      const responses: string[] = [];
+      parser.setResponseHandler((response) => responses.push(response));
+      parser.write(kittyRgbaTransmit({ imageId: 70 }));
+      parser.write("\x1b_Ga=p,i=70,C=1\x1b\\");
+      writeChunkedKittyImage(parser, "a=f,f=100,i=70,r=1,X=1", invalid.toString("base64"));
+      expect(responses.at(-1)).toContain("EINVAL:");
+      expect(Array.from(parser.getImages()[0].data)).toEqual([1, 2, 3, 4]);
+    }
+  });
+
+  test("rejects repeated PNG palette transparency and recovers with one alpha channel", () => {
+    const parser = new AnsiParser(20, 3);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    parser.write(kittyRgbaTransmit({ imageId: 70 }));
+    parser.write("\x1b_Ga=p,i=70,C=1\x1b\\");
+    const palette = pngChunk("PLTE", Uint8Array.of(13, 27, 49));
+    const transparency = pngChunk("tRNS", Uint8Array.of(128));
+    const params = "a=f,f=100,i=70,r=1,X=1";
+    const invalid = rawPng(1, 1, 8, 3, Uint8Array.of(0, 0), [palette, transparency, transparency]);
+    writeChunkedKittyImage(parser, params, invalid.toString("base64"));
+    expect(responses.at(-1)).toContain("EINVAL:");
+    expect(Array.from(parser.getImages()[0].data)).toEqual([1, 2, 3, 4]);
+    const valid = rawPng(1, 1, 8, 3, Uint8Array.of(0, 0), [palette, transparency]);
+    writeChunkedKittyImage(parser, params, valid.toString("base64"));
+    expect(responses.at(-1)).toContain(";OK");
+    expect(Array.from(parser.getImages()[0].data)).toEqual([13, 27, 49, 128]);
+  });
+
   test("caps detached placements and animation frames", () => {
     const placementParser = new AnsiParser(20, 3);
     const placementResponses: string[] = [];
@@ -2089,29 +2250,24 @@ describe("AnsiParser Kitty images", () => {
     expect(responses.at(-1)).toContain("EINVAL:overlapping composition rectangles");
   });
 
-  test("applies low-bit grayscale PNG transparency after sample expansion", () => {
-    const parser = new AnsiParser(20, 3);
-    const internals = parser as unknown as {
-      decodedPngToRgba(decoded: {
-        width: number;
-        height: number;
-        channels: number;
-        depth: number;
-        data: Uint8Array;
-        transparency: Uint16Array;
-      }): Uint8ClampedArray | null;
-    };
-
-    const rgba = internals.decodedPngToRgba({
-      width: 1,
-      height: 1,
-      channels: 1,
-      depth: 1,
-      data: Uint8Array.of(0b1000_0000),
-      transparency: Uint16Array.of(1),
-    });
-
-    expect(Array.from(rgba ?? [])).toEqual([255, 255, 255, 0]);
+  test("preserves PNG low-bit grayscale and indexed transparency through frame decoding", () => {
+    const grayscale = rawPng(1, 1, 1, 0, Uint8Array.of(0, 0x80), [pngChunk("tRNS", Uint8Array.of(0, 1))]);
+    const indexed = rawPng(4, 1, 2, 3, Uint8Array.of(0, 0x1b), [
+      pngChunk("PLTE", Uint8Array.of(9, 8, 7, 30, 60, 90, 100, 150, 200, 255, 1, 2)),
+      pngChunk("tRNS", Uint8Array.of(0, 64, 128, 255)),
+    ]);
+    for (const [png, width, expected] of [
+      [grayscale, 1, [255, 255, 255, 0]],
+      [indexed, 4, [9, 8, 7, 0, 30, 60, 90, 64, 100, 150, 200, 128, 255, 1, 2, 255]],
+    ]) {
+      const parser = new AnsiParser(20, 3);
+      const responses: string[] = [];
+      parser.setResponseHandler((response) => responses.push(response));
+      writeChunkedKittyImage(parser, "a=T,f=32,s=" + width + ",v=1,i=70,C=1", Buffer.alloc(width * 4).toString("base64"));
+      writeChunkedKittyImage(parser, "a=f,f=100,i=70,r=1,X=1", png.toString("base64"));
+      expect(responses.at(-1)).toContain(";OK");
+      expect(Array.from(parser.getImages()[0].data)).toEqual(expected);
+    }
   });
 
   test("preserves the root animation frame zero-millisecond gap", () => {

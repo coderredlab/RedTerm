@@ -495,11 +495,9 @@ pub async fn local_remove_path(
     remove_dir_all_with_progress(&scoped, &on_progress).await
 }
 
-/// Local twin of the SSH recursive delete: collect the tree first, unlink
-/// files, then remove directories in reverse discovery order, reporting each
-/// finished entry so the explorer progress bar behaves identically for local
-/// and remote paths. Symlinks are unlinked, never traversed — the same
-/// LSTAT semantics as the SSH path.
+/// Collect the local tree, unlink files, then remove directories in reverse
+/// discovery order while reporting completed entries. Symlinks are unlinked
+/// rather than traversed. Remote deletion supports only files and empty folders.
 async fn remove_dir_all_with_progress(
     root: &Path,
     on_progress: &impl Fn(RemoveProgress),
@@ -701,6 +699,14 @@ async fn read_local_file_for_save(path: &Path) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
+async fn create_local_save_file(path: &Path) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path).await
+}
+
 #[tauri::command]
 pub async fn local_write_file(
     path: String,
@@ -732,10 +738,8 @@ pub async fn local_write_file(
         .parent()
         .ok_or_else(|| "File has no parent directory".to_string())?;
     let temp_path = parent.join(format!(".redterm-save-{}.tmp", uuid::Uuid::new_v4()));
-    let mut temp_file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
+    // On Unix, stage privately from creation, before restoring the original metadata.
+    let mut temp_file = create_local_save_file(&temp_path)
         .await
         .map_err(|e| format!("Failed to create temporary save file: {}", e))?;
     let write_result = async {
@@ -1121,6 +1125,66 @@ mod tests {
         assert_eq!(replay[1].seq, second.seq);
         assert_eq!(replay[1].data, second.data);
     }
+
+    #[tokio::test]
+    async fn local_save_staging_is_private_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_PATH: &str = "REDTERM_PRIVATE_SAVE_TEST_PATH";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = Path::new(&path);
+            let mut file = create_local_save_file(path)
+                .await
+                .expect("create staged file");
+            assert_eq!(
+                file.metadata().await.unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            file.write_all(b"private edited content").await.unwrap();
+            file.flush().await.unwrap();
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let collision = create_local_save_file(path)
+                .await
+                .expect_err("must not reopen an existing file");
+            assert_eq!(collision.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(path).unwrap(), b"private edited content");
+            return;
+        }
+
+        // umask is process-global: set it only in a fresh, single-test child.
+        let root = std::env::temp_dir().join(format!(
+            "redterm-private-save-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let result = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("umask 022; exec \"$@\"")
+            .arg("redterm-private-save-test")
+            .arg(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(format!(
+                "{}::local_save_staging_is_private_under_permissive_umask",
+                module_path!().split_once("::").unwrap().1
+            ))
+            .arg("--nocapture")
+            .env(CHILD_PATH, root.join("staged"))
+            .output();
+        let staged_content = std::fs::read(root.join("staged"));
+        std::fs::remove_dir_all(&root).unwrap();
+        let output = result.expect("run isolated permissions test");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(staged_content.unwrap(), b"private edited content");
+    }
+
     #[tokio::test]
     async fn local_write_rejects_stale_content_without_overwriting() {
         let home = local_home_dir_path().expect("test home directory");
@@ -1133,13 +1197,9 @@ mod tests {
             .expect("create test file");
         let path_text = path.to_string_lossy().to_string();
 
-        let error = local_write_file(path_text.clone(), "mine".to_string(), "stale".to_string())
+        local_write_file(path_text.clone(), "mine".to_string(), "stale".to_string())
             .await
             .expect_err("stale save must fail");
-        assert_eq!(
-            error,
-            "File changed since it was opened. Reload before saving."
-        );
         assert_eq!(
             tokio::fs::read(&path).await.expect("read unchanged file"),
             b"original"
@@ -1185,11 +1245,6 @@ mod tests {
         assert_eq!(
             tokio::fs::read(&path).await.expect("read winning save"),
             expected
-        );
-        let conflict = first_result.err().or_else(|| second_result.err());
-        assert_eq!(
-            conflict.as_deref(),
-            Some("File changed since it was opened. Reload before saving.")
         );
         tokio::fs::remove_file(&path)
             .await

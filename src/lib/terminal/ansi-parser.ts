@@ -343,8 +343,25 @@ const MAX_IMAGE_CELL_DIMENSION = 4096;
 const DEFAULT_ITERM2_CELL_PIXEL_WIDTH = 8;
 const DEFAULT_ITERM2_CELL_PIXEL_HEIGHT = 16;
 const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] as const;
+const PNG_ADAM7_PASSES = [
+  [0, 0, 8, 8], [4, 0, 8, 8], [0, 4, 4, 8], [2, 0, 4, 4],
+  [0, 2, 2, 4], [1, 0, 2, 2], [0, 1, 1, 2],
+] as const;
 const MAX_ZLIB_INPUT_CHUNK_BYTES = 512;
+// PNG preflight retains no output; 2 KiB steps reduce history copying while
+// bounding temporary DEFLATE expansion before the strict output-limit callback.
+const MAX_PNG_ZLIB_INPUT_CHUNK_BYTES = 2048;
 const ZLIB_OUTPUT_LIMIT_EXCEEDED = Symbol('zlib-output-limit-exceeded');
+
+function pushUnzlibChunks(
+  decoder: Unzlib, input: Uint8Array, final: boolean, chunkBytes = MAX_ZLIB_INPUT_CHUNK_BYTES,
+): void {
+  // Bound temporary expansion before ondata can enforce the output budget.
+  for (let offset = 0; offset < input.length; offset += chunkBytes) {
+    const end = Math.min(offset + chunkBytes, input.length);
+    decoder.push(input.subarray(offset, end), final && end === input.length);
+  }
+}
 
 function unzlibBounded(
   input: Uint8Array,
@@ -359,10 +376,7 @@ function unzlibBounded(
   });
 
   try {
-    for (let offset = 0; offset < input.length; offset += MAX_ZLIB_INPUT_CHUNK_BYTES) {
-      const end = Math.min(offset + MAX_ZLIB_INPUT_CHUNK_BYTES, input.length);
-      decoder.push(input.subarray(offset, end), end === input.length);
-    }
+    pushUnzlibChunks(decoder, input, true);
   } catch (error) {
     return error === ZLIB_OUTPUT_LIMIT_EXCEEDED
       ? { ok: false, error: 'ENOSPC:decompressed image too large' }
@@ -3065,6 +3079,7 @@ export class AnsiParser {
     }
 
     try {
+      if (!this.isPngDecodeBounded(imageData.data, imageData.pixelWidth, imageData.pixelHeight)) return null;
       const decoded = decodePngBytes(imageData.data, { checkCrc: true });
       if (
         decoded.width !== imageData.pixelWidth ||
@@ -3086,6 +3101,104 @@ export class AnsiParser {
     } catch {
       return null;
     }
+  }
+
+  private isPngDecodeBounded(data: Uint8Array, width: number, height: number): boolean {
+    const dimensions = this.parsePngDimensions(data);
+    if (
+      data.length < 33 || data.length > MAX_IMAGE_DECODED_BYTES ||
+      !dimensions || dimensions.width !== width || dimensions.height !== height ||
+      !this.isImageDimensionsAllowed(width, height)
+    ) return false;
+
+    const depth = data[24];
+    const colorType = data[25];
+    const channels = colorType === 0 || colorType === 3 ? 1
+      : colorType === 2 ? 3 : colorType === 4 ? 2 : colorType === 6 ? 4 : 0;
+    if (
+      channels === 0 || (depth !== 1 && depth !== 2 && depth !== 4 && depth !== 8 && depth !== 16) ||
+      (colorType === 3 ? depth === 16 : colorType !== 0 && depth < 8) ||
+      data[26] !== 0 || data[27] !== 0 || data[28] > 1
+    ) return false;
+
+    const bitsPerPixel = channels * depth;
+    let scanlineBytes = (Math.ceil(width * bitsPerPixel / 8) + 1) * height;
+    if (data[28] === 1) {
+      scanlineBytes = 0;
+      // Adam7 passes contain independently padded rows and filter bytes.
+      for (const [x, y, xStep, yStep] of PNG_ADAM7_PASSES) {
+        const passWidth = Math.ceil((width - x) / xStep);
+        const passHeight = Math.ceil((height - y) / yStep);
+        if (passWidth > 0 && passHeight > 0) {
+          scanlineBytes += (Math.ceil(passWidth * bitsPerPixel / 8) + 1) * passHeight;
+        }
+      }
+    }
+
+    // fast-png 8 has no inflate limits or injection hook. Preflight its compressed
+    // streams without retaining output before allowing its allocating decoder.
+    let imageBytes = 0;
+    const imageDecoder = new Unzlib((chunk) => {
+      imageBytes += chunk.length;
+      if (imageBytes > scanlineBytes) throw ZLIB_OUTPUT_LIMIT_EXCEEDED;
+    });
+    let hasImageData = false;
+    let imageDataEnded = false;
+    let hasProfile = false;
+    let paletteEntries = 0;
+    let hasTransparency = false;
+    for (let offset = 33; offset + 12 <= data.length;) {
+      const length = this.readPngUint32(data, offset);
+      const start = offset + 8;
+      const end = start + length;
+      if (end + 4 > data.length) return false;
+      const type = this.readPngUint32(data, offset + 4);
+      if (type !== 0x49444154 && hasImageData) imageDataEnded = true;
+      switch (type) {
+        case 0x49484452: // IHDR: a later header must not change the decode budget.
+          return false;
+        case 0x49444154: // IDAT: one zlib stream, even when split across chunks.
+          if (imageDataEnded) return false;
+          hasImageData = true;
+          pushUnzlibChunks(imageDecoder, data.subarray(start, end), false, MAX_PNG_ZLIB_INPUT_CHUNK_BYTES);
+          break;
+        case 0x69434350: { // iCCP
+          if (hasProfile || hasImageData) return false;
+          hasProfile = true;
+          let nameEnd = start;
+          while (nameEnd < end && nameEnd - start <= 79 && data[nameEnd] !== 0) nameEnd++;
+          if (nameEnd === start || nameEnd - start > 79 || nameEnd + 2 >= end || data[nameEnd + 1] !== 0) return false;
+          let profileBytes = 0;
+          const profileDecoder = new Unzlib((chunk) => {
+            profileBytes += chunk.length;
+            if (profileBytes > MAX_IMAGE_DECODED_BYTES) throw ZLIB_OUTPUT_LIMIT_EXCEEDED;
+          });
+          pushUnzlibChunks(profileDecoder, data.subarray(nameEnd + 2, end), true, MAX_PNG_ZLIB_INPUT_CHUNK_BYTES);
+          break;
+        }
+        case 0x504c5445: // PLTE
+          if (paletteEntries || hasTransparency || hasImageData || colorType === 0 || colorType === 4 ||
+              length === 0 || length > 768 || length % 3 !== 0 ||
+              (colorType === 3 && length / 3 > 2 ** depth)) return false;
+          paletteEntries = length / 3;
+          break;
+        case 0x74524e53: // tRNS: one alpha value per palette entry, not extra channels.
+          if (hasTransparency || hasImageData ||
+              (colorType === 0 ? length !== 2 : colorType === 2 ? length !== 6 :
+                colorType === 3 ? paletteEntries === 0 || length === 0 || length > paletteEntries : true)) return false;
+          hasTransparency = true;
+          break;
+        case 0x70485973: // pHYs has a fixed-size upstream reader.
+          if (length !== 9) return false;
+          break;
+        case 0x49454e44: // IEND
+          if (length !== 0 || !hasImageData) return false;
+          imageDecoder.push(new Uint8Array(0), true);
+          return imageBytes === scanlineBytes;
+      }
+      offset = end + 4;
+    }
+    return false;
   }
 
   private decodedPngToRgba(decoded: DecodedPng): Uint8ClampedArray | null {
@@ -4666,7 +4779,9 @@ export class AnsiParser {
         if (combineMark && this.combineTextSizingMarkAt(this.cursorY, x, char)) return false;
         if (sizing.row > 0) {
           const blockEnd = x - sizing.col + sizing.scale * sizing.width;
-          if (!this.autoWrapMode && blockEnd >= this.cols) {
+          const canAdvanceRow = this.autoWrapMode &&
+            (this.cursorY < this.rows - 1 || this.cursorY === this.scrollBottom);
+          if (!canAdvanceRow && blockEnd + cellWidth > this.cols) {
             intersecting.push({ row: this.cursorY, col: x });
           } else {
             skippedTo = Math.max(skippedTo, blockEnd);

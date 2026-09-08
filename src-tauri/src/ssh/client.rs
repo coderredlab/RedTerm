@@ -18,10 +18,6 @@ const SSH_DATA_CHUNK_BYTES: usize = 64 * 1024;
 const SSH_COMMAND_CHANNEL_CAPACITY: usize = 256;
 const MAX_EXEC_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_SFTP_LIST_ENTRIES: usize = 10_000;
-/// Recursive SFTP delete aborts before deleting anything when a tree exceeds
-/// either bound, so a cyclic or runaway remote tree cannot exhaust memory.
-const MAX_SFTP_DELETE_DIRS: usize = 4_096;
-const MAX_SFTP_DELETE_FILES: usize = 100_000;
 const EXEC_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_COMMAND_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_CHANNEL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -535,94 +531,28 @@ impl SshConnection {
                 .await
                 .map_err(|e| SshError::SessionError(e.to_string()));
         }
-        // Scan the whole tree before deleting anything, so an over-large or
-        // cyclic tree aborts without touching a single file. ReadDir entry
-        // types do not follow symlinks, so a symlinked directory is unlinked
-        // as a file instead of traversed. Known crate limit: russh-sftp 2.4
-        // `read_dir` materializes a whole directory before returning, so the
-        // per-directory count is enforced post hoc — the same exposure the
-        // browse listing already has.
-        let mut files: Vec<String> = Vec::new();
-        let mut dirs: Vec<String> = Vec::new();
-        let mut queue = vec![path.to_string()];
-        while let Some(dir) = queue.pop() {
-            dirs.push(dir.clone());
-            if let Some(progress) = on_progress {
-                progress(RemoveProgress {
-                    phase: RemovePhase::Scanning,
-                    deleted: 0,
-                    total: None,
-                    current: last_path_segment(&dir),
-                });
-            }
-            if dirs.len() > MAX_SFTP_DELETE_DIRS {
-                return Err(SshError::SessionError(format!(
-                    "Refusing to delete: directory tree exceeds {MAX_SFTP_DELETE_DIRS} directories"
-                )));
-            }
-            let mut scanned = 0usize;
-            for entry in sftp
-                .read_dir(&dir)
-                .await
-                .map_err(|e| SshError::SessionError(e.to_string()))?
-            {
-                scanned += 1;
-                if scanned > MAX_SFTP_LIST_ENTRIES {
-                    return Err(SshError::SessionError(format!(
-                        "Refusing to delete: a directory exceeds {MAX_SFTP_LIST_ENTRIES} entries"
-                    )));
-                }
-                let name = entry.file_name();
-                if name == "." || name == ".." {
-                    continue;
-                }
-                let child = if dir.ends_with('/') {
-                    format!("{dir}{name}")
-                } else {
-                    format!("{dir}/{name}")
-                };
-                if entry.metadata().file_type().is_dir() {
-                    queue.push(child);
-                } else {
-                    if files.len() >= MAX_SFTP_DELETE_FILES {
-                        return Err(SshError::SessionError(format!(
-                            "Refusing to delete: directory tree exceeds {MAX_SFTP_DELETE_FILES} files"
-                        )));
-                    }
-                    files.push(child);
-                }
-            }
+        // SFTP v3 cannot bind descendant paths to directory handles. Never walk
+        // a remote tree here: RMDIR rejects non-empty directories atomically.
+        if let Some(progress) = on_progress {
+            progress(RemoveProgress {
+                phase: RemovePhase::Deleting,
+                deleted: 0,
+                total: Some(1),
+                current: last_path_segment(path),
+            });
         }
-        let total = files.len() + dirs.len();
-        let mut deleted = 0usize;
-        for file in &files {
-            sftp.remove_file(file)
-                .await
-                .map_err(|e| SshError::SessionError(e.to_string()))?;
-            deleted += 1;
-            if let Some(progress) = on_progress {
-                progress(RemoveProgress {
-                    phase: RemovePhase::Deleting,
-                    deleted,
-                    total: Some(total),
-                    current: last_path_segment(file),
-                });
-            }
-        }
-        // Reverse discovery order removes deepest directories first.
-        for dir in dirs.iter().rev() {
-            sftp.remove_dir(dir)
-                .await
-                .map_err(|e| SshError::SessionError(e.to_string()))?;
-            deleted += 1;
-            if let Some(progress) = on_progress {
-                progress(RemoveProgress {
-                    phase: RemovePhase::Deleting,
-                    deleted,
-                    total: Some(total),
-                    current: last_path_segment(dir),
-                });
-            }
+        sftp.remove_dir(path).await.map_err(|error| {
+            SshError::SessionError(format!(
+                "Unable to delete this remote folder. Only empty folders are supported. {error}"
+            ))
+        })?;
+        if let Some(progress) = on_progress {
+            progress(RemoveProgress {
+                phase: RemovePhase::Deleting,
+                deleted: 1,
+                total: Some(1),
+                current: last_path_segment(path),
+            });
         }
         Ok(())
     }

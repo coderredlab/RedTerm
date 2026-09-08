@@ -649,7 +649,9 @@
     message={deleteTarget !== null ? `Delete "${deleteTarget.entry.name}"?` : ""}
     detail={
       deleteTarget?.entry.is_dir
-        ? "Everything inside this folder will also be deleted. This cannot be undone."
+        ? kind === "ssh"
+          ? "Only empty remote folders can be deleted. If this entry is a symbolic link, only the link will be removed. This cannot be undone."
+          : "Everything inside this folder will also be deleted. This cannot be undone."
         : "This cannot be undone."
     }
     confirmLabel="Delete"
