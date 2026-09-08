@@ -380,7 +380,7 @@ function unzlibBounded(
 
 const UNSAFE_OSC_TEXT = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/gu;
 const STRICT_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-
+const APC_BOUNDARY = /[\x07\x18\x1a\x1b]/g;
 function normalizeOscColor(value: string): string | null {
   const rgbMatch = /^rgb:([0-9a-f]{1,4})\/([0-9a-f]{1,4})\/([0-9a-f]{1,4})$/i.exec(value);
   const hexMatch = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{9}|[0-9a-f]{12})$/i.exec(value);
@@ -963,8 +963,34 @@ export class AnsiParser {
   }
 
   write(data: string) {
-    for (const char of data) {
-      this.processChar(char);
+    let offset = 0;
+    while (offset < data.length) {
+      if (data.charCodeAt(offset) < 0x20) {
+        this.processChar(data[offset]);
+        offset++;
+        continue;
+      }
+      if (this.parseState === 'apc' || this.parseState === 'apcDiscard') {
+        APC_BOUNDARY.lastIndex = offset;
+        const boundary = APC_BOUNDARY.exec(data)?.index ?? data.length;
+        if (this.parseState === 'apcDiscard') {
+          offset = boundary;
+        } else {
+          let end = Math.min(boundary, offset + Math.max(0, MAX_KITTY_APC_SEQUENCE_CHARS - this.escapeBuffer.length));
+          // Leave a code point crossing the size limit to the normal state transition.
+          if (end > offset && end < data.length &&
+              data.charCodeAt(end - 1) >= 0xd800 && data.charCodeAt(end - 1) <= 0xdbff &&
+              data.charCodeAt(end) >= 0xdc00 && data.charCodeAt(end) <= 0xdfff) {
+            end--;
+          }
+          this.escapeBuffer += data.slice(offset, end);
+          offset = end;
+        }
+        if (offset === data.length) break;
+      }
+      const width = data.codePointAt(offset)! > 0xffff ? 2 : 1;
+      this.processChar(width === 1 ? data[offset] : data.slice(offset, offset + width));
+      offset += width;
     }
   }
 

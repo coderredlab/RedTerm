@@ -691,7 +691,12 @@
   .settings-modal {
     position: relative;
     width: min(760px, calc(100vw - 48px));
-    max-height: min(680px, calc(100vh - 64px));
+    height: min(680px, calc(100vh - 64px));
+    min-width: min(560px, calc(100vw - 48px));
+    min-height: min(360px, calc(100vh - 64px));
+    max-width: calc(100vw - 48px);
+    max-height: calc(100vh - 64px);
+    resize: both;
     display: flex;
     flex-direction: column;
     border: 1px solid var(--border-primary);

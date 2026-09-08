@@ -920,6 +920,23 @@ describe("AnsiParser Kitty images", () => {
     expect(visibleText).not.toContain("CQoLDA0ODw==");
   });
 
+  test("preserves Kitty pixels and Unicode around every split of an APC transfer", () => {
+    const control = "\x1b_Ga=T,f=32,s=1,v=1,c=1,r=1,C=1;AQIDBA==\x1b\\";
+    for (let split = 0; split <= control.length; split++) {
+      const source = new AnsiParser(20, 3);
+      source.write("界\u{1d11e}" + control.slice(0, split));
+      const restored = new AnsiParser(20, 3);
+      restored.restoreSnapshot(source.createRuntimeSnapshot());
+      restored.write(control.slice(split) + "끝");
+      expect(restored.getImages()).toHaveLength(1);
+      expect(Array.from(restored.getImages()[0].data)).toEqual([1, 2, 3, 4]);
+      expect(restored.getImages()[0]).toMatchObject({ row: 0, col: 3 });
+      expect(restored.getBuffer()[0][0].char).toBe("界");
+      expect(restored.getBuffer()[0][2].char).toBe("\u{1d11e}");
+      expect(restored.getBuffer()[0][3].char).toBe("끝");
+    }
+  });
+
   test("continues a multi-chunk Kitty image after a JSON snapshot round trip", () => {
     const source = new AnsiParser(80, 3);
     source.write("\x1b_Ga=T,f=32,s=2,v=2,c=2,r=1,m=1\x1b\\");
@@ -2886,49 +2903,36 @@ describe("AnsiParser CSI work limits", () => {
 
 describe("AnsiParser image resource limits", () => {
   test("discards oversized OSC and APC controls and resumes plain text", () => {
-    const oversizedControl = "x".repeat(24 * 1024 * 1024);
-
-    for (const state of ["osc", "apc"]) {
+    for (const opener of ["\x1b]0;", "\x1b_G"]) {
       const parser = new AnsiParser(40, 2);
-      const parserInternals = parser as AnsiParser & {
-        parseState: "osc" | "apc";
-        escapeBuffer: string;
-        pendingITerm2File: unknown;
-        pendingKittyImage: unknown;
-      };
-      parser.write("before");
-      parserInternals.parseState = state;
-      parserInternals.escapeBuffer = oversizedControl;
-      parserInternals.pendingITerm2File = state === "osc" ? {} : null;
-      parserInternals.pendingKittyImage = state === "apc" ? {} : null;
-
-      parser.write("x\x07after");
-
+      parser.write("before" + opener + "x".repeat(10 * 1024) + "\x07after");
       expect(visibleRowText(parser)).toBe("beforeafter");
-      expect(parserInternals.escapeBuffer).toBe("");
-      expect(parserInternals.pendingITerm2File).toBeNull();
-      expect(parserInternals.pendingKittyImage).toBeNull();
+      parser.write(kittyRgbaApc());
+      expect(Array.from(parser.getImages()[0].data)).toEqual([1, 2, 3, 4]);
     }
   });
 
   test("cancels oversized APC and DCS controls with CAN or SUB", () => {
-    const oversizedControl = "x".repeat(24 * 1024 * 1024);
-
-    for (const [state, cancel] of [["apc", "\x18"], ["dcs", "\x1a"]] as const) {
+    for (const [opener, length, cancel] of [["\x1b_G", 10 * 1024, "\x18"], ["\x1bPq", 6 * 1024 * 1024, "\x1a"]] as const) {
       const parser = new AnsiParser(40, 2);
-      const parserInternals = parser as AnsiParser & {
-        parseState: "apc" | "dcs";
-        escapeBuffer: string;
-      };
-      parser.write("before");
-      parserInternals.parseState = state;
-      parserInternals.escapeBuffer = oversizedControl;
-
-      parser.write(`x${cancel}after`);
-
+      parser.write("before" + opener + "x".repeat(length));
+      parser.write(cancel + "after");
       expect(visibleRowText(parser)).toBe("beforeafter");
-      expect(parserInternals.escapeBuffer).toBe("");
     }
+  });
+
+  test("accepts a full-size Kitty APC and rejects one beyond its bound", () => {
+    const header = "a=q,f=32,s=768,v=1,i=905,x=".padEnd(4096, "x");
+    const payload = Buffer.alloc(3072).toString("base64");
+    const parser = new AnsiParser(40, 2);
+    const responses: string[] = [];
+    parser.setResponseHandler((response) => responses.push(response));
+    parser.write("\x1b_G" + header + ";" + payload + "\x1b\\");
+    expect(responses).toEqual(["\x1b_Gi=905;OK\x1b\\"]);
+    responses.length = 0;
+    parser.write("before\x1b_G" + header + ";" + payload + "A\x1b\\after");
+    expect(responses).toEqual([]);
+    expect(visibleRowText(parser)).toBe("beforeafter");
   });
 
   test("accepts a maximum-size raw Kitty image in protocol-sized chunks", () => {

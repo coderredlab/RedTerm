@@ -305,7 +305,6 @@
   let startupScriptDispatcher: StartupScriptDispatcher | null = null;
   const REPLAY_SLICE_BUDGET_MS = 8;
   const LIVE_OUTPUT_SLICE_BUDGET_MS = 8;
-  const LIVE_OUTPUT_SLICE_CHARACTERS = 256 * 1024;
   const MAX_PENDING_OUTPUT_CHARACTERS = 4 * 1024 * 1024;
   const MAX_REPLAY_BUFFER_BYTES = 4 * 1024 * 1024;
   const STICKY_BOTTOM_THRESHOLD_PX = 24;
@@ -1390,13 +1389,12 @@
   function processPendingOutputSlice(force: boolean) {
     if (!parser) return;
     const startedAt = performance.now();
-    let processedCharacters = 0;
+    const initialHead = pendingDataHead;
     while (pendingDataHead < pendingDataChunks.length) {
       if (
         !force &&
-        processedCharacters > 0 &&
-        (processedCharacters >= LIVE_OUTPUT_SLICE_CHARACTERS ||
-          performance.now() - startedAt >= LIVE_OUTPUT_SLICE_BUDGET_MS)
+        pendingDataHead > initialHead &&
+        performance.now() - startedAt >= LIVE_OUTPUT_SLICE_BUDGET_MS
       ) {
         break;
       }
@@ -1404,7 +1402,6 @@
       const chunk = pendingDataChunks[pendingDataHead++];
       parser.write(chunk.text);
       pendingDataCharacters -= chunk.text.length;
-      processedCharacters += chunk.text.length;
       if (chunk.completesSeq) {
         lastProcessedSeq = Math.max(lastProcessedSeq, chunk.seq);
       }
