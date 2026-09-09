@@ -3,6 +3,7 @@
 import { convertIndexedToRgb, decode as decodePngBytes, type DecodedPng } from 'fast-png';
 import { Unzlib } from 'fflate';
 import { decodeSixel } from './sixel-decoder';
+import { OscNotifications, type TerminalNotification } from './osc-notifications';
 import { kittyDiacriticIndex } from './kitty-placeholder';
 import {
   KITTY_KEYBOARD_STACK_LIMIT,
@@ -45,6 +46,7 @@ export interface TerminalShellIntegrationState {
 }
 
 export type TerminalOscEvent =
+  | { type: 'notification'; notification: TerminalNotification }
   | { type: 'title'; value: string }
   | { type: 'current-directory'; uri: string }
   | { type: 'clipboard'; text: string }
@@ -542,6 +544,28 @@ export class AnsiParser {
     this.onResponse = handler;
   }
   private onOscEvent: ((event: TerminalOscEvent) => void) | null = null;
+  private notifications = new OscNotifications();
+  private notificationSupport = false;
+  private replayingNotifications = false;
+  private notificationSequenceSuppressed = false;
+
+  setNotificationSupport(enabled: boolean) {
+    this.notificationSupport = enabled;
+    if (!enabled) this.notifications.clear();
+  }
+
+  /** Replayed output must not reissue external notifications. Queries still respond. */
+  writeReplay(data: string) {
+    this.notifications.clear();
+    this.replayingNotifications = true;
+    this.notificationSequenceSuppressed = true;
+    try {
+      this.write(data);
+    } finally {
+      this.replayingNotifications = false;
+      this.notifications.clear();
+    }
+  }
   setOscEventHandler(handler: (event: TerminalOscEvent) => void) {
     this.onOscEvent = handler;
   }
@@ -971,6 +995,7 @@ export class AnsiParser {
   }
 
   private oscSequenceLimit(): number {
+    if (this.escapeBuffer.startsWith('99;')) return 4096 + 1024 + 4;
     if (this.escapeBuffer.startsWith('1337;File')) return MAX_CONTROL_SEQUENCE_CHARS;
     if (this.escapeBuffer.startsWith('52;')) return MAX_OSC_CLIPBOARD_BASE64_CHARS + 64;
     return MAX_OSC_SEQUENCE_CHARS;
@@ -1035,6 +1060,7 @@ export class AnsiParser {
           this.parseState = 'csi';
         } else if (char === ']') {
           this.parseState = 'osc';
+          this.notificationSequenceSuppressed = this.replayingNotifications;
         } else if (char === 'O') {
           this.parseState = 'ss3';
         } else if (char === '_') {
@@ -1117,6 +1143,7 @@ export class AnsiParser {
         } else if (char === '\x1b') {
           this.parseState = 'oscEscape';
         } else if (this.escapeBuffer.length >= this.oscSequenceLimit()) {
+          if (this.escapeBuffer.startsWith('99;')) this.notifications.clear();
           this.escapeBuffer = '';
           this.pendingITerm2File = null;
           this.parseState = 'oscDiscard';
@@ -1133,6 +1160,7 @@ export class AnsiParser {
         } else if (char === '\x1b') {
           this.parseState = 'oscEscape';
         } else if (this.escapeBuffer.length + 2 > this.oscSequenceLimit()) {
+          if (this.escapeBuffer.startsWith('99;')) this.notifications.clear();
           this.escapeBuffer = '';
           this.pendingITerm2File = null;
           this.parseState = 'oscDiscard';
@@ -1336,6 +1364,14 @@ export class AnsiParser {
       case '52':
         this.handleOscClipboard(payload);
         return;
+      case '99': {
+        if (!this.notificationSupport) return;
+        const result = this.notifications.receive(payload);
+        if (result.response) this.onResponse?.(result.response);
+        if (this.notificationSequenceSuppressed) this.notifications.clear();
+        else if (result.notification) this.onOscEvent?.({ type: 'notification', notification: result.notification });
+        return;
+      }
       case '66':
         this.handleOscTextSizing(payload);
         return;
@@ -5804,6 +5840,8 @@ export class AnsiParser {
   }
 
   restoreSnapshot(snapshot: TerminalSnapshot) {
+    this.notifications.clear();
+    this.notificationSequenceSuppressed = true;
     this.clearRetainedImageState();
     const preserveLatestLines =
       !snapshot.usingAlternateScreen &&

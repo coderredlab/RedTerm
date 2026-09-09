@@ -322,6 +322,7 @@
         const verdict = await resolveRecovery(
           {
             sessionId: pane.sessionId,
+            kind: pane.kind,
             runtimeInstanceId: pane.runtimeInstanceId,
             auth: pane.connection.auth,
             canRestorePassword: pane.connection.canRestorePassword,
@@ -783,31 +784,23 @@
   }
 
   async function handlePaneDrop(tabId: string, paneId: string) {
-    if (paneIsClosing(tabId, paneId)) return;
-    if (!workspaceEl) return;
-    const hit = document.elementFromPoint(
-      tabDrag.pointerX,
-      tabDrag.pointerY
-    )?.closest<HTMLElement>("[data-pane-id]");
-    const targetPaneId = hit?.dataset.paneId;
-    if (!targetPaneId || targetPaneId === paneId) return;
+    if (paneIsClosing(tabId, paneId) || tabsStore.activeTabId !== tabId) return;
+    const target = tabDrag.paneTarget ? { ...tabDrag.paneTarget } : null;
+    const wholePane = tabDrag.wholePane;
+    if (!target || target.tabId !== tabId) return;
+    const targetPaneId = target.paneId;
     if (paneIsClosing(tabId, targetPaneId)) return;
-
-    // Direction comes from the hovered pane's own rect so the split happens
-    // where the pointer actually is, not relative to the whole workspace.
-    const zone =
-      zoneFromPoint(hit!.getBoundingClientRect(), tabDrag.pointerX, tabDrag.pointerY) ??
-      tabDrag.dropZone;
-    if (!zone) return;
-
-    const dir = zone === "left" || zone === "right" ? "row" : "col";
+    const zone = target.zone;
+    const dir = zone === "merge" ? "merge" : zone === "left" || zone === "right" ? "row" : "col";
     const side = zone === "left" || zone === "top" ? "before" : "after";
 
     await serializeLayoutSnapshotOperation(async () => {
       await storeTabSnapshots([tabId]);
       await tick();
       if (paneIsClosing(tabId, paneId) || paneIsClosing(tabId, targetPaneId)) return;
-      await tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side);
+      await tabsStore.movePaneWithinTab(tabId, paneId, targetPaneId, dir, side, {
+        wholePane, insertIndex: target.insertIndex,
+      });
       for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {
         terminals.get(pane.id)?.syncSize();
       }

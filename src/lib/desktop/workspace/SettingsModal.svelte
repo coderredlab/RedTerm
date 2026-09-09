@@ -563,8 +563,8 @@
           <div class="section-label">Notifications</div>
           <div class="toggle-row">
             <div class="toggle-copy">
-              <span class="control-label" id="bell-notifications-label">Terminal bell notifications</span>
-              <span class="control-hint">Show a system notification when a background session rings the terminal bell.</span>
+              <span class="control-label" id="bell-notifications-label">Terminal notifications</span>
+              <span class="control-hint">Show system notifications from terminal apps and background terminal bells.</span>
             </div>
             <button
               type="button"

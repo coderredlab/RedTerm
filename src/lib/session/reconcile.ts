@@ -6,6 +6,7 @@ export type SessionRecoveryVerdict = "keep" | "remove" | "disconnect";
 /** Minimal persisted-session shape shared by tabs (mobile) and panes (desktop). */
 export interface RecoveryTarget {
   sessionId: string | null;
+  kind?: "ssh" | "local";
   runtimeInstanceId?: string | null;
   auth: AuthConfig;
   canRestorePassword?: boolean;
@@ -32,6 +33,9 @@ export async function resolveRecovery(
   if (!target.sessionId) return "keep";
 
   const sameRuntime = target.runtimeInstanceId === runtimeInstanceId;
+  // Local attachment checks its own PTY. Across app runtimes the process is
+  // gone, but its workspace entry must survive and start a fresh shell.
+  if (target.kind === "local") return sameRuntime ? "keep" : "disconnect";
   const sessionAlive = sameRuntime
     ? await sshSessionExists(target.sessionId).catch(() => false)
     : false;

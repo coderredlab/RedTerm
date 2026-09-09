@@ -183,9 +183,9 @@ function makePersistableAuth(
 }
 
 function canPersistPane(pane: Pane): boolean {
-  // Local shells die with the app process; there is nothing to restore.
+  // Restore the local workspace with fresh shells after the app restarts.
   if (pane.kind === "local") {
-    return false;
+    return true;
   }
   const auth = pane.connection.auth;
   if (auth.method.type === "key") {
@@ -468,6 +468,7 @@ function validatePane(candidate: unknown, tabId: string): Pane | null {
     id: raw.id,
     tabId,
     title: normalizedPaneTitle(raw.title, persistedConnection),
+    kind: raw.kind === "local" ? "local" : "ssh",
     connection: persistedConnection,
     sessionId: typeof raw.sessionId === "string" ? raw.sessionId : null,
     runtimeInstanceId:
@@ -850,7 +851,7 @@ function createTabsStore() {
       return id;
     },
 
-    /** Open a tab running the local machine's own shell (never persisted). */
+    /** Open a tab running the local machine's own shell. */
     addLocalTab(): string {
       const id = crypto.randomUUID();
       const connection: PaneConnection = {
@@ -1593,54 +1594,65 @@ function createTabsStore() {
       });
     },
 
-    /** Move a pane next to another pane of the same tab (drag rearrange). */
+    /** Move a terminal tab or whole split leaf within its existing top-level tab. */
     async movePaneWithinTab(
       tabId: string,
       paneId: string,
       targetPaneId: string,
-      dir: "row" | "col",
-      side: "before" | "after"
+      dir: "row" | "col" | "merge",
+      side: "before" | "after",
+      options: { wholePane?: boolean; insertIndex?: number | null } = {},
     ) {
-      if (paneId === targetPaneId) return;
-      const tab = tabs.find((candidate) => candidate.id === tabId);
-      if (!tab) return;
-      if (
-        !tab.panes.some((pane) => pane.id === paneId) ||
-        !tab.panes.some((pane) => pane.id === targetPaneId)
-      ) {
-        return;
-      }
-
       await withPreservedLayout([tabId], () => {
         const candidate = tabs.find((entry) => entry.id === tabId);
         if (!candidate) return;
+        const findLeaf = (node: PaneNode, id: string): Extract<PaneNode, { type: "leaf" }> | null => {
+          if (node.type === "leaf") return node.paneIds.includes(id) ? node : null;
+          return findLeaf(node.children[0], id) ?? findLeaf(node.children[1], id);
+        };
+        const source = findLeaf(candidate.layout, paneId);
+        const target = findLeaf(candidate.layout, targetPaneId);
+        if (!source || !target) return;
+        if (source === target && options.wholePane) return;
+        const movedIds = options.wholePane ? [...source.paneIds] : [paneId];
+        const movedSet = new Set(movedIds);
         const movedDocumentIds = candidate.documents
-          .filter((document) => document.sourcePaneId === paneId)
+          .filter((document) => movedSet.has(document.sourcePaneId))
           .map((document) => document.id);
-        const layoutWithoutMovedDocuments = removeDocumentsFromLayout(
-          candidate.layout,
-          new Set(movedDocumentIds)
-        );
-        const withoutMoved = pruneLayout(
-          layoutWithoutMovedDocuments,
-          new Set(
-            collectPaneIds(candidate.layout).filter((id) => id !== paneId)
-          )
-        );
-        if (!withoutMoved) return;
-        candidate.layout = replaceLeaf(
-          withoutMoved,
-          targetPaneId,
-          (leafNode) =>
-            makeSplit(
-              dir,
-              0.5,
-              side === "before"
-                ? [leaf(paneId, [paneId], movedDocumentIds), leafNode]
-                : [leafNode, leaf(paneId, [paneId], movedDocumentIds)]
-            )
-        );
-        candidate.activePaneId = paneId;
+        const activeItem: PaneItem = options.wholePane ? source.activeItem : { kind: "terminal", id: paneId };
+        const activePane = options.wholePane ? source.paneId : paneId;
+
+        if (source === target && dir === "merge") {
+          if (options.insertIndex == null) return;
+          const oldIndex = source.paneIds.indexOf(paneId);
+          const index = options.insertIndex > oldIndex ? options.insertIndex - 1 : options.insertIndex;
+          const ids = source.paneIds.filter((id) => id !== paneId);
+          ids.splice(Math.max(0, Math.min(index, ids.length)), 0, paneId);
+          candidate.layout = replaceLeaf(candidate.layout, paneId, () =>
+            leaf(paneId, ids, source.documentIds, activeItem));
+        } else {
+          if (source === target && source.paneIds.length === 1) return;
+          const withoutDocuments = removeDocumentsFromLayout(candidate.layout, new Set(movedDocumentIds));
+          const withoutMoved = pruneLayout(withoutDocuments, new Set(
+            collectPaneIds(candidate.layout).filter((id) => !movedSet.has(id))
+          ));
+          if (!withoutMoved) return;
+          // When splitting from the same leaf, its previously active pane may be the moved tab.
+          const destinationId = source === target
+            ? source.paneIds.find((id) => !movedSet.has(id))!
+            : targetPaneId;
+          candidate.layout = replaceLeaf(withoutMoved, destinationId, (destination) => {
+            if (dir === "merge") {
+              const ids = [...destination.paneIds];
+              const index = Math.max(0, Math.min(options.insertIndex ?? ids.length, ids.length));
+              ids.splice(index, 0, ...movedIds);
+              return leaf(activePane, ids, [...destination.documentIds, ...movedDocumentIds], activeItem);
+            }
+            const moved = leaf(activePane, movedIds, movedDocumentIds, activeItem);
+            return makeSplit(dir, 0.5, side === "before" ? [moved, destination] : [destination, moved]);
+          });
+        }
+        candidate.activePaneId = activePane;
         syncTabFromPanes(candidate);
       });
     },

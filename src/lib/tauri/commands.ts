@@ -66,28 +66,44 @@ export async function relaunchDesktopApp(): Promise<void> {
   await invoke("restart_application");
 }
 
-/** Global cooldown so background sessions cannot flood the OS notification center. */
-const BELL_NOTIFICATION_GLOBAL_COOLDOWN_MS = 2000;
-let lastBellNotificationSentAt = 0;
+/** Shared cooldown for terminal bells and OSC 99 messages across all sessions. */
+const TERMINAL_NOTIFICATION_GLOBAL_COOLDOWN_MS = 2000;
+let lastTerminalNotificationSentAt = -Infinity;
+let terminalNotificationInFlight = false;
 
 /** Sends a desktop notification when a background session rings the terminal bell. */
 export async function sendDesktopBellNotification(sourceLabel: string): Promise<void> {
-  // Dynamic import on purpose: test module graphs replace @tauri-apps/api/core with a
-  // partial mock, so a static plugin import would fail to load there (same as the updater).
-  const { isPermissionGranted, requestPermission, sendNotification } =
-    await import("@tauri-apps/plugin-notification");
-  let granted = await isPermissionGranted();
-  if (!granted) {
-    granted = (await requestPermission()) === "granted";
+  return sendDesktopTerminalNotification(
+    `${sourceLabel}: terminal bell`,
+    "A background session is requesting attention."
+  );
+}
+
+export async function sendDesktopTerminalNotification(
+  title: string,
+  body: string,
+  canDeliver: () => boolean = () => true,
+): Promise<void> {
+  if (!canDeliver() || terminalNotificationInFlight ||
+    Date.now() - lastTerminalNotificationSentAt < TERMINAL_NOTIFICATION_GLOBAL_COOLDOWN_MS) return;
+  terminalNotificationInFlight = true;
+  try {
+    // Dynamic import on purpose: test module graphs replace @tauri-apps/api/core with a
+    // partial mock, so a static plugin import would fail to load there (same as the updater).
+    const { isPermissionGranted, requestPermission, sendNotification } =
+      await import("@tauri-apps/plugin-notification");
+    let granted = await isPermissionGranted();
+    if (!granted) {
+      granted = (await requestPermission()) === "granted";
+    }
+    if (!granted || !canDeliver()) return;
+    const now = Date.now();
+    if (now - lastTerminalNotificationSentAt < TERMINAL_NOTIFICATION_GLOBAL_COOLDOWN_MS) return;
+    lastTerminalNotificationSentAt = now;
+    sendNotification({ title, body });
+  } finally {
+    terminalNotificationInFlight = false;
   }
-  if (!granted) return;
-  const now = Date.now();
-  if (now - lastBellNotificationSentAt < BELL_NOTIFICATION_GLOBAL_COOLDOWN_MS) return;
-  lastBellNotificationSentAt = now;
-  sendNotification({
-    title: `${sourceLabel}: terminal bell`,
-    body: "A background session is requesting attention.",
-  });
 }
 
 

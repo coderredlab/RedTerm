@@ -7,13 +7,13 @@
 </script>
 
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import Terminal from "$lib/terminal/Terminal.svelte";
   import { tabsStore, type PaneNode } from "$lib/stores/tabs.svelte";
   import {
-    dragTargets,
+    paneTargetFromPoint,
     resetTabDrag,
     tabDrag,
-    zoneFromPoint,
   } from "./drag-state.svelte";
   import { getWorkspaceApi } from "./workspace-context";
   import Self from "./PaneView.svelte";
@@ -35,6 +35,9 @@
   let liveRatio = $state(0.5);
   let terminalRefs = $state<Record<string, Terminal | undefined>>({});
   let resizePointerId: number | null = null;
+  let cancelPaneDrag: (() => void) | null = null;
+  let suppressPaneClick = false;
+  onDestroy(() => cancelPaneDrag?.());
 
   $effect(() => {
     if (node.type === "split") {
@@ -119,66 +122,76 @@
     divider.setPointerCapture(capturedPointerId);
   }
 
-  function startPaneDrag(event: PointerEvent, paneId: string, title: string) {
+  function startPaneDrag(event: PointerEvent, paneId: string, title: string, wholePane = false) {
     const header = event.currentTarget as HTMLElement | null;
-    if (event.button !== 0 || !header) return;
+    if (event.button !== 0 || !header || !interactive || tabDrag.active) return;
+    cancelPaneDrag?.();
     event.preventDefault();
     const startX = event.clientX;
     const startY = event.clientY;
     let armed = false;
     let settled = false;
     const capturedPointerId = event.pointerId;
-    const windowUp = (e: PointerEvent) => {
-      if (e.pointerId !== capturedPointerId) return;
-      finish(true);
+    const updateTarget = (x: number, y: number) => {
+      tabDrag.pointerX = x;
+      tabDrag.pointerY = y;
+      const target = tabsStore.activeTabId === tabId ? paneTargetFromPoint(tabId, x, y) : null;
+      const sameLeaf = node.type === "leaf" && target !== null && node.paneIds.includes(target.paneId);
+      tabDrag.paneTarget = sameLeaf && (wholePane ||
+        (target?.zone === "merge" && target.insertIndex === null) ||
+        (target?.zone !== "merge" && node.type === "leaf" && node.paneIds.length === 1)) ? null : target;
     };
-    const windowCancel = (e: PointerEvent) => {
-      if (e.pointerId !== capturedPointerId) return;
-      finish(false);
-    };
-
     const onMove = (moveEvent: PointerEvent) => {
-      if (
-        !armed &&
-        Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) < 5
-      ) {
-        return;
-      }
+      if (moveEvent.pointerId !== capturedPointerId || settled) return;
+      if (!armed && Math.hypot(moveEvent.clientX - startX, moveEvent.clientY - startY) < 5) return;
       armed = true;
       tabDrag.active = true;
       tabDrag.kind = "pane";
       tabDrag.tabId = tabId;
       tabDrag.paneId = paneId;
+      tabDrag.wholePane = wholePane;
       tabDrag.title = title;
-      tabDrag.pointerX = moveEvent.clientX;
-      tabDrag.pointerY = moveEvent.clientY;
-      const rect = dragTargets.workspace?.getBoundingClientRect();
-      tabDrag.dropZone = rect
-        ? zoneFromPoint(rect, moveEvent.clientX, moveEvent.clientY)
-        : null;
+      updateTarget(moveEvent.clientX, moveEvent.clientY);
     };
     const finish = (drop: boolean) => {
       if (settled) return;
       settled = true;
-      header.removeEventListener("pointermove", onMove);
-      header.removeEventListener("pointerup", finishUp);
-      header.removeEventListener("pointercancel", cancel);
-      // Window-level backstop in case the header unmounts mid-gesture.
-      window.removeEventListener("pointerup", windowUp, true);
-      window.removeEventListener("pointercancel", windowCancel, true);
-      if (armed && drop) {
-        workspace.paneDragDropped(tabId, paneId);
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointerup", finishUp, true);
+      window.removeEventListener("pointercancel", cancel, true);
+      window.removeEventListener("keydown", keydown, true);
+      window.removeEventListener("blur", cancel);
+      header.removeEventListener("lostpointercapture", cancel);
+      if (header.hasPointerCapture(capturedPointerId)) header.releasePointerCapture(capturedPointerId);
+      cancelPaneDrag = null;
+      if (armed) {
+        suppressPaneClick = true;
+        setTimeout(() => { suppressPaneClick = false; }, 0);
+        if (drop) workspace.paneDragDropped(tabId, paneId);
       }
       resetTabDrag();
     };
-    const finishUp = () => finish(true);
+    const finishUp = (upEvent: PointerEvent) => {
+      if (upEvent.pointerId !== capturedPointerId) return;
+      if (armed) updateTarget(upEvent.clientX, upEvent.clientY);
+      finish(true);
+    };
     const cancel = () => finish(false);
-    header.addEventListener("pointermove", onMove);
-    header.addEventListener("pointerup", finishUp);
-    header.addEventListener("pointercancel", cancel);
-    window.addEventListener("pointerup", windowUp, true);
-    window.addEventListener("pointercancel", windowCancel, true);
-    header.setPointerCapture(event.pointerId);
+    const keydown = (keyEvent: KeyboardEvent) => {
+      if (keyEvent.key === "Escape") {
+        keyEvent.preventDefault();
+        keyEvent.stopPropagation();
+        finish(false);
+      }
+    };
+    cancelPaneDrag = cancel;
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointerup", finishUp, true);
+    window.addEventListener("pointercancel", cancel, true);
+    window.addEventListener("keydown", keydown, true);
+    window.addEventListener("blur", cancel);
+    header.addEventListener("lostpointercapture", cancel);
+    header.setPointerCapture(capturedPointerId);
   }
 
 </script>
@@ -208,19 +221,36 @@
 {:else}
   {@const pane = tabsStore.getPane(tabId, node.paneId)}
   {@const focused = interactive && activePaneId === node.paneId}
+  {@const dropTarget = tabDrag.active && tabDrag.kind === "pane" && tabDrag.paneTarget?.tabId === tabId && tabDrag.paneTarget.paneId === node.paneId ? tabDrag.paneTarget : null}
   {#if pane}
       <section
         class="pane"
         class:focused
         data-pane-id={node.paneId}
+        data-workspace-tab-id={tabId}
       >
         <header class="pane-header">
+          <button
+            class="pane-action pane-drag-handle"
+            title="Drag pane to move or merge"
+            aria-label="Drag pane to move or merge"
+            onpointerdown={(event) => startPaneDrag(event, node.paneId, `Pane: ${pane.title}`, true)}
+          >
+            <svg viewBox="0 0 12 16" aria-hidden="true">
+              <circle cx="4" cy="4" r="1" /><circle cx="8" cy="4" r="1" />
+              <circle cx="4" cy="8" r="1" /><circle cx="8" cy="8" r="1" />
+              <circle cx="4" cy="12" r="1" /><circle cx="8" cy="12" r="1" />
+            </svg>
+          </button>
           <div class="pane-tabs" role="tablist" aria-label="Pane tabs">
-            {#each node.paneIds as paneId}
+            {#each node.paneIds as paneId, index (paneId)}
               {@const tabPane = tabsStore.getPane(tabId, paneId)}
               {#if tabPane}
                 <div
                   class="terminal-tab"
+                  class:drop-before={dropTarget?.insertIndex === index}
+                  class:drop-after={dropTarget?.insertIndex === node.paneIds.length && index === node.paneIds.length - 1}
+                  data-pane-tab-id={paneId}
                   class:active={node.activeItem.kind === "terminal" && node.activeItem.id === paneId}
                 >
                   <button
@@ -229,7 +259,7 @@
                     aria-selected={node.activeItem.kind === "terminal" && node.activeItem.id === paneId}
                     title={tabPane.title}
                     onpointerdown={(event) => startPaneDrag(event, paneId, tabPane.title)}
-                    onclick={() => workspace.activatePane(tabId, paneId)}
+                    onclick={() => { if (!suppressPaneClick) workspace.activatePane(tabId, paneId); }}
                   >
                     <span
                       class="pane-state"
@@ -331,7 +361,8 @@
                     startupScriptReadyText={terminalPane.connection.startupScriptReadyText}
                     interactive={focused && node.activeItem.kind === "terminal" && node.activeItem.id === terminalPaneId}
                     refocusOnBlur={focused && node.activeItem.kind === "terminal" && node.activeItem.id === terminalPaneId}
-                    disconnectOnDestroy={!terminalPane.preserveSessionOnMove}
+                    disconnectOnDestroy={() => !tabsStore.tabs.some((tab) =>
+                      tab.panes.some((pane) => pane.id === terminalPaneId && pane.preserveSessionOnMove))}
                     kind={terminalPane.kind ?? "ssh"}
                     onConnected={(sessionId) =>
                       workspace.paneConnected(tabId, terminalPaneId, sessionId)}
@@ -374,6 +405,12 @@
             {/if}
           {/if}
         </div>
+        {#if dropTarget && dropTarget.insertIndex === null}
+          <div class="pane-drop-preview" class:left={dropTarget.zone === "left"} class:right={dropTarget.zone === "right"}
+            class:top={dropTarget.zone === "top"} class:bottom={dropTarget.zone === "bottom"} aria-hidden="true">
+            <span>{dropTarget.zone === "merge" ? (tabDrag.wholePane ? "Merge panes" : "Move tab here") : "Split here"}</span>
+          </div>
+        {/if}
       </section>
   {/if}
 {/if}
@@ -425,6 +462,7 @@
   }
 
   .pane {
+    position: relative;
     display: flex;
     flex-direction: column;
     width: 100%;
@@ -465,6 +503,7 @@
   }
 
   .terminal-tab {
+    position: relative;
     min-width: 112px;
     max-width: 220px;
     flex: 0 1 180px;
@@ -519,6 +558,47 @@
     flex: 0 0 auto;
     display: flex;
     align-items: center;
+  }
+
+  .pane-drag-handle { width: 20px; cursor: grab; touch-action: none; }
+  .pane-drag-handle:active, .terminal-tab-main:active { cursor: grabbing; }
+  .pane-drag-handle svg { width: 12px; height: 16px; fill: currentColor; }
+  .terminal-tab-main { touch-action: none; }
+  .terminal-tab.drop-before::before, .terminal-tab.drop-after::after {
+    content: "";
+    position: absolute;
+    top: 4px;
+    bottom: 4px;
+    width: 3px;
+    border-radius: 2px;
+    background: var(--accent-primary);
+    z-index: 2;
+    pointer-events: none;
+  }
+  .terminal-tab.drop-before::before { left: 0; }
+  .terminal-tab.drop-after::after { right: 0; }
+  .pane-drop-preview {
+    position: absolute;
+    inset: 30px 0 0;
+    z-index: 20;
+    pointer-events: none;
+    display: grid;
+    place-items: center;
+    border: 2px solid var(--accent-primary);
+    background: color-mix(in srgb, var(--accent-primary) 14%, transparent);
+  }
+  .pane-drop-preview.left { right: 50%; }
+  .pane-drop-preview.right { left: 50%; }
+  .pane-drop-preview.top { bottom: calc(50% - 15px); }
+  .pane-drop-preview.bottom { top: calc(50% + 15px); }
+  .pane-drop-preview span {
+    padding: 6px 10px;
+    border: 1px solid var(--accent-primary);
+    border-radius: 3px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-size: 11px;
+    font-weight: 600;
   }
 
   .pane-state {

@@ -2,6 +2,7 @@
   import { onMount, onDestroy, tick } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { AnsiParser, type Cell, type TerminalOscEvent, type TerminalSnapshot } from "./ansi-parser";
+  import { shouldShowTerminalNotification } from "./osc-notifications";
   import { CanvasRenderer } from './CanvasRenderer';
   import {
     MAX_CLIPBOARD_IMAGE_BYTES,
@@ -30,6 +31,7 @@
     localShellResize,
     localShellDisconnect,
     sendDesktopBellNotification,
+    sendDesktopTerminalNotification,
     listenLocalData,
     listenLocalExit,
     type AuthConfig,
@@ -97,7 +99,7 @@
     connectionId?: string;
     interactive?: boolean;
     refocusOnBlur?: boolean;
-    disconnectOnDestroy?: boolean;
+    disconnectOnDestroy?: boolean | (() => boolean);
     /** "local" spawns the machine's own shell instead of an SSH session. */
     kind?: "ssh" | "local";
     startupScript?: string;
@@ -2435,6 +2437,20 @@
 
   function handleOscEvent(event: TerminalOscEvent) {
     if (destroyed) return;
+    if (event.type === "notification") {
+      if (!isDesktopTarget || !settingsStore.bellNotifications) return;
+      const generation = connectionGeneration;
+      const notification = event.notification;
+      const canDeliver = () => !destroyed && generation === connectionGeneration &&
+        settingsStore.bellNotifications && shouldShowTerminalNotification(
+          notification.occasion, interactive, document.hasFocus(),
+          document.visibilityState === "visible" && terminalContainer.getClientRects().length > 0
+        );
+      if (!canDeliver()) return;
+      void sendDesktopTerminalNotification(notification.title, notification.body, canDeliver)
+        .catch((error) => console.error("[Terminal] OSC 99 notification failed:", error));
+      return;
+    }
     if (event.type === "title") {
       onTitleChange?.(event.value);
       return;
@@ -2485,6 +2501,7 @@
     parser.setCellSize(charWidth, charHeight);
     parser.setMaxScrollback(settingsStore.scrollbackLines);
     parser.setBellHandler(notifyBell);
+    parser.setNotificationSupport(isDesktopTarget && "__TAURI_INTERNALS__" in window);
     const theme = getThemeById(settingsStore.theme) ?? THEMES[0];
     renderer?.updateConfig({
       defaultFg: theme.colors.terminalFg,
@@ -2618,7 +2635,7 @@
         let end = Math.min(offset + 4096, text.length);
         const finalCodeUnit = text.charCodeAt(end - 1);
         if (end < text.length && finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff) end--;
-        replayParser.write(text.slice(offset, end));
+        replayParser.writeReplay(text.slice(offset, end));
         offset = end;
         if (offset < text.length && performance.now() - sliceStart >= REPLAY_SLICE_BUDGET_MS) {
           updateBuffer();
@@ -3591,6 +3608,11 @@
     const activeParser = parser;
     activeParser?.setOscEventHandler(() => {});
     const activeSessionId = sessionId;
+    // Read move ownership at teardown; an inactive subtree may retain an older
+    // reactive prop value while its layout is being replaced.
+    const shouldDisconnect = typeof disconnectOnDestroy === "function"
+      ? disconnectOnDestroy()
+      : disconnectOnDestroy;
     if (
       activeSessionId &&
       terminalMouseButton !== null &&
@@ -3625,7 +3647,7 @@
     // Disconnect SSH session when tab is closed. Callers moving a live
     // terminal between containers opt out via disconnectOnDestroy and
     // re-attach with existingSessionId.
-    if (activeSessionId && !isBackgroundTeardown && disconnectOnDestroy) {
+    if (activeSessionId && !isBackgroundTeardown && shouldDisconnect) {
       disconnectRequested = true;
       void disconnectSessionRemote(activeSessionId).catch((e) => {
         console.error("Disconnect on destroy error:", e);
@@ -3707,7 +3729,7 @@
       activeSessionId &&
       !disconnectRequested &&
       !isBackgroundTeardown &&
-      disconnectOnDestroy
+      shouldDisconnect
     ) {
       terminalModesStore.clearSession(activeSessionId);
       clearSessionSnapshot(activeSessionId);

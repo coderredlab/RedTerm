@@ -1083,4 +1083,87 @@ describe("tabs store persistence", () => {
     }
   });
 
+  test("reorders terminal tabs and merges split leaves without losing live sessions or documents", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const tabId = tabsStore.addTab("drag.example.com", 22, { username: "user", method: { type: "password", password: "" } });
+    try {
+      const first = tabsStore.getTab(tabId)!.activePaneId!;
+      const second = (await tabsStore.addPaneTab(tabId, first))!;
+      const other = (await tabsStore.splitPane(tabId, first, "row"))!;
+      tabsStore.setPaneConnected(tabId, first, "first-session");
+      tabsStore.setPaneConnected(tabId, second, "second-session");
+      const doc = (await tabsStore.openDocument(tabId, second, { name: "notes.txt", path: "/notes.txt", size: 10 }))!;
+      tabsStore.setDocumentLoaded(tabId, doc, "original", false);
+      tabsStore.setDocumentContent(tabId, doc, "unsaved");
+      await tabsStore.movePaneWithinTab(tabId, second, first, "merge", "after", { insertIndex: 0 });
+      expect(tabsStore.getTab(tabId)!.layout.children[0].paneIds).toEqual([second, first]);
+      await tabsStore.setActiveDocument(tabId, doc);
+      await tabsStore.movePaneWithinTab(tabId, second, other, "merge", "after", { wholePane: true });
+      const tab = tabsStore.getTab(tabId)!;
+      expect(tab.layout).toMatchObject({ type: "leaf", paneIds: [other, second, first], documentIds: [doc], activeItem: { kind: "document", id: doc } });
+      expect(tabsStore.getPane(tabId, first)?.sessionId).toBe("first-session");
+      expect(tabsStore.getPane(tabId, second)?.sessionId).toBe("second-session");
+      expect(tabsStore.getDocument(tabId, doc)).toMatchObject({ content: "unsaved", dirty: true, sourcePaneId: second, sourceSessionId: "second-session" });
+      expect(tab.panes.every(pane => !pane.preserveSessionOnMove)).toBe(true);
+    } finally { tabsStore.removeTab(tabId); }
+  });
+
+  test("splits a selected tab from its own leaf and can merge it back", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const tabId = tabsStore.addTab("drag.example.com", 22, { username: "user", method: { type: "password", password: "" } });
+    try {
+      const first = tabsStore.getTab(tabId)!.activePaneId!;
+      const second = (await tabsStore.addPaneTab(tabId, first))!;
+      await tabsStore.movePaneWithinTab(tabId, second, second, "col", "before");
+      expect(tabsStore.getTab(tabId)!.layout).toMatchObject({ type: "split", dir: "col", children: [{ paneIds: [second] }, { paneIds: [first] }] });
+      await tabsStore.movePaneWithinTab(tabId, second, first, "merge", "after", { insertIndex: 0 });
+      expect(tabsStore.getTab(tabId)!.layout).toMatchObject({ type: "leaf", paneIds: [second, first] });
+    } finally { tabsStore.removeTab(tabId); }
+  });
+
+  test("pane moves reject another top-level tab and targets removed while queued", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const auth = { username: "user", method: { type: "password", password: "" } };
+    const tabId = tabsStore.addTab("first.example.com", 22, auth);
+    const otherTab = tabsStore.addTab("other.example.com", 22, auth);
+    try {
+      const first = tabsStore.getTab(tabId)!.activePaneId!;
+      const foreign = tabsStore.getTab(otherTab)!.activePaneId!;
+      const before = JSON.stringify(tabsStore.getTab(tabId)!.layout);
+      await tabsStore.movePaneWithinTab(tabId, first, foreign, "merge", "after", { wholePane: true });
+      expect(JSON.stringify(tabsStore.getTab(tabId)!.layout)).toBe(before);
+      const pending = tabsStore.movePaneWithinTab(tabId, first, foreign, "row", "after");
+      tabsStore.removeTab(tabId);
+      await pending;
+      expect(tabsStore.getTab(tabId)).toBeUndefined();
+      expect(tabsStore.getTab(otherTab)!.panes).toHaveLength(1);
+    } finally { tabsStore.removeTab(tabId); tabsStore.removeTab(otherTab); }
+  });
+
+});
+
+
+test("restores local shells, split layout and active pane after storage reload", async () => {
+  const storage = new MemoryStorage();
+  installBrowserStorage(storage);
+  const { tabsStore: original } = await import("./tabs.svelte.ts?local-save");
+  const tabId = original.addLocalTab();
+  const first = original.getTab(tabId).activePaneId;
+  const second = await original.addPaneTab(tabId, first);
+  const third = await original.splitPane(tabId, second, "row");
+  original.setPaneConnected(tabId, first, "old-local-session", "old-runtime");
+  await original.setActivePane(tabId, third);
+  const saved = JSON.parse(storage.getItem(STORAGE_KEY));
+  expect(saved.tabs[0].panes).toHaveLength(3);
+  const { tabsStore: restored } = await import("./tabs.svelte.ts?local-restore");
+  const tab = restored.getTab(tabId);
+  expect(restored.activeTabId).toBe(tabId);
+  expect(tab.activePaneId).toBe(third);
+  expect(tab.layout.type).toBe("split");
+  expect(tab.panes.map(p => p.kind)).toEqual(["local", "local", "local"]);
+  expect(tab.panes.every(p => !p.connected)).toBe(true);
+  expect(tab.panes.find(p => p.id === first).sessionId).toBe("old-local-session");
 });
