@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import ConnectionList from "$lib/components/ConnectionList.svelte";
   import type { SavedConnection } from "$lib/tauri/commands";
   import FileExplorer from "./FileExplorer.svelte";
@@ -15,6 +16,7 @@
     explorerKind: "ssh" | "local" | null;
     explorerId: string | null;
     connectionsViewRequest: number;
+    revealPathRequest: { paneId: string; path: string; id: number } | null;
     onWidthChange: (width: number) => void;
     onEdit: (connection: SavedConnection) => void;
     onNewConnection: () => void;
@@ -30,6 +32,7 @@
     explorerKind,
     explorerId,
     connectionsViewRequest,
+    revealPathRequest,
     onWidthChange,
     onEdit,
     onNewConnection,
@@ -38,6 +41,8 @@
     cachedLocalPathFor,
   }: Props = $props();
 
+  let fileExplorer = $state<FileExplorer | null>(null);
+  let handledRevealId = 0;
   let view = $state<"connections" | "files">("connections");
   let explorerPaths = $state<Record<string, string>>({});
 
@@ -45,6 +50,19 @@
     if (connectionsViewRequest > 0) {
       view = "connections";
     }
+  });
+
+  $effect(() => {
+    const request = revealPathRequest;
+    if (!request || request.id <= handledRevealId || request.paneId !== explorerId) return;
+    view = "files";
+    // The keyed explorer must finish switching sessions before receiving the request.
+    void tick().then(() => {
+      if (revealPathRequest?.id !== request.id || explorerId !== request.paneId ||
+          request.id <= handledRevealId || !fileExplorer) return;
+      handledRevealId = request.id;
+      void fileExplorer.revealPath(request.path);
+    });
   });
 
   let panelEl: HTMLElement | null = $state(null);
@@ -146,6 +164,7 @@
         kind={explorerKind}
         sessionId={activeSessionId}
         initialPath={explorerPaths[explorerId] ?? null}
+        bind:this={fileExplorer}
         onPathChange={rememberExplorerPath(explorerId)}
         {onPreview}
         {cachedLocalPathFor}

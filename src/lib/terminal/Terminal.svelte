@@ -45,6 +45,7 @@
   import { ctrlKey, altKey, getArrowKeyCode } from "$lib/utils/key-mapper";
   import { settingsStore, terminalFontStack } from "$lib/stores/settings.svelte";
   import { createStartupScriptDispatcher, type StartupScriptDispatcher } from "./startup-script";
+  import { findPathAtCell } from "./terminal-paths";
   import { findUrlAtCell, validateTerminalUrl, type SafeTerminalUrl } from "./terminal-links";
   import { extractTerminalSelection } from "./terminal-selection";
   import { formatTerminalPaste } from "./terminal-paste";
@@ -100,6 +101,7 @@
     interactive?: boolean;
     refocusOnBlur?: boolean;
     disconnectOnDestroy?: boolean | (() => boolean);
+    onRevealPath?: (path: string) => void;
     /** "local" spawns the machine's own shell instead of an SSH session. */
     kind?: "ssh" | "local";
     startupScript?: string;
@@ -129,6 +131,7 @@
     interactive = true,
     refocusOnBlur = true,
     disconnectOnDestroy = true,
+    onRevealPath,
     kind = "ssh",
     onConnected,
     onDisconnected,
@@ -319,6 +322,7 @@
   let selectedText = $state("");
   let selectionFeedback = $state("");
   let selectionFeedbackTimer: number | null = null;
+  let hoveredPath = $state<string | null>(null);
   let pendingTerminalUrl = $state<SafeTerminalUrl | null>(null);
   let openingTerminalUrl = $state(false);
   let pendingSelectionRefresh = false;
@@ -574,6 +578,20 @@
       selectionFeedback = "";
       selectionFeedbackTimer = null;
     }, 1500);
+  }
+
+  function findTerminalLink(point: { row: number; col: number }) {
+    const url = findUrlAtCell(buffer, point);
+    if (url) return { kind: "url" as const, value: url.url };
+    const path = isDesktopTarget && onRevealPath
+      ? findPathAtCell(buffer, point, parser?.getCurrentDirectoryUri() ?? null)
+      : null;
+    return path ? { kind: "path" as const, value: path.path } : null;
+  }
+
+  function openTerminalLink(link: { kind: "url" | "path"; value: string }) {
+    if (link.kind === "path") onRevealPath?.(link.value);
+    else confirmAndOpenTerminalUrl(link.value);
   }
 
   function confirmAndOpenTerminalUrl(url: string) {
@@ -2847,7 +2865,7 @@
       const localSelectionOverride =
         e.button === 0 && e.shiftKey && shouldForwardTerminalMouseEvents();
       const localUrlClick =
-        e.button === 0 && !!findUrlAtCell(buffer, pointerToCell(e));
+        e.button === 0 && !!findTerminalLink(pointerToCell(e));
       if (shouldForwardTerminalMouseEvents() && !localSelectionOverride && !localUrlClick) {
         if (e.button < 0 || e.button > 2) return;
         e.preventDefault();
@@ -2864,7 +2882,7 @@
       }
       if (e.button !== 0) return;
 
-      if (localSelectionOverride) localSelectionPointerId = e.pointerId;
+      if (localSelectionOverride || localUrlClick) localSelectionPointerId = e.pointerId;
       e.preventDefault();
       suppressNextFocus = true;
 
@@ -2907,6 +2925,10 @@
 
 
   function handleScreenPointerMove(e: PointerEvent) {
+    if (e.pointerType === "mouse" && e.buttons === 0) {
+      const link = findTerminalLink(pointerToCell(e));
+      hoveredPath = link?.kind === "path" ? link.value : null;
+    }
     if (e.pointerType === "mouse" && localSelectionPointerId !== e.pointerId) {
       const buttonPressed =
         terminalMousePointerId === e.pointerId && terminalMouseButton !== null;
@@ -2998,7 +3020,7 @@
     if (pendingMouseClick?.pointerId === e.pointerId) {
       e.preventDefault();
       const point = pointerToCell(e);
-      const match = e.type === "pointerup" ? findUrlAtCell(buffer, point) : null;
+      const match = e.type === "pointerup" ? findTerminalLink(point) : null;
       pendingMouseClick = null;
 
       if (scrollContainer?.hasPointerCapture(e.pointerId)) {
@@ -3006,7 +3028,7 @@
       }
 
       if (match) {
-        void confirmAndOpenTerminalUrl(match.url);
+        openTerminalLink(match);
       } else {
         focusInput();
       }
@@ -3045,11 +3067,11 @@
         touchPointerStart
       ) {
         // Match mouse clicks: rendered URLs take precedence over TUI mouse reporting.
-        const match = findUrlAtCell(buffer, pointerToCell(e));
+        const match = findTerminalLink(pointerToCell(e));
         resetTouchLongPressState();
         if (match) {
           e.preventDefault();
-          void confirmAndOpenTerminalUrl(match.url);
+          openTerminalLink(match);
           focusInput();
           return;
         }
@@ -4159,6 +4181,9 @@
   <div
     class="terminal-screen"
     class:selection-mode={selectionMode}
+    class:path-link={hoveredPath !== null}
+    title={hoveredPath ? `Show in Files: ${hoveredPath}` : undefined}
+    onpointerleave={() => { hoveredPath = null; }}
     bind:this={scrollContainer}
     onscroll={handleTerminalScroll}
     onwheel={handleTerminalWheel}
@@ -4658,6 +4683,8 @@
     overscroll-behavior: contain;
     background: var(--terminal-bg, #1a0f0f);
   }
+
+  .terminal-screen.path-link { cursor: pointer; }
 
   .terminal-screen.selection-mode {
     cursor: text;

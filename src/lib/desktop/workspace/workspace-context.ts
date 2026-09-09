@@ -5,6 +5,7 @@ export interface WorkspaceApi {
   unregisterTerminal(paneId: string, terminal: unknown): void;
   paneConnected(tabId: string, paneId: string, sessionId: string): void;
   paneDisconnected(tabId: string, paneId: string): void;
+  revealPath(tabId: string, paneId: string, path: string): void;
   paneRetrying(tabId: string, paneId: string): void;
   editPaneConnection(tabId: string, paneId: string): void;
   closeTab(tabId: string): void;

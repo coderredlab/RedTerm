@@ -61,6 +61,7 @@
   let loading = $state(false);
   let errorMessage = $state("");
   let loadToken = 0;
+  let revealedName = $state<string | null>(null);
   let homePath = $state<string | null>(null);
   let statusMessage = $state("");
   let downloadingPaths = $state<string[]>([]);
@@ -310,7 +311,11 @@
     void openHome(untrack(() => initialPath));
   });
 
-  async function openHome(restoredPath: string | null = null) {
+  export function revealPath(target: string) {
+    return openHome(null, target);
+  }
+
+  async function openHome(restoredPath: string | null = null, revealPath: string | null = null) {
     const token = ++loadToken;
     loading = true;
     errorMessage = "";
@@ -323,6 +328,10 @@
             : "/";
       if (destroyed || token !== loadToken) return;
       homePath = home || "/";
+      if (revealPath) {
+        await revealEntry(revealPath);
+        return;
+      }
       const target =
         restoredPath &&
         (kind !== "local" ||
@@ -333,6 +342,11 @@
       await navigate(target);
     } catch (error) {
       if (destroyed || token !== loadToken) return;
+      if (revealPath) {
+        loading = false;
+        errorMessage = error instanceof Error ? error.message : String(error);
+        return;
+      }
       if (kind === "local") {
         homePath = null;
         loading = false;
@@ -344,11 +358,63 @@
     }
   }
 
+  async function revealEntry(requestedPath: string) {
+    const token = ++loadToken;
+    loading = true;
+    errorMessage = "";
+    revealedName = null;
+    try {
+      const expanded = requestedPath === "~" ? homePath!
+        : requestedPath.startsWith("~/") ? joinPath(homePath!, requestedPath.slice(2))
+        : requestedPath;
+      const drive = expanded.match(/^[A-Za-z]:\//)?.[0];
+      const parts: string[] = [];
+      for (const part of expanded.slice(drive ? 3 : 1).split("/")) {
+        if (part === "..") {
+          throw new Error("Paths containing '..' cannot be opened here. Use a path without parent-directory components.");
+        }
+        if (part && part !== ".") parts.push(part);
+      }
+      const target = `${drive ?? "/"}${parts.join("/")}`;
+      if (isRootPath(target) || target === homePath) {
+        await navigate(target);
+        return;
+      }
+      const parent = parentPath(target);
+      const result = kind === "local" ? await localListDir(parent) : await sftpListDir(sessionId!, parent);
+      if (destroyed || token !== loadToken) return;
+      const entry = result.find((candidate) => candidate.name === baseName(target));
+      if (!entry) throw new Error("The path was not found in this session.");
+      if (entry.is_dir) {
+        await navigate(target);
+      } else {
+        entries = result;
+        path = parent;
+        revealedName = entry.name;
+        onPathChange(parent);
+      }
+    } catch (error) {
+      if (destroyed || token !== loadToken) return;
+      errorMessage = error instanceof Error ? error.message : String(error);
+      entries = null;
+    } finally {
+      if (!destroyed && token === loadToken) loading = false;
+    }
+  }
+
+  function scrollRevealedEntry(node: HTMLElement, revealed: boolean) {
+    if (revealed) node.scrollIntoView({ block: "nearest" });
+    return { update(next: boolean) {
+      if (next) node.scrollIntoView({ block: "nearest" });
+    } };
+  }
+
   async function navigate(target: string) {
     if (destroyed || !canBrowse) return;
     const token = ++loadToken;
     loading = true;
     errorMessage = "";
+    revealedName = null;
     try {
       const result =
         kind === "local"
@@ -548,6 +614,9 @@
         <div
           class="entry"
           class:dir={entry.is_dir}
+          class:revealed={entry.name === revealedName}
+          data-revealed={entry.name === revealedName}
+          use:scrollRevealedEntry={entry.name === revealedName}
           role="listitem"
           oncontextmenu={(event) => openEntryContextMenu(event, entry)}
         >
@@ -662,6 +731,10 @@
 </div>
 
 <style>
+  .entry.revealed {
+    background: color-mix(in srgb, var(--accent-primary) 15%, transparent);
+    box-shadow: inset 3px 0 var(--accent-primary);
+  }
   .file-explorer {
     flex: 1;
     min-height: 0;

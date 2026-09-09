@@ -366,6 +366,7 @@
                     kind={terminalPane.kind ?? "ssh"}
                     onConnected={(sessionId) =>
                       workspace.paneConnected(tabId, terminalPaneId, sessionId)}
+                    onRevealPath={(path) => workspace.revealPath(tabId, terminalPaneId, path)}
                     onRetryConnection={() => workspace.paneRetrying(tabId, terminalPaneId)}
                     onEditConnection={terminalPane.kind === "local"
                       ? undefined

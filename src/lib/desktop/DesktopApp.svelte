@@ -53,6 +53,8 @@
   let workspaceEl: HTMLElement | null = $state(null);
   let editPaneRequestGeneration = 0;
   let connectionsViewRequest = $state(0);
+  let revealPathRequest = $state<{ paneId: string; path: string; id: number } | null>(null);
+  let revealPathSequence = 0;
 
   interface ClosePrompt {
     title: string;
@@ -808,6 +810,14 @@
   }
 
   const workspaceApi: WorkspaceApi = {
+    revealPath(tabId, paneId, path) {
+      if (paneIsClosing(tabId, paneId) || !tabsStore.getPane(tabId, paneId)) return;
+      void tabsStore.setActivePane(tabId, paneId).then(() => {
+        if (tabsStore.activeTabId !== tabId || tabsStore.getActivePane()?.id !== paneId) return;
+        if (desktopPrefsStore.prefs.sidebarCollapsed) desktopPrefsStore.toggleSidebar();
+        revealPathRequest = { paneId, path, id: ++revealPathSequence };
+      });
+    },
     registerTerminal(paneId, terminal) {
       terminals.set(paneId, terminal as Terminal);
     },
@@ -976,6 +986,7 @@
     explorerKind={explorerKind}
     explorerId={explorerId}
     connectionsViewRequest={connectionsViewRequest}
+    {revealPathRequest}
     onWidthChange={(width) => desktopPrefsStore.setSidebarWidth(width)}
     onEdit={handleEdit}
     onNewConnection={handleNewConnection}
