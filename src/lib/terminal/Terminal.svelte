@@ -61,7 +61,10 @@
   import { AutomaticResponseBuffer } from "./automatic-response-buffer";
   import {
     clearRuntimeSessionSnapshot,
+    invalidateLocalSnapshotWrite,
+    scheduleLocalSnapshotWrite,
     storeRuntimeSessionSnapshot,
+    takeLocalSnapshotWrite,
     takeRuntimeSessionSnapshot,
   } from "./session-runtime-snapshot";
   import { composeJamoSequence, HangulComposer } from "./hangul-compose";
@@ -436,15 +439,41 @@
       : 0;
   }
 
+  let pendingLocalSnapshotCancel: (() => void) | null = null;
+
   function saveSessionSnapshot(targetSessionId: string) {
     if (!parser || !canUseStorage()) return;
-    const snapshots = loadSessionSnapshots();
-    snapshots[targetSessionId] = {
-      snapshot: createTerminalSnapshot(parser),
-      savedAt: Date.now(),
+    const snapshot = createTerminalSnapshot(parser);
+    if (pendingLocalSnapshotCancel) pendingLocalSnapshotCancel();
+    // 첫 페인트가 한 번 지나간 뒤 별도 task에서 직렬화·기록한다 —
+    // ~32MB JSON이 분할·이동의 첫 화면을 막지 않는다.
+    const write = () => {
+      if (!canUseStorage()) return;
+      try {
+        const snapshots = loadSessionSnapshots();
+        snapshots[targetSessionId] = { snapshot, savedAt: Date.now() };
+        const prunedSnapshots = pruneSessionSnapshots(snapshots);
+        localStorage.setItem(TERMINAL_SNAPSHOT_STORAGE_KEY, JSON.stringify(prunedSnapshots));
+      } catch (error) {
+        console.error("Store local terminal snapshot error:", error);
+      }
     };
-    const prunedSnapshots = pruneSessionSnapshots(snapshots);
-    localStorage.setItem(TERMINAL_SNAPSHOT_STORAGE_KEY, JSON.stringify(prunedSnapshots));
+    const generation = scheduleLocalSnapshotWrite(targetSessionId, write);
+    let rafId = 0;
+    let timerId = 0;
+    const cancelPending = () => {
+      cancelAnimationFrame(rafId);
+      clearTimeout(timerId);
+      pendingLocalSnapshotCancel = null;
+      invalidateLocalSnapshotWrite(targetSessionId);
+    };
+    pendingLocalSnapshotCancel = cancelPending;
+    rafId = requestAnimationFrame(() => {
+      timerId = window.setTimeout(() => {
+        pendingLocalSnapshotCancel = null;
+        takeLocalSnapshotWrite(targetSessionId, generation)?.();
+      }, 0);
+    });
   }
 
   function restoreSessionSnapshot(targetSessionId: string): TerminalSnapshot | null {
@@ -461,6 +490,11 @@
   function clearSessionSnapshot(targetSessionId: string | null | undefined) {
     if (!targetSessionId) return;
     clearRuntimeSessionSnapshot(targetSessionId);
+    // 세션이 닫히거나 정리되면 대기 중인 지연 쓰기를 폐기해 화면 잔존을 막는다.
+    // 인스턴스가 바뀌어도 무효화되도록 공유 슬롯을 거친다.
+    invalidateLocalSnapshotWrite(targetSessionId);
+    pendingLocalSnapshotCancel?.();
+    pendingLocalSnapshotCancel = null;
     if (!canUseStorage()) return;
     const snapshots = loadSessionSnapshots();
     if (!(targetSessionId in snapshots)) return;
@@ -2335,6 +2369,8 @@
       if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
       await localShellDisconnect(nextSessionId).catch(() => {});
       if (!isConnectionAttemptActive(generation, nextSessionId)) return false;
+      // 세션을 버리는 경로다 — 직전 이동의 지연 쓰기와 저장본을 남기지 않는다.
+      clearSessionSnapshot(nextSessionId);
       unlisten?.();
       unlistenExit?.();
       unlisten = null;
