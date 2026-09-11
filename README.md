@@ -43,7 +43,9 @@ Android and iOS sources are included in the repository, but mobile binaries are 
 - Local and SFTP directory browsing
 - Editable code, configuration, shell, Markdown, and UTF-8 text files
 - Image, PDF, audio, and video previews
-- Remote file downloads and clipboard-image uploads over the active SSH connection
+- Media playback and editor state preserved across document-tab switches; Markdown opens in preview mode
+- Remote file downloads, file and whole-folder uploads, and clipboard-image uploads over the active SSH connection
+- Upload progress and per-item results; existing remote names are preserved with numbered alternatives
 - Unsaved-document and active-session checks before closing documents, panes, tabs, or the application
 - Dark and light terminal themes with persistent font, size, and layout settings
 

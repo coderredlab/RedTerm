@@ -415,6 +415,36 @@ export interface SftpDownloadedFile {
   size: number;
 }
 
+export type SftpUploadSelectionKind = "files" | "folder";
+
+export interface SftpUploadedItem {
+  name: string;
+  remote_path: string;
+  size: number;
+  is_dir: boolean;
+}
+
+export interface SftpUploadFailure {
+  name: string;
+  error: string;
+}
+
+export interface SftpUploadResult {
+  uploaded: SftpUploadedItem[];
+  failed: SftpUploadFailure[];
+}
+
+export async function sftpUpload(
+  sessionId: string,
+  remoteDir: string,
+  selectionKind: SftpUploadSelectionKind,
+  originId: string
+): Promise<SftpUploadResult | null> {
+  return invoke<SftpUploadResult | null>("sftp_upload", {
+    sessionId, remoteDir, selectionKind, originId,
+  });
+}
+
 export const MAX_SFTP_READ_BYTES = 2 * 1024 * 1024;
 export const MAX_SFTP_DOWNLOAD_BYTES = 200 * 1024 * 1024;
 
@@ -578,6 +608,25 @@ export interface DownloadProgressEvent {
   path: string;
   transferred: number;
   total: number | null;
+}
+
+export interface UploadProgressEvent {
+  originId: string;
+  sessionId: string;
+  phase: "preparing" | "uploading" | "finishing";
+  name: string;
+  transferred: number;
+  total: number | null;
+  fileIndex: number;
+  fileCount: number;
+}
+
+export async function listenUploadProgress(
+  callback: (event: UploadProgressEvent) => void
+): Promise<UnlistenFn> {
+  return listen<UploadProgressEvent>("sftp-upload-progress", (event) => {
+    callback(event.payload);
+  });
 }
 
 export async function listenDownloadProgress(

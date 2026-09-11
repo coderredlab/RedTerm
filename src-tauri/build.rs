@@ -36,6 +36,7 @@ fn main() {
             "sftp_download_file",
             "sftp_download_to_dir",
             "sftp_home_dir",
+            "sftp_upload",
             "preview_cache_acquire",
             "preview_cache_release",
             "read_clipboard_text",

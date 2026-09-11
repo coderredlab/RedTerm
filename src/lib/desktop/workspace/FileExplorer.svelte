@@ -3,6 +3,7 @@
   import {
     listenDownloadProgress,
     listenRemoveProgress,
+    listenUploadProgress,
     chooseDownloadSavePath,
     sanitizeDownloadDialogFileName,
     localCreateDir,
@@ -19,6 +20,10 @@
     sftpHomeDir,
     sftpListDir,
     sftpRemovePath,
+    sftpUpload,
+    type SftpUploadResult,
+    type SftpUploadSelectionKind,
+    type UploadProgressEvent,
     type SftpDirEntry,
   } from "$lib/tauri/commands";
   import {
@@ -64,6 +69,11 @@
   let revealedName = $state<string | null>(null);
   let homePath = $state<string | null>(null);
   let statusMessage = $state("");
+  let uploadBusy = $state(false);
+  let uploadProgress = $state<(UploadProgressEvent & { destination: string }) | null>(null);
+  let uploadReport = $state<(SftpUploadResult & { destination: string }) | null>(null);
+  let uploadUnlisten: (() => void) | null = null;
+  let uploadEpoch = 0;
   let downloadingPaths = $state<string[]>([]);
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
   let downloads = $state<Record<string, { transferred: number; total: number | null }>>({});
@@ -85,7 +95,10 @@
   const sort = $derived(desktopPrefsStore.prefs.explorerSort);
   const sortedEntries = $derived(entries === null ? null : sortExplorerEntries(entries, sort));
 
-  let contextMenu = $state<{ x: number; y: number; entry: SftpDirEntry | null } | null>(null);
+  let contextMenu = $state<{
+    x: number; y: number; entry: SftpDirEntry | null; uploadOnly?: boolean;
+  } | null>(null);
+  let uploadButton = $state<HTMLButtonElement>();
   let deleteTarget = $state<{ entry: SftpDirEntry; path: string } | null>(null);
   let nameDialog = $state<{ mode: "file" | "folder" } | null>(null);
 
@@ -93,7 +106,7 @@
     if (contextMenu === null) return null;
     return {
       left: Math.max(4, Math.min(contextMenu.x, window.innerWidth - 172)),
-      top: Math.max(4, Math.min(contextMenu.y, window.innerHeight - 120)),
+      top: Math.max(4, Math.min(contextMenu.y, window.innerHeight - (contextMenu.uploadOnly ? 80 : 170))),
     };
   });
 
@@ -101,7 +114,10 @@
     if (contextMenu === null) return;
     const close = () => (contextMenu = null);
     const onKeydown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close();
+      if (event.key === "Escape") {
+        if (contextMenu?.uploadOnly) uploadButton?.focus();
+        close();
+      }
     };
     window.addEventListener("click", close);
     window.addEventListener("resize", close);
@@ -135,6 +151,98 @@
     event.preventDefault();
     contextMenu = { x: event.clientX, y: event.clientY, entry: null };
   }
+
+  function openUploadMenu(event: MouseEvent) {
+    event.stopPropagation();
+    if (contextMenu?.uploadOnly) {
+      closeContextMenu();
+      return;
+    }
+    const rect = event.currentTarget instanceof HTMLElement
+      ? event.currentTarget.getBoundingClientRect() : null;
+    if (rect) contextMenu = { x: rect.left, y: rect.bottom + 4, entry: null, uploadOnly: true };
+  }
+
+  function focusContextMenu(node: HTMLElement) {
+    node.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+  }
+
+  function handleMenuKeydown(event: KeyboardEvent) {
+    if (event.key === "Tab") {
+      closeContextMenu();
+      return;
+    }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const buttons = Array.from((event.currentTarget as HTMLElement)
+      .querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+    const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? buttons.length - 1
+      : (index + (event.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
+    buttons[next]?.focus();
+  }
+
+  async function upload(selectionKind: SftpUploadSelectionKind) {
+    closeContextMenu();
+    if (kind !== "ssh" || !sessionId || loading || uploadBusy) return;
+    const targetSession = sessionId;
+    const targetKind = kind;
+    const destination = path;
+    const epoch = uploadEpoch;
+    const originId = crypto.randomUUID();
+    const isCurrent = () => !destroyed && uploadEpoch === epoch
+      && kind === targetKind && sessionId === targetSession;
+    uploadBusy = true;
+    uploadReport = null;
+    uploadProgress = {
+      originId, sessionId: targetSession, destination, phase: "preparing",
+      name: selectionKind === "folder" ? "Choose a folder…" : "Choose files…",
+      transferred: 0, total: null, fileIndex: 0, fileCount: 0,
+    };
+    let stopListening: (() => void) | null = null;
+    try {
+      const unlisten = await listenUploadProgress((event) => {
+        if (!isCurrent() || event.originId !== originId || event.sessionId !== targetSession) return;
+        uploadProgress = { ...event, destination };
+      });
+      let listening = true;
+      stopListening = () => {
+        if (!listening) return;
+        listening = false;
+        unlisten();
+      };
+      if (!isCurrent()) return;
+      uploadUnlisten = stopListening;
+      const result = await sftpUpload(targetSession, destination, selectionKind, originId);
+      if (!isCurrent() || result === null) return;
+      uploadReport = { ...result, destination };
+      // Do not let completion replace a newer navigation, even if its listing is pending.
+      if (path === destination && !loading) await navigate(destination);
+    } catch (error) {
+      if (isCurrent()) uploadReport = {
+        destination, uploaded: [],
+        failed: [{ name: selectionKind === "folder" ? "Folder upload" : "File upload",
+          error: error instanceof Error ? error.message : String(error) }],
+      };
+    } finally {
+      stopListening?.();
+      if (uploadUnlisten === stopListening) uploadUnlisten = null;
+      if (!destroyed) {
+        uploadBusy = false;
+        if (isCurrent()) uploadProgress = null;
+      }
+    }
+  }
+
+  $effect(() => {
+    kind;
+    sessionId;
+    untrack(() => {
+      uploadEpoch += 1;
+      uploadProgress = null;
+      uploadReport = null;
+    });
+  });
 
   function startCreate(mode: "file" | "folder") {
     closeContextMenu();
@@ -201,6 +309,7 @@
   onDestroy(() => {
     destroyed = true;
     loadToken += 1;
+    uploadUnlisten?.();
   });
 
   $effect(() => {
@@ -516,6 +625,24 @@
         {/if}
       {/each}
     </div>
+    {#if kind === "ssh" && sessionId}
+      <button
+        class="path-btn upload-btn"
+        bind:this={uploadButton}
+        title="Upload to this directory"
+        aria-haspopup="menu"
+        aria-expanded={contextMenu?.uploadOnly ?? false}
+        disabled={loading || uploadBusy}
+        onclick={openUploadMenu}
+      >
+        <svg width="14" height="14" viewBox="0 0 20 20" fill="none"
+          stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+          stroke-linejoin="round" aria-hidden="true">
+          <path d="M10 12V3m-3 3 3-3 3 3M4 13v3h12v-3" />
+        </svg>
+        Upload
+      </button>
+    {/if}
     <button
       class="path-btn"
       title="Refresh"
@@ -545,6 +672,51 @@
   </div>
   {#if statusMessage}
     <div class="explorer-toast" role="status">{statusMessage}</div>
+  {/if}
+
+  {#if uploadProgress}
+    <div class="download-progress upload-progress" role="status">
+      <div class="download-progress-info">
+        <span class="download-progress-name">{uploadProgress.phase === "preparing" ? "Preparing upload…"
+          : uploadProgress.phase === "finishing" ? "Finishing upload…" : "Uploading…"}</span>
+        {#if uploadProgress.fileCount > 0}
+          <span class="download-progress-bytes">{uploadProgress.fileIndex} of {uploadProgress.fileCount}</span>
+        {/if}
+      </div>
+      <div class="upload-path">{uploadProgress.name}</div>
+      <div class="download-progress-info">
+        <span class="download-progress-name" title={uploadProgress.destination}>To {uploadProgress.destination}</span>
+        <span class="download-progress-bytes">
+          {formatBytes(uploadProgress.transferred)}{uploadProgress.total !== null ? " / " + formatBytes(uploadProgress.total) : ""}
+        </span>
+      </div>
+      <div class="download-track">
+        <div class="download-fill"
+          class:indeterminate={uploadProgress.phase !== "uploading" || uploadProgress.total === null}
+          style:width={uploadProgress.total !== null && uploadProgress.total > 0
+            ? Math.min(100, uploadProgress.transferred / uploadProgress.total * 100) + "%" : "100%"}
+        ></div>
+      </div>
+    </div>
+  {/if}
+
+  {#if uploadReport}
+    <div class="explorer-toast upload-report" role="status">
+      <div class="download-progress-info">
+        <span class="download-progress-name">{uploadReport.uploaded.length} uploaded{uploadReport.failed.length ? ", " + uploadReport.failed.length + " failed" : ""}</span>
+        <button class="path-btn" title="Dismiss upload result" aria-label="Dismiss upload result" onclick={() => (uploadReport = null)}>×</button>
+      </div>
+      <div class="upload-path">To {uploadReport.destination}</div>
+      {#each uploadReport.uploaded as item}
+        <div class="upload-result-item">
+          <span>{item.name}{item.is_dir ? "/" : ""} — {formatBytes(item.size)}</span>
+          <span class="upload-path">{baseName(item.remote_path) !== item.name ? "Saved as " : "Saved to "}{item.remote_path}</span>
+        </div>
+      {/each}
+      {#each uploadReport.failed as failure}
+        <div class="upload-result-item explorer-error">{failure.name}: {failure.error}</div>
+      {/each}
+    </div>
   {/if}
 
   {#each Object.entries(downloads) as [target, progress] (target)}
@@ -659,7 +831,21 @@
                 event.stopPropagation();
                 void downloadEntry(entry);
               }}
-            >⭳</button>
+            >
+              <svg
+                width="14"
+                height="14"
+                viewBox="0 0 20 20"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M10 3v9m-3-3 3 3 3-3M4 13v3h12v-3" />
+              </svg>
+            </button>
           {/if}
         </div>
       {:else}
@@ -672,9 +858,18 @@
     <div
       class="entry-context-menu"
       role="menu"
+      tabindex="-1"
+      aria-label={contextMenu.uploadOnly ? "Upload" : "File actions"}
+      use:focusContextMenu
+      onkeydown={handleMenuKeydown}
       style:left="{menuPosition.left}px"
       style:top="{menuPosition.top}px"
     >
+      {#if kind === "ssh" && sessionId && contextMenu.entry === null}
+        <button type="button" role="menuitem" disabled={loading || uploadBusy} onclick={() => void upload("files")}>Upload files…</button>
+        <button type="button" role="menuitem" disabled={loading || uploadBusy} onclick={() => void upload("folder")}>Upload folder…</button>
+      {/if}
+      {#if !contextMenu.uploadOnly}
       {#if contextMenu.entry !== null && !contextMenu.entry.is_dir && !downloadingPaths.includes(joinPath(path, contextMenu.entry.name))}
         <button
           type="button"
@@ -699,6 +894,7 @@
             deleteTarget = entry ? { entry, path } : null;
           }}
         >Delete</button>
+      {/if}
       {/if}
     </div>
   {/if}
@@ -774,6 +970,58 @@
   .path-btn:hover:not(:disabled) {
     background: var(--bg-tertiary);
     color: var(--text-primary);
+  }
+
+  .upload-btn {
+    width: auto;
+    display: flex;
+    gap: 4px;
+    padding: 0 5px;
+    font: inherit;
+    font-size: 10px;
+  }
+
+  .upload-btn:focus-visible,
+  .upload-report button:focus-visible,
+  .entry-context-menu button:focus-visible {
+    outline: 1px solid var(--accent-primary);
+    outline-offset: -1px;
+  }
+
+  .upload-btn:active:not(:disabled) {
+    color: var(--accent-primary);
+  }
+
+  .upload-progress .download-progress-bytes {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .upload-path {
+    overflow-wrap: anywhere;
+    white-space: normal;
+    font-size: 10px;
+    color: var(--text-secondary);
+    margin-bottom: 4px;
+  }
+
+  .upload-report.explorer-toast {
+    max-height: 180px;
+    overflow-y: auto;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .upload-result-item + .upload-result-item {
+    margin-top: 6px;
+  }
+
+  .upload-result-item .upload-path {
+    display: block;
+  }
+
+  .entry-context-menu button:disabled {
+    opacity: 0.4;
+    cursor: default;
   }
 
   .explorer-toast {

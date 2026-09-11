@@ -380,31 +380,34 @@
               </div>
             {/if}
           {/each}
-          {#if node.activeItem.kind === "document"}
-            {@const activeDocument = tabsStore.getDocument(tabId, node.activeItem.id)}
-            {#if activeDocument}
+          {#each node.documentIds as documentId (documentId)}
+            {@const document = tabsStore.getDocument(tabId, documentId)}
+            {@const selected = node.activeItem.kind === "document" && node.activeItem.id === documentId}
+            <!-- Tab selection must not discard editor state, media playback, or cache leases. -->
+            {#if document}
               <div
                 class="pane-document"
+                class:active={selected}
+                aria-hidden={!visible || !selected}
+                inert={!visible || !selected}
                 onpointerdowncapture={() => {
-                  if (!focused) workspace.activateDocument(tabId, activeDocument.id);
+                  if (!focused) workspace.activateDocument(tabId, document.id);
                 }}
                 onfocusin={() => {
-                  if (!focused) workspace.activateDocument(tabId, activeDocument.id);
+                  if (!focused) workspace.activateDocument(tabId, document.id);
                 }}
               >
                 {#await loadPaneDocumentView() then { default: PaneDocumentView }}
-                  {#key activeDocument.id}
-                    <PaneDocumentView
-                      {tabId}
-                      document={activeDocument}
-                      {visible}
-                      active={focused}
-                    />
-                  {/key}
+                  <PaneDocumentView
+                    {tabId}
+                    {document}
+                    visible={visible && selected}
+                    active={focused && selected}
+                  />
                 {/await}
               </div>
             {/if}
-          {/if}
+          {/each}
         </div>
         {#if dropTarget && dropTarget.insertIndex === null}
           <div class="pane-drop-preview" class:left={dropTarget.zone === "left"} class:right={dropTarget.zone === "right"}
@@ -682,11 +685,13 @@
   }
 
 
-  .pane-terminal {
+  .pane-terminal,
+  .pane-document {
     display: none;
   }
 
-  .pane-terminal.active {
+  .pane-terminal.active,
+  .pane-document.active {
     display: block;
   }
 

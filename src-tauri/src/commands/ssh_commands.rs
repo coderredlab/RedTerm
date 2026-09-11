@@ -30,7 +30,9 @@ use crate::ssh::known_hosts::{
 use crate::ssh::{
     AuthConfig, AuthMethod, RemoveProgress, SftpDirEntry, SshConnection, SshError, SshSession,
 };
-use crate::storage::{load_saved_password_for_connection, resolve_uploaded_key_for_auth};
+use crate::storage::{
+    load_saved_password_for_connection, resolve_uploaded_key_for_auth, unique_destination_names,
+};
 #[cfg(target_os = "android")]
 use tauri_plugin_redterm_android_paste::read_clipboard_image as read_native_clipboard_image;
 #[cfg(not(target_os = "ios"))]
@@ -1432,6 +1434,77 @@ pub fn preview_cache_release(app: AppHandle, local_path: String) -> Result<(), S
     }
     Ok(())
 }
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SftpUploadEvent<'a> {
+    origin_id: &'a str,
+    session_id: &'a str,
+    #[serde(flatten)]
+    progress: crate::ssh::UploadProgress,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tauri::command]
+pub async fn sftp_upload(
+    app: AppHandle,
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    remote_dir: String,
+    selection_kind: String,
+    origin_id: String,
+) -> Result<Option<crate::ssh::SftpUploadResult>, String> {
+    use crate::ssh::UploadSelectionKind;
+    use tauri_plugin_dialog::DialogExt;
+
+    let kind = UploadSelectionKind::parse(&selection_kind)?;
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+    if origin_id.is_empty() {
+        return Err("Upload origin is required".to_string());
+    }
+    if remote_dir.is_empty() || remote_dir.contains('\0') {
+        return Err("Invalid remote upload directory".to_string());
+    }
+    let picker_app = app.clone();
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        let picker = picker_app.dialog().file().set_title(match kind {
+            UploadSelectionKind::Files => "Upload files",
+            UploadSelectionKind::Folder => "Upload folder",
+        });
+        match kind {
+            UploadSelectionKind::Files => picker.blocking_pick_files(),
+            UploadSelectionKind::Folder => picker.blocking_pick_folder().map(|path| vec![path]),
+        }
+    })
+    .await
+    .map_err(|error| format!("Failed to open upload picker: {error}"))?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let paths = selected
+        .into_iter()
+        .map(|path| {
+            path.into_path()
+                .map_err(|error| format!("The picker did not select a local file: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let on_progress = |progress| {
+        let _ = app.emit(
+            "sftp-upload-progress",
+            SftpUploadEvent {
+                origin_id: &origin_id,
+                session_id: &session_id,
+                progress,
+            },
+        );
+    };
+    connection
+        .upload_paths_via_sftp(&remote_dir, paths, kind, &on_progress)
+        .await
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub async fn sftp_list_dir(
     session_manager: State<'_, Arc<SessionManager>>,
@@ -1701,22 +1774,6 @@ pub(crate) fn sanitize_file_name(file_name: &str) -> String {
     }
 }
 
-/// Collision-safe destination candidates: the plain name first, then
-/// "name (1)", "name (2)", … — claim_download_destination stops at the
-/// first free name and errors out after the retry budget is exhausted.
-pub(crate) fn unique_download_candidate_names(file_name: &str) -> impl Iterator<Item = String> {
-    let stem = Path::new(file_name)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| file_name.to_string());
-    let extension = Path::new(file_name)
-        .extension()
-        .map(|s| format!(".{}", s.to_string_lossy()))
-        .unwrap_or_default();
-    std::iter::once(file_name.to_string())
-        .chain((1..1000u32).map(move |index| format!("{} ({}){}", stem, index, extension)))
-}
-
 /// Platform-neutral claimed destination: owns the exclusive write handle and
 /// every handle needed to clean itself up safely if the download fails. A
 /// concurrently re-pointed ancestor directory cannot redirect the download
@@ -1920,7 +1977,7 @@ pub(crate) fn claim_download_destination(
 ) -> Result<ClaimedDownloadDestination, String> {
     let dir_file =
         open_download_dir(dir).map_err(|e| format!("Failed to open download directory: {e}"))?;
-    for name in unique_download_candidate_names(file_name) {
+    for name in unique_destination_names(file_name) {
         let name_c = match std::ffi::CString::new(name.as_bytes().to_vec()) {
             Ok(name_c) => name_c,
             Err(_) => continue,
@@ -1953,7 +2010,7 @@ pub(crate) fn claim_download_destination(
         open_windows_dir(dir).map_err(|e| format!("Failed to open download directory: {e}"))?;
     let canonical_dir = final_path_by_handle(&dir_file)
         .map_err(|e| format!("Failed to resolve download directory: {e}"))?;
-    for name in unique_download_candidate_names(file_name) {
+    for name in unique_destination_names(file_name) {
         let path = dir.join(&name);
         match open_windows_candidate(&path) {
             Ok(file) => {

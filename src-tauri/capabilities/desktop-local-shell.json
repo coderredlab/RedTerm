@@ -27,6 +27,7 @@
     "allow-preview-cache-acquire",
     "allow-preview-cache-release",
     "allow-sftp-write-file",
+    "allow-sftp-upload",
     "allow-sftp-create-dir",
     "allow-sftp-create-file",
     "allow-sftp-remove-path"

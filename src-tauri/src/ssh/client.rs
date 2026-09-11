@@ -124,7 +124,7 @@ pub struct SftpDirEntry {
 }
 
 pub struct SshConnection {
-    handle: Handle<ClientHandler>,
+    pub(super) handle: Handle<ClientHandler>,
 }
 
 /// Phase of a recursive delete reported through the `sftp-remove-progress`

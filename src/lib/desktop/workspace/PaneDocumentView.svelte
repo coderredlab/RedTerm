@@ -81,7 +81,6 @@
   let editorView = $state.raw<EditorView | null>(null);
   const editorThemeCompartment = new Compartment();
   let appliedEditorDarkTheme: boolean | null = null;
-  let mode = $state<"edit" | "preview">("edit");
   let downloading = $state(false);
   let downloadedHint = $state(false);
   let loadToken = 0;
@@ -130,6 +129,9 @@
   const boundPath = untrack(() => document.path);
   let fileKind = $state<FilePreviewKind>(
     untrack(() => previewKindOf(document.name))
+  );
+  let mode = $state<"edit" | "preview">(
+    untrack(() => fileKind === "markdown" ? "preview" : "edit")
   );
   const editable = $derived(
     fileKind === "code" || fileKind === "text" || fileKind === "markdown"

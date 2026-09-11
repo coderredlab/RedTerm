@@ -37,7 +37,7 @@ use commands::{
     local_create_dir, local_create_file, local_download_file, local_download_to_dir,
     local_home_dir, local_list_dir, local_read_file, local_remove_path, local_shell_disconnect,
     local_shell_get_output, local_shell_resize, local_shell_start, local_shell_write,
-    local_write_file, DesktopClipboardState, LocalShellManager,
+    local_write_file, sftp_upload, DesktopClipboardState, LocalShellManager,
 };
 
 use storage::{
@@ -177,6 +177,8 @@ pub fn run() {
             sftp_download_file,
             sftp_download_to_dir,
             sftp_home_dir,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            sftp_upload,
             preview_cache_acquire,
             preview_cache_release,
             read_clipboard_text,
