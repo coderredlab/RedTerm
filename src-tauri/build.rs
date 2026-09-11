@@ -55,6 +55,7 @@ fn main() {
             "local_remove_path",
             "local_download_file",
             "local_download_to_dir",
+            "local_upload",
             "read_clipboard_image",
             "set_keyboard_visible",
             "set_keep_screen_on",

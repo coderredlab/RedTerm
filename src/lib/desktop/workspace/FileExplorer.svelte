@@ -12,6 +12,7 @@
     localHomeDir,
     localListDir,
     localRemovePath,
+    localUpload,
     previewCacheAcquire,
     previewCacheRelease,
     sftpCreateDir,
@@ -90,6 +91,8 @@
   let breadcrumbViewport: HTMLDivElement | undefined;
   let destroyed = false;
   const canBrowse = $derived(kind === "local" || Boolean(sessionId));
+  const canUpload = $derived(kind === "local" || (kind === "ssh" && Boolean(sessionId)));
+  const uploadLabel = $derived(kind === "local" ? "Copy" : "Upload");
   // Local browsing is scoped to home: no navigation above it.
   const atLocalHome = $derived(kind === "local" && homePath !== null && path === homePath);
   const sort = $derived(desktopPrefsStore.prefs.explorerSort);
@@ -184,8 +187,9 @@
 
   async function upload(selectionKind: SftpUploadSelectionKind) {
     closeContextMenu();
-    if (kind !== "ssh" || !sessionId || loading || uploadBusy) return;
+    if (!canUpload || loading || uploadBusy) return;
     const targetSession = sessionId;
+    const eventSession = targetSession ?? "";
     const targetKind = kind;
     const destination = path;
     const epoch = uploadEpoch;
@@ -195,14 +199,14 @@
     uploadBusy = true;
     uploadReport = null;
     uploadProgress = {
-      originId, sessionId: targetSession, destination, phase: "preparing",
+      originId, sessionId: eventSession, destination, phase: "preparing",
       name: selectionKind === "folder" ? "Choose a folder…" : "Choose files…",
       transferred: 0, total: null, fileIndex: 0, fileCount: 0,
     };
     let stopListening: (() => void) | null = null;
     try {
       const unlisten = await listenUploadProgress((event) => {
-        if (!isCurrent() || event.originId !== originId || event.sessionId !== targetSession) return;
+        if (!isCurrent() || event.originId !== originId || event.sessionId !== eventSession) return;
         uploadProgress = { ...event, destination };
       });
       let listening = true;
@@ -213,7 +217,9 @@
       };
       if (!isCurrent()) return;
       uploadUnlisten = stopListening;
-      const result = await sftpUpload(targetSession, destination, selectionKind, originId);
+      const result = targetKind === "local"
+        ? await localUpload(eventSession, destination, selectionKind, originId)
+        : await sftpUpload(eventSession, destination, selectionKind, originId);
       if (!isCurrent() || result === null) return;
       uploadReport = { ...result, destination };
       // Do not let completion replace a newer navigation, even if its listing is pending.
@@ -221,7 +227,7 @@
     } catch (error) {
       if (isCurrent()) uploadReport = {
         destination, uploaded: [],
-        failed: [{ name: selectionKind === "folder" ? "Folder upload" : "File upload",
+        failed: [{ name: `${selectionKind === "folder" ? "Folder" : "File"} ${targetKind === "local" ? "copy" : "upload"}`,
           error: error instanceof Error ? error.message : String(error) }],
       };
     } finally {
@@ -625,11 +631,33 @@
         {/if}
       {/each}
     </div>
-    {#if kind === "ssh" && sessionId}
+  </div>
+
+  <div class="sort-bar">
+    <div class="sort-buttons" role="group" aria-label="Sort entries">
+      <button
+        class="sort-btn"
+        class:active={sort.key === "name"}
+        title="Sort by name"
+        onclick={() => toggleSort("name")}
+      >
+        Name{sort.key === "name" ? (sort.direction === "asc" ? " ↑" : " ↓") : ""}
+      </button>
+      <button
+        class="sort-btn"
+        class:active={sort.key === "date"}
+        title="Sort by date"
+        onclick={() => toggleSort("date")}
+      >
+        Date{sort.key === "date" ? (sort.direction === "asc" ? " ↑" : " ↓") : ""}
+      </button>
+    </div>
+    {#if canUpload}
       <button
         class="path-btn upload-btn"
         bind:this={uploadButton}
-        title="Upload to this directory"
+        title={`${uploadLabel} to this directory`}
+        aria-label={`${uploadLabel} to this directory`}
         aria-haspopup="menu"
         aria-expanded={contextMenu?.uploadOnly ?? false}
         disabled={loading || uploadBusy}
@@ -640,7 +668,6 @@
           stroke-linejoin="round" aria-hidden="true">
           <path d="M10 12V3m-3 3 3-3 3 3M4 13v3h12v-3" />
         </svg>
-        Upload
       </button>
     {/if}
     <button
@@ -651,25 +678,6 @@
       onclick={() => void navigate(path)}
     >⟳</button>
   </div>
-
-  <div class="sort-bar" role="group" aria-label="Sort entries">
-    <button
-      class="sort-btn"
-      class:active={sort.key === "name"}
-      title="Sort by name"
-      onclick={() => toggleSort("name")}
-    >
-      Name{sort.key === "name" ? (sort.direction === "asc" ? " ↑" : " ↓") : ""}
-    </button>
-    <button
-      class="sort-btn"
-      class:active={sort.key === "date"}
-      title="Sort by date"
-      onclick={() => toggleSort("date")}
-    >
-      Date{sort.key === "date" ? (sort.direction === "asc" ? " ↑" : " ↓") : ""}
-    </button>
-  </div>
   {#if statusMessage}
     <div class="explorer-toast" role="status">{statusMessage}</div>
   {/if}
@@ -677,8 +685,11 @@
   {#if uploadProgress}
     <div class="download-progress upload-progress" role="status">
       <div class="download-progress-info">
-        <span class="download-progress-name">{uploadProgress.phase === "preparing" ? "Preparing upload…"
-          : uploadProgress.phase === "finishing" ? "Finishing upload…" : "Uploading…"}</span>
+        <span class="download-progress-name">{uploadProgress.phase === "preparing"
+          ? kind === "local" ? "Preparing copy…" : "Preparing upload…"
+          : uploadProgress.phase === "finishing"
+            ? kind === "local" ? "Finishing copy…" : "Finishing upload…"
+            : kind === "local" ? "Copying…" : "Uploading…"}</span>
         {#if uploadProgress.fileCount > 0}
           <span class="download-progress-bytes">{uploadProgress.fileIndex} of {uploadProgress.fileCount}</span>
         {/if}
@@ -703,8 +714,8 @@
   {#if uploadReport}
     <div class="explorer-toast upload-report" role="status">
       <div class="download-progress-info">
-        <span class="download-progress-name">{uploadReport.uploaded.length} uploaded{uploadReport.failed.length ? ", " + uploadReport.failed.length + " failed" : ""}</span>
-        <button class="path-btn" title="Dismiss upload result" aria-label="Dismiss upload result" onclick={() => (uploadReport = null)}>×</button>
+        <span class="download-progress-name">{uploadReport.uploaded.length} {kind === "local" ? "copied" : "uploaded"}{uploadReport.failed.length ? ", " + uploadReport.failed.length + " failed" : ""}</span>
+        <button class="path-btn" title={kind === "local" ? "Dismiss copy result" : "Dismiss upload result"} aria-label={kind === "local" ? "Dismiss copy result" : "Dismiss upload result"} onclick={() => (uploadReport = null)}>×</button>
       </div>
       <div class="upload-path">To {uploadReport.destination}</div>
       {#each uploadReport.uploaded as item}
@@ -859,15 +870,15 @@
       class="entry-context-menu"
       role="menu"
       tabindex="-1"
-      aria-label={contextMenu.uploadOnly ? "Upload" : "File actions"}
+      aria-label={contextMenu.uploadOnly ? uploadLabel : "File actions"}
       use:focusContextMenu
       onkeydown={handleMenuKeydown}
       style:left="{menuPosition.left}px"
       style:top="{menuPosition.top}px"
     >
-      {#if kind === "ssh" && sessionId && contextMenu.entry === null}
-        <button type="button" role="menuitem" disabled={loading || uploadBusy} onclick={() => void upload("files")}>Upload files…</button>
-        <button type="button" role="menuitem" disabled={loading || uploadBusy} onclick={() => void upload("folder")}>Upload folder…</button>
+      {#if canUpload && contextMenu.entry === null}
+        <button type="button" role="menuitem" disabled={loading || uploadBusy} onclick={() => void upload("files")}>{uploadLabel} files…</button>
+        <button type="button" role="menuitem" disabled={loading || uploadBusy} onclick={() => void upload("folder")}>{uploadLabel} folder…</button>
       {/if}
       {#if !contextMenu.uploadOnly}
       {#if contextMenu.entry !== null && !contextMenu.entry.is_dir && !downloadingPaths.includes(joinPath(path, contextMenu.entry.name))}
@@ -970,15 +981,6 @@
   .path-btn:hover:not(:disabled) {
     background: var(--bg-tertiary);
     color: var(--text-primary);
-  }
-
-  .upload-btn {
-    width: auto;
-    display: flex;
-    gap: 4px;
-    padding: 0 5px;
-    font: inherit;
-    font-size: 10px;
   }
 
   .upload-btn:focus-visible,
@@ -1272,9 +1274,16 @@
     flex: 0 0 auto;
     display: flex;
     align-items: center;
-    gap: 2px;
+    gap: 4px;
     padding: 4px 8px;
     border-bottom: 1px solid var(--border-secondary);
+  }
+
+  .sort-buttons {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-right: auto;
   }
 
   .sort-btn {

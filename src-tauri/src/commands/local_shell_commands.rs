@@ -1006,6 +1006,45 @@ pub async fn local_download_to_dir(
     }
 }
 
+#[tauri::command]
+pub async fn local_upload(
+    app: AppHandle,
+    session_id: String,
+    path: String,
+    selection_kind: String,
+    origin_id: String,
+) -> Result<Option<crate::ssh::SftpUploadResult>, String> {
+    use super::ssh_commands::{emit_upload_progress, pick_upload_paths};
+    use crate::ssh::UploadSelectionKind;
+
+    let kind = UploadSelectionKind::parse(&selection_kind)?;
+    if origin_id.is_empty() {
+        return Err("Copy origin is required".to_string());
+    }
+    let destination = ensure_within_home(Path::new(&path))?;
+    if !destination.is_dir() {
+        return Err("Copy destination is not a directory".to_string());
+    }
+    let title = match kind {
+        UploadSelectionKind::Files => "Copy files",
+        UploadSelectionKind::Folder => "Copy folder",
+    };
+    let Some(paths) = pick_upload_paths(&app, kind, title).await? else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        // The picker can remain open while the filesystem changes. Recheck
+        // the home boundary before the copy engine pins the destination.
+        let destination = ensure_within_home(&destination)?;
+        crate::storage::local_upload::copy_upload_paths(&destination, paths, kind, &|progress| {
+            emit_upload_progress(&app, &origin_id, &session_id, progress);
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to copy selected items: {error}"))?
+    .map(Some)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

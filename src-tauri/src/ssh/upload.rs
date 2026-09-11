@@ -73,13 +73,13 @@ pub struct SftpUploadResult {
     pub failed: Vec<SftpUploadFailure>,
 }
 
-struct LocalEntry {
-    relative: PathBuf,
-    name: String,
-    is_dir: bool,
+pub(crate) struct LocalEntry {
+    pub(crate) relative: PathBuf,
+    pub(crate) name: String,
+    pub(crate) is_dir: bool,
 }
 
-struct LocalFile {
+pub(crate) struct LocalFile {
     file: File,
     #[cfg(windows)]
     _parents: Vec<File>,
@@ -92,7 +92,7 @@ impl std::ops::Deref for LocalFile {
     }
 }
 
-struct LocalSource {
+pub(crate) struct LocalSource {
     root: File,
     #[cfg(windows)]
     path: PathBuf,
@@ -104,7 +104,7 @@ fn invalid_source(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
-fn validate_name(name: &std::ffi::OsStr) -> io::Result<&str> {
+pub(crate) fn validate_name(name: &std::ffi::OsStr) -> io::Result<&str> {
     let name = name
         .to_str()
         .ok_or_else(|| invalid_source("File names must be valid Unicode"))?;
@@ -114,7 +114,7 @@ fn validate_name(name: &std::ffi::OsStr) -> io::Result<&str> {
     Ok(name)
 }
 
-fn validate_type(file: &File) -> io::Result<bool> {
+pub(crate) fn validate_type(file: &File) -> io::Result<bool> {
     let metadata = file.metadata()?;
     #[cfg(windows)]
     {
@@ -159,7 +159,7 @@ fn open_local(path: &Path) -> io::Result<File> {
 }
 
 impl LocalSource {
-    fn new(path: &Path, folder: bool) -> io::Result<Self> {
+    pub(crate) fn new(path: &Path, folder: bool) -> io::Result<Self> {
         #[cfg(windows)]
         let (path, ancestors) = {
             let name = path
@@ -191,7 +191,7 @@ impl LocalSource {
         })
     }
 
-    fn open(&self, relative: &Path) -> io::Result<LocalFile> {
+    pub(crate) fn open(&self, relative: &Path) -> io::Result<LocalFile> {
         let mut file = self.root.try_clone()?;
         #[cfg(windows)]
         let mut path = self.path.clone();
@@ -233,7 +233,7 @@ impl LocalSource {
         })
     }
 
-    fn entries(&self, name: &str) -> io::Result<Vec<LocalEntry>> {
+    pub(crate) fn entries(&self, name: &str) -> io::Result<Vec<LocalEntry>> {
         let mut entries = Vec::new();
         let mut pending = vec![(PathBuf::new(), name.to_string())];
         while let Some((relative, name)) = pending.pop() {

@@ -36,7 +36,7 @@ use commands::{
 use commands::{
     local_create_dir, local_create_file, local_download_file, local_download_to_dir,
     local_home_dir, local_list_dir, local_read_file, local_remove_path, local_shell_disconnect,
-    local_shell_get_output, local_shell_resize, local_shell_start, local_shell_write,
+    local_shell_get_output, local_shell_resize, local_shell_start, local_shell_write, local_upload,
     local_write_file, sftp_upload, DesktopClipboardState, LocalShellManager,
 };
 
@@ -211,6 +211,8 @@ pub fn run() {
             local_download_file,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_download_to_dir,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            local_upload,
             ssh_upload_clipboard_image_from_local_path,
             read_clipboard_image,
             set_keyboard_visible,

@@ -24,6 +24,7 @@
     "allow-local-remove-path",
     "allow-local-download-file",
     "allow-local-download-to-dir",
+    "allow-local-upload",
     "allow-preview-cache-acquire",
     "allow-preview-cache-release",
     "allow-sftp-write-file",

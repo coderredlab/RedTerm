@@ -1,4 +1,6 @@
 pub mod connections;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) mod local_upload;
 
 pub use connections::*;
 

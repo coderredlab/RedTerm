@@ -1445,6 +1445,55 @@ struct SftpUploadEvent<'a> {
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) fn emit_upload_progress(
+    app: &AppHandle,
+    origin_id: &str,
+    session_id: &str,
+    progress: crate::ssh::UploadProgress,
+) {
+    let _ = app.emit(
+        "sftp-upload-progress",
+        SftpUploadEvent {
+            origin_id,
+            session_id,
+            progress,
+        },
+    );
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) async fn pick_upload_paths(
+    app: &AppHandle,
+    kind: crate::ssh::UploadSelectionKind,
+    title: &'static str,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    use crate::ssh::UploadSelectionKind;
+    use tauri_plugin_dialog::DialogExt;
+
+    let app = app.clone();
+    let selected = tauri::async_runtime::spawn_blocking(move || {
+        let picker = app.dialog().file().set_title(title);
+        match kind {
+            UploadSelectionKind::Files => picker.blocking_pick_files(),
+            UploadSelectionKind::Folder => picker.blocking_pick_folder().map(|path| vec![path]),
+        }
+    })
+    .await
+    .map_err(|error| format!("Failed to open file picker: {error}"))?;
+    selected
+        .map(|selected| {
+            selected
+                .into_iter()
+                .map(|path| {
+                    path.into_path()
+                        .map_err(|error| format!("The picker did not select a local file: {error}"))
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[tauri::command]
 pub async fn sftp_upload(
     app: AppHandle,
@@ -1455,8 +1504,6 @@ pub async fn sftp_upload(
     origin_id: String,
 ) -> Result<Option<crate::ssh::SftpUploadResult>, String> {
     use crate::ssh::UploadSelectionKind;
-    use tauri_plugin_dialog::DialogExt;
-
     let kind = UploadSelectionKind::parse(&selection_kind)?;
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
     if origin_id.is_empty() {
@@ -1465,39 +1512,14 @@ pub async fn sftp_upload(
     if remote_dir.is_empty() || remote_dir.contains('\0') {
         return Err("Invalid remote upload directory".to_string());
     }
-    let picker_app = app.clone();
-    let selected = tauri::async_runtime::spawn_blocking(move || {
-        let picker = picker_app.dialog().file().set_title(match kind {
-            UploadSelectionKind::Files => "Upload files",
-            UploadSelectionKind::Folder => "Upload folder",
-        });
-        match kind {
-            UploadSelectionKind::Files => picker.blocking_pick_files(),
-            UploadSelectionKind::Folder => picker.blocking_pick_folder().map(|path| vec![path]),
-        }
-    })
-    .await
-    .map_err(|error| format!("Failed to open upload picker: {error}"))?;
-    let Some(selected) = selected else {
+    let title = match kind {
+        UploadSelectionKind::Files => "Upload files",
+        UploadSelectionKind::Folder => "Upload folder",
+    };
+    let Some(paths) = pick_upload_paths(&app, kind, title).await? else {
         return Ok(None);
     };
-    let paths = selected
-        .into_iter()
-        .map(|path| {
-            path.into_path()
-                .map_err(|error| format!("The picker did not select a local file: {error}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let on_progress = |progress| {
-        let _ = app.emit(
-            "sftp-upload-progress",
-            SftpUploadEvent {
-                origin_id: &origin_id,
-                session_id: &session_id,
-                progress,
-            },
-        );
-    };
+    let on_progress = |progress| emit_upload_progress(&app, &origin_id, &session_id, progress);
     connection
         .upload_paths_via_sftp(&remote_dir, paths, kind, &on_progress)
         .await

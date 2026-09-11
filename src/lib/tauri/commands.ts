@@ -445,6 +445,17 @@ export async function sftpUpload(
   });
 }
 
+export async function localUpload(
+  sessionId: string,
+  path: string,
+  selectionKind: SftpUploadSelectionKind,
+  originId: string
+): Promise<SftpUploadResult | null> {
+  return invoke<SftpUploadResult | null>("local_upload", {
+    sessionId, path, selectionKind, originId,
+  });
+}
+
 export const MAX_SFTP_READ_BYTES = 2 * 1024 * 1024;
 export const MAX_SFTP_DOWNLOAD_BYTES = 200 * 1024 * 1024;
 

@@ -45,7 +45,8 @@ Android and iOS sources are included in the repository, but mobile binaries are 
 - Image, PDF, audio, and video previews
 - Media playback and editor state preserved across document-tab switches; Markdown opens in preview mode
 - Remote file downloads, file and whole-folder uploads, and clipboard-image uploads over the active SSH connection
-- Upload progress and per-item results; existing remote names are preserved with numbered alternatives
+- Local file and whole-folder copies into the current directory using native file and folder pickers
+- Upload and copy progress with per-item results; existing destination names are preserved with numbered alternatives
 - Unsaved-document and active-session checks before closing documents, panes, tabs, or the application
 - Dark and light terminal themes with persistent font, size, and layout settings
 
