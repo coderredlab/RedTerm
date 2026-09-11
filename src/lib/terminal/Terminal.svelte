@@ -188,6 +188,7 @@
   let buffer = $state<Cell[][]>([]);
   let cursorPos = $state({ x: 0, y: 0 });
   let prevCursorY = 0;
+  let rendererSized = false;
   let cols = $state(80);
   let rows = $state(24);
   let statusMessage = $state("");
@@ -942,8 +943,9 @@
 
   function redrawCanvas(force = false) {
     if (!renderer || !parser) return;
-    // synchronized output 중에는 중간 상태 노출 방지를 위해 렌더 스킵
-    // force=true: resize 직후 등 캔버스가 클리어된 경우 반드시 다시 그려야 함
+    // 숨은 표면은 캔버스가 0×0으로 수축한 상태다 — raster를 생략하고
+    // resume 시 markAllDirty + 전체 재생으로 복구한다.
+    if (!terminalSurfaceVisible) return;
     if (!force && parser.isSynchronizedOutput()) return;
     const buf = parser.getFullBuffer();
     if (buf.length === 0) return;
@@ -1016,6 +1018,7 @@
         defaultFg: theme.colors.terminalFg,
         defaultBg: theme.colors.terminalBg,
         cursorColor: theme.colors.terminalCursor,
+        directDraw: isDesktopTarget,
         onImageLoad: requestRedraw,
       });
     }
@@ -1165,7 +1168,8 @@
         // Android WebView resume 시 DOM 레이아웃 복원 타이밍이 불확실해서
         // 여러 시점에서 scrollTop 재설정 + canvas 다시 그리기
         const forceScrollToBottomAndRedraw = () => {
-          if (!parser || !renderer) return;
+          // 비활성 패인·숨은 탭은 suspend 상태다 — raster하지 않는다.
+          if (!parser || !renderer || !terminalSurfaceVisible) return;
           autoStickToBottom = true;
 
           const buf = parser.getFullBuffer();
@@ -1207,7 +1211,6 @@
           }
           renderer.endDraw();
         };
-
         // 3중 보장: 즉시 + 다음 repaint + DOM 안정화 후
         forceScrollToBottomAndRedraw();
         requestAnimationFrame(forceScrollToBottomAndRedraw);
@@ -1285,7 +1288,14 @@
     const newRows = Math.floor(rect.height / charHeight);
 
 
-    if (newCols > 0 && newRows > 0 && (newCols !== cols || newRows !== rows)) {
+    // 렌더러가 유효한 크기를 한 번도 받지 못했으면 cols/rows가 초기값(80×24)과
+    // 같아도 반드시 resize한다 — suspend/resume이 저장 크기 없이 0×0으로 수축하는
+    // 것을 막고, 초기값과 우연히 일치하는 첫 레이아웃에서 캔버스가 빈 채로 남지
+    // 않게 한다.
+    if (
+      newCols > 0 && newRows > 0
+      && (newCols !== cols || newRows !== rows || !rendererSized)
+    ) {
       // resize 전에 stickToBottom 상태 캡처 (키보드 올라와서 clientHeight가 줄어들기 전)
       const wasAtBottom = autoStickToBottom || isNearBottom();
 
@@ -1294,6 +1304,7 @@
       rows = newRows;
       if (renderer) {
         renderer.resize(rect.width, rect.height, newCols, newRows);
+        rendererSized = true;
       }
 
       if (!sessionId) {
@@ -1495,10 +1506,23 @@
   }
 
   function updateImageAnimationVisibility() {
-    terminalSurfaceVisible = isTerminalSurfaceVisible();
-    renderer?.setAnimationsEnabled(terminalSurfaceVisible);
-    if (terminalSurfaceVisible) scheduleImageAnimation();
-    else clearImageAnimationTimer();
+    const visible = isTerminalSurfaceVisible();
+    // 숨은 탭·패인은 캔버스 백킹 스토어와 이미지 디코드 캐시를 해제하고,
+    // 다시 보이는 시점에 복원한 뒤 다음 페인트 전에 동기 재생한다.
+    const resumed = visible ? (renderer?.resume() ?? false) : false;
+    terminalSurfaceVisible = visible;
+    if (visible) {
+      renderer?.setAnimationsEnabled(true);
+      scheduleImageAnimation();
+      if (resumed) {
+        parser?.markAllDirty();
+        redrawCanvas(true);
+      }
+    } else {
+      renderer?.suspend();
+      renderer?.setAnimationsEnabled(false);
+      clearImageAnimationTimer();
+    }
   }
 
   function scheduleImageAnimation() {
@@ -1596,7 +1620,6 @@
       cursorPos = nextCursor;
       parserCursorVisible = parser.isCursorVisible();
 
-
       // height filler 업데이트 (네이티브 스크롤을 위한 가상 높이)
       const totalHeight = newBuffer.length * charHeight;
       if (heightFiller) {
@@ -1620,16 +1643,18 @@
       const fracOffsetY = viewportTop % charHeight;
       const endRow = Math.min(startRow + rows + 2, newBuffer.length);
 
-      // 항상 전체 다시 그리기
-      renderer.clear();
-      renderer.beginDraw(fracOffsetY);
-      const images = parser.getImages(startRow, endRow);
-      renderer.drawImages(images, startRow, endRow, 'background');
-      renderer.drawVisibleRowBackgrounds(newBuffer, startRow, endRow);
-      renderer.drawImages(images, startRow, endRow, 'below');
-      renderer.drawVisibleRowText(newBuffer, startRow, endRow);
-      renderer.drawImages(images, startRow, endRow, 'above');
-
+      // 숨은 표면은 raster를 생략한다 — 파싱과 상태 갱신은 계속 실행되며,
+      // drawImages가 디코드 이미지 캐시를 다시 채우지 않도록 한다.
+      if (terminalSurfaceVisible) {
+        renderer.clear();
+        renderer.beginDraw(fracOffsetY);
+        const images = parser.getImages(startRow, endRow);
+        renderer.drawImages(images, startRow, endRow, 'background');
+        renderer.drawVisibleRowBackgrounds(newBuffer, startRow, endRow);
+        renderer.drawImages(images, startRow, endRow, 'below');
+        renderer.drawVisibleRowText(newBuffer, startRow, endRow);
+        renderer.drawImages(images, startRow, endRow, 'above');
+      }
       prevCursorY = cursorPos.y;
 
       drawSelectionIfActive(startRow);

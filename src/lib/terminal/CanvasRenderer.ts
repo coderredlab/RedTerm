@@ -9,6 +9,11 @@ export interface CanvasRendererConfig {
   cursorColor: string;
   horizontalPadding: number;
   onImageLoad?: () => void;
+  /**
+   * true면 오프스크린 버퍼 없이 visible canvas에 바로 그린다(프레임마다 전체 복사 비용 제거).
+   * false(기본)는 Android WebView 잔상 방지용 더블 버퍼링을 유지한다.
+   */
+  directDraw?: boolean;
 }
 
 const DEFAULT_CONFIG: CanvasRendererConfig = {
@@ -19,6 +24,7 @@ const DEFAULT_CONFIG: CanvasRendererConfig = {
   defaultBg: '#1a0f0f',
   cursorColor: '#ff6b6b',
   horizontalPadding: 8,
+  directDraw: false,
 };
 
 const MAX_IMAGE_CACHE_ENTRIES = 64;
@@ -55,6 +61,9 @@ export class CanvasRenderer {
   private animatedImageSeenThisFrame = false;
   private animationsEnabled = true;
   private cursorSnapshot: { x: number; y: number; pixels: ImageData } | null = null;
+  private suspended = false;
+  private savedWidth = 0;
+  private savedHeight = 0;
 
 
   charWidth = 0;
@@ -65,20 +74,25 @@ export class CanvasRenderer {
 
   constructor(canvas: HTMLCanvasElement, config?: Partial<CanvasRendererConfig>) {
     this.canvas = canvas;
+    this.config = { ...DEFAULT_CONFIG, ...config };
     const visibleCtx = canvas.getContext('2d', { alpha: false });
     if (!visibleCtx) throw new Error('Failed to get 2d context');
     this.visibleCtx = visibleCtx;
 
-    // 오프스크린 캔버스 (더블 버퍼링)
-    this.offscreen = document.createElement('canvas');
-    const offCtx = this.offscreen.getContext('2d', { alpha: false });
-    if (!offCtx) throw new Error('Failed to get offscreen 2d context');
-    this.ctx = offCtx;
+    if (this.config.directDraw) {
+      // visible canvas에 곧장 그린다 — 프레임마다 전체 복사(blit)가 없다.
+      this.offscreen = document.createElement('canvas');
+      this.ctx = visibleCtx;
+    } else {
+      // 오프스크린 캔버스 (더블 버퍼링)
+      this.offscreen = document.createElement('canvas');
+      const offCtx = this.offscreen.getContext('2d', { alpha: false });
+      if (!offCtx) throw new Error('Failed to get offscreen 2d context');
+      this.ctx = offCtx;
+    }
 
-    this.config = { ...DEFAULT_CONFIG, ...config };
     this.dpr = window.devicePixelRatio || 1;
   }
-
   measureFont() {
     const { fontSize, fontFamily, lineHeightMultiplier } = this.config;
 
@@ -105,29 +119,62 @@ export class CanvasRenderer {
     this.charHeight = Math.round(fontSize * lineHeightMultiplier);
     this.ctx.font = `${fontSize}px ${appliedFamily}`;
   }
-
   resize(widthCss: number, heightCss: number, cols: number, rows: number) {
     this.cols = cols;
     this.rows = rows;
     this.dpr = window.devicePixelRatio || 1;
 
-    const pw = Math.round(widthCss * this.dpr);
-    const ph = Math.round(heightCss * this.dpr);
-
-    this.canvas.width = pw;
-    this.canvas.height = ph;
+    this.savedWidth = Math.round(widthCss * this.dpr);
+    this.savedHeight = Math.round(heightCss * this.dpr);
     this.canvas.style.width = `${widthCss}px`;
     this.canvas.style.height = `${heightCss}px`;
 
-    // 오프스크린도 동일 크기
-    this.offscreen.width = pw;
-    this.offscreen.height = ph;
+    // 숨은 표면(백그라운드 탭·비활성 패인)에서는 백킹 스토어를 유지하지 않는다.
+    // resume()에서 저장된 크기로 재할당한다.
+    if (this.suspended) return;
+
+    this.applyCanvasSize();
+  }
+
+  /**
+   * 표면이 보이지 않는 동안 캔버스 백킹 스토어와 디코드된 이미지 캐시를 해제한다.
+   * HTMLCanvasElement는 width/height가 0이면 픽셀 버퍼를 유지하지 않는다.
+   */
+  suspend() {
+    if (this.suspended) return;
+    this.suspended = true;
+    this.cursorSnapshot = null;
+    this.canvas.width = 0;
+    this.canvas.height = 0;
+    this.offscreen.width = 0;
+    this.offscreen.height = 0;
+    this.resetImageCache();
+  }
+
+  /** 백킹 스토어를 저장된 크기로 복원한다. 이후 전체 재렌더링이 필요하면 true를 반환한다. */
+  resume(): boolean {
+    if (!this.suspended) return false;
+    this.suspended = false;
+    this.applyCanvasSize();
+    return true;
+  }
+
+  private applyCanvasSize() {
+    this.canvas.width = this.savedWidth;
+    this.canvas.height = this.savedHeight;
+
+    // 더블 버퍼링 모드에서만 오프스크린을 같은 크기로 유지한다.
+    if (!this.config.directDraw) {
+      this.offscreen.width = this.savedWidth;
+      this.offscreen.height = this.savedHeight;
+    }
     this.cursorSnapshot = null;
 
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.ctx.font = `${this.config.fontSize}px ${this.config.fontFamily}`;
     this.ctx.textBaseline = 'top';
   }
+
 
   /** 런타임에 config 업데이트 (폰트 크기, 색상 등). 호출 후 measureFont()→resize() 필요. */
   updateConfig(newConfig: Partial<CanvasRendererConfig>) {
@@ -146,18 +193,24 @@ export class CanvasRenderer {
 
   /** 스크롤 소수점 오프셋 적용 — clear() 후, 모든 draw 호출 전에 호출 */
   beginDraw(scrollFracY: number) {
+    // 수축된 0×0 캔버스에는 그릴 내용이 없다. endDraw도 같은 조건으로 스킵한다.
+    if (this.suspended) return;
     this.animatedImageSeenThisFrame = false;
     this.protectedImageCacheIds.clear();
     this.ctx.save();
     this.ctx.translate(0, -scrollFracY);
   }
 
-  /** beginDraw 후 draw 완료 시 호출 — 오프스크린 버퍼를 visible canvas에 한번에 복사 */
+  /** beginDraw 후 draw 완료 시 호출 — 더블 버퍼링 모드에서는 오프스크린을 visible canvas로 복사 */
   endDraw() {
+    // beginDraw가 스킵된 suspend 상태에서는 restore·drawImage 모두 건너뛴다.
+    if (this.suspended) return;
     this.ctx.restore();
     this.ctx.font = `${this.config.fontSize}px ${this.config.fontFamily}`;
     this.ctx.textBaseline = 'top';
-    this.visibleCtx.drawImage(this.offscreen, 0, 0);
+    if (!this.config.directDraw) {
+      this.visibleCtx.drawImage(this.offscreen, 0, 0);
+    }
     this.updateAnimatedImageTimer();
   }
   drawRow(screenY: number, cells: Cell[]) {
@@ -275,8 +328,8 @@ export class CanvasRenderer {
       const transform = this.ctx.getTransform();
       const left = Math.max(0, Math.floor(x * transform.a + transform.e));
       const top = Math.max(0, Math.floor(y * transform.d + transform.f));
-      const right = Math.min(this.offscreen.width, Math.ceil((x + width) * transform.a + transform.e));
-      const bottom = Math.min(this.offscreen.height, Math.ceil((y + height) * transform.d + transform.f));
+      const right = Math.min(this.ctx.canvas.width, Math.ceil((x + width) * transform.a + transform.e));
+      const bottom = Math.min(this.ctx.canvas.height, Math.ceil((y + height) * transform.d + transform.f));
       this.cursorSnapshot = right > left && bottom > top
         ? { x: left, y: top, pixels: this.ctx.getImageData(left, top, right - left, bottom - top) }
         : null;
@@ -293,7 +346,9 @@ export class CanvasRenderer {
     const snapshot = this.cursorSnapshot;
     if (!snapshot) return;
     this.ctx.putImageData(snapshot.pixels, snapshot.x, snapshot.y);
-    this.visibleCtx.putImageData(snapshot.pixels, snapshot.x, snapshot.y);
+    if (this.ctx !== this.visibleCtx) {
+      this.visibleCtx.putImageData(snapshot.pixels, snapshot.x, snapshot.y);
+    }
     this.cursorSnapshot = null;
   }
   drawSelection(startRow: number, startCol: number, endRow: number, endCol: number, viewStartRow: number) {
