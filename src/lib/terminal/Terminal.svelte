@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, onDestroy, tick } from "svelte";
+  import { onMount, onDestroy, tick, untrack } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { AnsiParser, type Cell, type TerminalOscEvent, type TerminalSnapshot } from "./ansi-parser";
   import { shouldShowTerminalNotification } from "./osc-notifications";
@@ -344,6 +344,7 @@
   let terminalMouseButton: number | null = null;
   let localSelectionPointerId: number | null = null;
   let lastTerminalMouseCell: { row: number; col: number } | null = null;
+  let terminalMouseModifiers: TerminalMouseModifiers | undefined;
   let desktopWheelRows = 0;
   let pendingMouseClick: {
     pointerId: number;
@@ -1253,6 +1254,7 @@
 
         void resumeAfterBackground();
       } else if (document.visibilityState === "hidden") {
+        cancelPointerInteraction();
         clearImageAnimationTimer();
         pauseSshDataForBackground();
       }
@@ -1965,10 +1967,11 @@
       }
       if (parser) {
         enqueuePendingOutput(seq, text);
-        if (pendingDataCharacters >= MAX_PENDING_OUTPUT_CHARACTERS) {
-          processPendingOutputSlice(true);
-        }
-        updateBuffer();
+        if (
+          document.visibilityState === "hidden" ||
+          pendingDataCharacters >= MAX_PENDING_OUTPUT_CHARACTERS
+        ) processPendingOutputSlice(true);
+        if (document.visibilityState !== "hidden") updateBuffer();
       }
     });
     if (!isConnectionAttemptActive(generation, nextSessionId)) {
@@ -2680,7 +2683,12 @@
   }
 
   function pauseSshDataForBackground() {
-    if (kind === "local") return;
+    // Desktop streams stay live: a bounded replay history can lose image
+    // deletion commands and delay terminal query replies while hidden.
+    if (isDesktopTarget || kind === "local") {
+      processPendingOutputSlice(true);
+      return;
+    }
     if (!sessionId || !connected || !parser || !unlisten || sshDataPaused) return;
 
     pauseSshDataSource();
@@ -2880,9 +2888,9 @@
   }
 
   $effect(() => {
-    if (!interactive && hiddenInput && document.activeElement === hiddenInput) {
-      hiddenInput.blur();
-      return;
+    if (!interactive) {
+      untrack(cancelPointerInteraction);
+      if (hiddenInput && document.activeElement === hiddenInput) hiddenInput.blur();
     }
   });
 
@@ -2933,6 +2941,7 @@
         suppressNextFocus = true;
         terminalMousePointerId = e.pointerId;
         terminalMouseButton = e.button;
+        terminalMouseModifiers = e;
         const point = pointerToViewportCell(e);
         lastTerminalMouseCell = point;
         if (scrollContainer && !scrollContainer.hasPointerCapture(e.pointerId)) {
@@ -2943,13 +2952,16 @@
       }
       if (e.button !== 0) return;
 
-      if (localSelectionOverride || localUrlClick) localSelectionPointerId = e.pointerId;
+      localSelectionPointerId = e.pointerId;
       e.preventDefault();
       suppressNextFocus = true;
 
       if (selectionMode) {
-        beginSelectionAt(e);
-        return;
+        if (!isDesktopTarget) {
+          beginSelectionAt(e);
+          return;
+        }
+        exitSelectionMode();
       }
 
       pendingMouseClick = {
@@ -2986,6 +2998,16 @@
 
 
   function handleScreenPointerMove(e: PointerEvent) {
+    // A window/tab switch can lose pointerup. Never infer a held button
+    // from our previous pointerdown once the browser reports it released.
+    if (e.pointerType === "mouse") {
+      const buttonMask = terminalMouseButton === 1 ? 4 : terminalMouseButton === 2 ? 2 : 1;
+      if (
+        (terminalMousePointerId === e.pointerId && (e.buttons & buttonMask) === 0) ||
+        ((pendingMouseClick?.pointerId === e.pointerId || selectionPointerId === e.pointerId) &&
+          (e.buttons & 1) === 0)
+      ) cancelPointerInteraction();
+    }
     if (e.pointerType === "mouse" && e.buttons === 0) {
       const link = findTerminalLink(pointerToCell(e));
       hoveredPath = link?.kind === "path" ? link.value : null;
@@ -3060,6 +3082,59 @@
     longPressTriggered = false;
   }
 
+  function cancelPointerInteraction() {
+    const mousePointerId = terminalMousePointerId;
+    const clickPointerId = pendingMouseClick?.pointerId;
+    const dragPointerId = selectionPointerId;
+    const touchId = touchPointerId;
+    const mouseButton = terminalMouseButton;
+    const mouseCell = lastTerminalMouseCell;
+    const mouseModifiers = terminalMouseModifiers;
+    terminalMousePointerId = null;
+    terminalMouseButton = null;
+    terminalMouseModifiers = undefined;
+    lastTerminalMouseCell = null;
+    pendingMouseClick = null;
+    localSelectionPointerId = null;
+    selectionPointerId = null;
+    selectionDragTarget = null;
+    selectionHandleBoundary = null;
+    resetTouchLongPressState();
+    handleTouchEnd();
+    hoveredPath = null;
+    if (mousePointerId !== null && mouseButton !== null && mouseCell) {
+      sendMouseButton(mouseButton, mouseCell, false, mouseModifiers);
+    }
+    releasePointerCapture(mousePointerId);
+    releasePointerCapture(clickPointerId);
+    releasePointerCapture(dragPointerId);
+    releasePointerCapture(touchId);
+  }
+
+  function releasePointerCapture(pointerId: number | null | undefined) {
+    if (pointerId != null && scrollContainer?.hasPointerCapture(pointerId)) {
+      scrollContainer.releasePointerCapture(pointerId);
+    }
+  }
+
+  function handleScreenPointerCancel(e: PointerEvent) {
+    if (
+      terminalMousePointerId === e.pointerId ||
+      pendingMouseClick?.pointerId === e.pointerId ||
+      selectionPointerId === e.pointerId ||
+      touchPointerId === e.pointerId
+    ) cancelPointerInteraction();
+  }
+
+  function handleWindowFocus() {
+    if (!isDesktopTarget || !interactive || terminalContainer?.closest("[inert]")) return;
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active !== hiddenInput &&
+      (active.matches("input, textarea") || active.isContentEditable)) return;
+    focusInput();
+  }
+
+
   function handleScreenPointerEnd(e: PointerEvent) {
     if (localSelectionPointerId === e.pointerId) localSelectionPointerId = null;
     if (terminalMousePointerId === e.pointerId) {
@@ -3075,6 +3150,7 @@
       }
       terminalMousePointerId = null;
       terminalMouseButton = null;
+      terminalMouseModifiers = undefined;
       lastTerminalMouseCell = null;
     }
 
@@ -3987,6 +4063,8 @@
   }
 </script>
 
+<svelte:window onblur={cancelPointerInteraction} onfocus={handleWindowFocus} />
+
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
@@ -4252,7 +4330,8 @@
     onpointerdown={handleScreenPointerDown}
     onpointermove={handleScreenPointerMove}
     onpointerup={handleScreenPointerEnd}
-    onpointercancel={handleScreenPointerEnd}
+    onpointercancel={handleScreenPointerCancel}
+    onlostpointercapture={handleScreenPointerCancel}
     ontouchstart={handleTouchStart}
     ontouchmove={handleTouchMove}
     ontouchend={handleTouchEnd}
