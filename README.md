@@ -99,7 +99,7 @@ On Linux and Windows, `Ctrl+T`, `Ctrl+W`, and `Ctrl+\` retain their shell meanin
 - [Bun](https://bun.sh/) 1.3 or newer
 - Stable Rust toolchain
 - The [Tauri v2 platform prerequisites](https://v2.tauri.app/start/prerequisites/) for the target operating system
-- Android Studio, the Android SDK, and the Rust Android target for Android builds
+- Android Studio, JDK 21, the Android SDK, and the Rust Android target for Android builds
 - Xcode for iOS builds
 
 Install the locked frontend dependencies:
@@ -131,6 +131,11 @@ cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 Build the ARM64 Android app:
+
+Set `JAVA_HOME` to a JDK 21 installation and `ANDROID_HOME` to the Android SDK root.
+The Android project pins its Gradle daemon to JDK 21 independently of the system Java version.
+Direct Gradle checks can also read the SDK path from the untracked
+`src-tauri/gen/android/local.properties` file (`sdk.dir=/absolute/path/to/Android/sdk`).
 
 ```bash
 bun run android:build

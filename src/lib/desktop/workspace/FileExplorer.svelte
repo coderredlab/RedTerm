@@ -88,6 +88,7 @@
   // Identifies this explorer instance in delete progress events so a long
   // delete in one pane can never leak into another pane's progress UI.
   const removeOriginId = crypto.randomUUID();
+  const isWindows = typeof navigator !== "undefined" && navigator.platform.startsWith("Win");
   let breadcrumbViewport: HTMLDivElement | undefined;
   let destroyed = false;
   const canBrowse = $derived(kind === "local" || Boolean(sessionId));
@@ -402,7 +403,7 @@
   }
 
   function baseName(target: string): string {
-    const parts = target.split("/").filter(Boolean);
+    const parts = target.split(kind === "local" && isWindows ? /[\\/]/ : "/").filter(Boolean);
     return parts[parts.length - 1] ?? target;
   }
 
@@ -712,21 +713,40 @@
   {/if}
 
   {#if uploadReport}
-    <div class="explorer-toast upload-report" role="status">
-      <div class="download-progress-info">
-        <span class="download-progress-name">{uploadReport.uploaded.length} {kind === "local" ? "copied" : "uploaded"}{uploadReport.failed.length ? ", " + uploadReport.failed.length + " failed" : ""}</span>
-        <button class="path-btn" title={kind === "local" ? "Dismiss copy result" : "Dismiss upload result"} aria-label={kind === "local" ? "Dismiss copy result" : "Dismiss upload result"} onclick={() => (uploadReport = null)}>×</button>
+    <div class="explorer-toast upload-report">
+      <div class="upload-report-header">
+        <span class="upload-report-summary" role="status">{uploadReport.uploaded.length} {kind === "local" ? "copied" : "uploaded"}{uploadReport.failed.length ? " · " + uploadReport.failed.length + " failed" : ""}</span>
+        <button class="path-btn" title={kind === "local" ? "Dismiss copy result" : "Dismiss upload result"} aria-label={kind === "local" ? "Dismiss copy result" : "Dismiss upload result"} onclick={() => { uploadReport = null; uploadButton?.focus(); }}>×</button>
       </div>
-      <div class="upload-path">To {uploadReport.destination}</div>
-      {#each uploadReport.uploaded as item}
-        <div class="upload-result-item">
-          <span>{item.name}{item.is_dir ? "/" : ""} — {formatBytes(item.size)}</span>
-          <span class="upload-path">{baseName(item.remote_path) !== item.name ? "Saved as " : "Saved to "}{item.remote_path}</span>
+      <details class="upload-report-details" open={uploadReport.failed.length > 0}>
+        <summary aria-label={kind === "local" ? "Copy details" : "Upload details"}>
+          <span class="upload-report-destination" title={uploadReport.destination}>To {baseName(uploadReport.destination)}</span>
+          <span class="upload-details-label">Details</span>
+          <svg class="upload-details-chevron" width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="m6 3 5 5-5 5" /></svg>
+        </summary>
+        <div class="upload-report-body">
+          <div class="upload-path">{uploadReport.destination}</div>
+          <ul class="upload-report-list">
+            {#each uploadReport.failed as failure}
+              <li class="upload-result-item explorer-error">
+                <div class="upload-result-name" title={failure.name}>{failure.name}</div>
+                <div class="upload-result-error">{failure.error}</div>
+              </li>
+            {/each}
+            {#each uploadReport.uploaded as item}
+              <li class="upload-result-item">
+                <div class="upload-result-heading">
+                  <span class="upload-result-name" title={item.remote_path}>{item.name}{item.is_dir ? "/" : ""}</span>
+                  <span class="upload-result-size">{formatBytes(item.size)}</span>
+                </div>
+                {#if baseName(item.remote_path) !== item.name}
+                  <div class="upload-result-rename" title={item.remote_path}>Saved as {baseName(item.remote_path)}</div>
+                {/if}
+              </li>
+            {/each}
+          </ul>
         </div>
-      {/each}
-      {#each uploadReport.failed as failure}
-        <div class="upload-result-item explorer-error">{failure.name}: {failure.error}</div>
-      {/each}
+      </details>
     </div>
   {/if}
 
@@ -985,6 +1005,7 @@
 
   .upload-btn:focus-visible,
   .upload-report button:focus-visible,
+  .upload-report summary:focus-visible,
   .entry-context-menu button:focus-visible {
     outline: 1px solid var(--accent-primary);
     outline-offset: -1px;
@@ -1007,18 +1028,92 @@
   }
 
   .upload-report.explorer-toast {
-    max-height: 180px;
-    overflow-y: auto;
+    padding: 4px 8px;
     white-space: normal;
-    overflow-wrap: anywhere;
+  }
+
+  .upload-report-header,
+  .upload-report-details summary,
+  .upload-result-heading {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .upload-report-summary {
+    flex: 1;
+    min-width: 0;
+    color: var(--text-primary);
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 16px;
+  }
+
+  .upload-report-details summary {
+    min-height: 22px;
+    border-radius: 3px;
+    list-style: none;
+    cursor: pointer;
+  }
+
+  .upload-report-details summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .upload-report-destination,
+  .upload-result-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .upload-details-label,
+  .upload-details-chevron,
+  .upload-result-size {
+    flex: 0 0 auto;
+  }
+
+  .upload-report-details summary:hover .upload-details-label {
+    color: var(--text-primary);
+  }
+
+  .upload-report-details[open] .upload-details-chevron {
+    transform: rotate(90deg);
+  }
+
+  .upload-report-body {
+    max-height: 160px;
+    margin-top: 4px;
+    padding-top: 6px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border-top: 1px solid var(--border-secondary);
+  }
+
+  .upload-report-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
   }
 
   .upload-result-item + .upload-result-item {
-    margin-top: 6px;
+    margin-top: 8px;
   }
 
-  .upload-result-item .upload-path {
-    display: block;
+  .upload-result-heading {
+    align-items: baseline;
+  }
+
+  .upload-result-size {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .upload-result-rename,
+  .upload-result-error {
+    margin-top: 2px;
+    overflow-wrap: anywhere;
   }
 
   .entry-context-menu button:disabled {

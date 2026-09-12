@@ -201,7 +201,7 @@ fn remove_at(parent: &File, entry: &Created) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     let stat = unsafe { stat.assume_init() };
-    if Identity(stat.st_dev as u64, stat.st_ino as u64) != entry.identity {
+    if Identity(stat.st_dev as u64, stat.st_ino) != entry.identity {
         return Err(io::Error::other(
             "Copy destination entry was replaced; retained",
         ));

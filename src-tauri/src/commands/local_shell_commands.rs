@@ -485,13 +485,7 @@ pub async fn local_remove_path(
     }
     // The emitter label uses the caller-facing path; deletion itself uses the
     // scoped path resolved above.
-    let on_progress = make_remove_progress_emitter(
-        app,
-        path,
-        RemoveOrigin {
-            origin_id: origin_id,
-        },
-    );
+    let on_progress = make_remove_progress_emitter(app, path, RemoveOrigin { origin_id });
     remove_dir_all_with_progress(&scoped, &on_progress).await
 }
 
@@ -1426,7 +1420,7 @@ mod tests {
         std::fs::create_dir_all(outside.join("target")).unwrap();
         std::fs::write(outside.join("target/kept.txt"), "must survive").unwrap();
         std::fs::create_dir_all(root.join("dir")).unwrap();
-        std::os::unix::fs::symlink(&outside.join("target"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("target"), root.join("link")).unwrap();
         // link is deleted as an entry; dir adds one directory. The linked
         // target's contents must not appear in the count.
         let expected_total = 3usize;

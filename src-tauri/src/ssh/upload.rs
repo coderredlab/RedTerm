@@ -161,7 +161,7 @@ fn open_local(path: &Path) -> io::Result<File> {
 impl LocalSource {
     pub(crate) fn new(path: &Path, folder: bool) -> io::Result<Self> {
         #[cfg(windows)]
-        let (path, ancestors) = {
+        let (canonical_path, ancestors) = {
             let name = path
                 .file_name()
                 .ok_or_else(|| invalid_source("Select a named file or folder"))?;
@@ -174,7 +174,9 @@ impl LocalSource {
             }
             (path, handles)
         };
-        let root = open_local(path.as_ref())?;
+        #[cfg(windows)]
+        let path = canonical_path.as_path();
+        let root = open_local(path)?;
         if validate_type(&root)? != folder {
             return Err(invalid_source(if folder {
                 "Select a regular folder"
@@ -185,7 +187,7 @@ impl LocalSource {
         Ok(Self {
             root,
             #[cfg(windows)]
-            path,
+            path: canonical_path,
             #[cfg(windows)]
             _ancestors: ancestors,
         })

@@ -1747,13 +1747,7 @@ pub async fn sftp_remove_path(
 ) -> Result<(), String> {
     validate_sftp_browse_path(&path)?;
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
-    let on_progress = make_remove_progress_emitter(
-        app,
-        path.clone(),
-        RemoveOrigin {
-            origin_id: origin_id,
-        },
-    );
+    let on_progress = make_remove_progress_emitter(app, path.clone(), RemoveOrigin { origin_id });
     connection
         .remove_path_via_sftp(&path, Some(&on_progress))
         .await
@@ -1808,10 +1802,6 @@ pub(crate) struct ClaimedDownloadDestination {
 }
 
 impl ClaimedDownloadDestination {
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn file_mut(&mut self) -> &mut tokio::fs::File {
         &mut self.file
     }
@@ -2081,9 +2071,6 @@ pub async fn sftp_download_to_dir(
         .filter(|name| !name.is_empty())
         .unwrap_or("download");
     let destination_path = match destination_path.as_deref().filter(|p| !p.trim().is_empty()) {
-        Some(path) if path.is_empty() => {
-            return Err("Invalid download destination path".to_string())
-        }
         Some(path) => PathBuf::from(path),
         None => {
             let dir = app
