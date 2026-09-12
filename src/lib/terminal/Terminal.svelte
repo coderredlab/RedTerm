@@ -2,6 +2,7 @@
   import { onMount, onDestroy, tick, untrack } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
   import { AnsiParser, type Cell, type TerminalOscEvent, type TerminalSnapshot } from "./ansi-parser";
+  import { decodeTerminalSnapshot, encodeTerminalSnapshot } from "./snapshot-codec";
   import { shouldShowTerminalNotification } from "./osc-notifications";
   import { CanvasRenderer } from './CanvasRenderer';
   import {
@@ -173,7 +174,21 @@
       return;
     }
     cursorInterval = window.setInterval(() => {
-      if (destroyed) return;
+      if (
+        destroyed || !renderer || !parser || !connected || !terminalSurfaceVisible
+        || document.visibilityState !== "visible" || !parserCursorVisible
+        || !parser.isCursorVisible() || parser.isSynchronizedOutput()
+        || (isDesktopTarget && isComposing)
+      ) return;
+      // Blink only while the cursor can contribute pixels. Keep the phase while
+      // hidden; output, scrolling, composition end and surface resume redraw it.
+      const top = scrollContainer?.scrollTop ?? viewportTop;
+      const screenY = cursorPos.y - Math.floor(top / charHeight);
+      if (screenY < 0 || screenY >= rows + 2) return;
+      const sizing = buffer[cursorPos.y]?.[cursorPos.x]?.textSizing;
+      const cursorTop = (cursorPos.y - (sizing?.row ?? 0)) * charHeight - top;
+      const cursorHeight = (sizing?.scale ?? 1) * charHeight;
+      if (cursorTop + cursorHeight <= 0 || cursorTop >= (scrollContainer?.clientHeight ?? viewportHeight)) return;
       cursorVisible = !cursorVisible;
       requestRedraw();
     }, 530);
@@ -359,7 +374,7 @@
   const canCopySelection = $derived(selectionMode && selectedText.trim().length > 0);
 
   interface StoredTerminalSnapshot {
-    snapshot: TerminalSnapshot;
+    snapshot: unknown;
     savedAt: number;
   }
 
@@ -367,48 +382,43 @@
     return typeof window !== "undefined" && typeof localStorage !== "undefined";
   }
 
-  function normalizeStoredSnapshot(
-    value: StoredTerminalSnapshot | TerminalSnapshot | undefined
-  ): StoredTerminalSnapshot | null {
-    if (!value) return null;
-
-    if ("snapshot" in value && typeof value.savedAt === "number") {
-      return value as StoredTerminalSnapshot;
-    }
-
-    return {
-      snapshot: value as TerminalSnapshot,
-      savedAt: Date.now(),
-    };
+  function isSnapshotRecord(value: unknown): value is Record<string, unknown> {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
   }
 
   function pruneSessionSnapshots(
-    snapshots: Record<string, StoredTerminalSnapshot | TerminalSnapshot>,
+    snapshots: unknown,
     now = Date.now()
   ): Record<string, StoredTerminalSnapshot> {
-    const normalizedEntries = Object.entries(snapshots)
-      .map(([sessionKey, value]) => {
-        const normalized = normalizeStoredSnapshot(value);
-        if (!normalized) return null;
-        if (now - normalized.savedAt > SESSION_SNAPSHOT_MAX_AGE_MS) return null;
-        return [sessionKey, normalized] as const;
-      })
-      .filter((entry): entry is readonly [string, StoredTerminalSnapshot] => entry !== null)
-      .sort((a, b) => b[1].savedAt - a[1].savedAt)
-      .slice(0, MAX_SESSION_SNAPSHOTS);
-
-    return Object.fromEntries(normalizedEntries);
+    if (!isSnapshotRecord(snapshots)) return {};
+    const entries: Array<[string, StoredTerminalSnapshot]> = [];
+    for (const [sessionKey, value] of Object.entries(snapshots)) {
+      if (!isSnapshotRecord(value)) continue;
+      const wrapped = "snapshot" in value;
+      const savedAt = wrapped ? value.savedAt : now;
+      if (typeof savedAt !== "number" || !Number.isFinite(savedAt) ||
+          now - savedAt > SESSION_SNAPSHOT_MAX_AGE_MS) continue;
+      entries.push([sessionKey, { snapshot: wrapped ? value.snapshot : value, savedAt }]);
+    }
+    entries.sort((a, b) => b[1].savedAt - a[1].savedAt);
+    const retained: Array<[string, StoredTerminalSnapshot]> = [];
+    for (const [sessionKey, entry] of entries.slice(0, MAX_SESSION_SNAPSHOTS)) {
+      if (!isSnapshotRecord(entry.snapshot)) continue;
+      if (entry.snapshot.version !== 2) {
+        const legacy = decodeTerminalSnapshot(entry.snapshot);
+        if (!legacy) continue;
+        entry.snapshot = encodeTerminalSnapshot(legacy);
+      }
+      retained.push([sessionKey, entry]);
+    }
+    return Object.fromEntries(retained);
   }
 
   function loadSessionSnapshots(): Record<string, StoredTerminalSnapshot> {
     if (!canUseStorage()) return {};
-
     try {
       const raw = localStorage.getItem(TERMINAL_SNAPSHOT_STORAGE_KEY);
-      if (!raw) return {};
-      return pruneSessionSnapshots(
-        JSON.parse(raw) as Record<string, StoredTerminalSnapshot | TerminalSnapshot>
-      );
+      return raw ? pruneSessionSnapshots(JSON.parse(raw)) : {};
     } catch {
       return {};
     }
@@ -442,17 +452,15 @@
 
   let pendingLocalSnapshotCancel: (() => void) | null = null;
 
-  function saveSessionSnapshot(targetSessionId: string) {
-    if (!parser || !canUseStorage()) return;
-    const snapshot = createTerminalSnapshot(parser);
+  function saveSessionSnapshot(targetSessionId: string, snapshot: TerminalSnapshot) {
+    if (!canUseStorage()) return;
     if (pendingLocalSnapshotCancel) pendingLocalSnapshotCancel();
-    // 첫 페인트가 한 번 지나간 뒤 별도 task에서 직렬화·기록한다 —
-    // ~32MB JSON이 분할·이동의 첫 화면을 막지 않는다.
+    // Encode and write after the first paint, retaining only the detached capture.
     const write = () => {
       if (!canUseStorage()) return;
       try {
         const snapshots = loadSessionSnapshots();
-        snapshots[targetSessionId] = { snapshot, savedAt: Date.now() };
+        snapshots[targetSessionId] = { snapshot: encodeTerminalSnapshot(snapshot), savedAt: Date.now() };
         const prunedSnapshots = pruneSessionSnapshots(snapshots);
         localStorage.setItem(TERMINAL_SNAPSHOT_STORAGE_KEY, JSON.stringify(prunedSnapshots));
       } catch (error) {
@@ -480,14 +488,14 @@
   function restoreSessionSnapshot(targetSessionId: string): TerminalSnapshot | null {
     if (!parser) return null;
     const storedSnapshot = loadSessionSnapshots()[targetSessionId];
-    if (!storedSnapshot) return null;
+    const snapshot = decodeTerminalSnapshot(storedSnapshot?.snapshot);
+    if (!snapshot) return null;
 
-    restoreTerminalSnapshot(parser, storedSnapshot.snapshot);
-    lastProcessedSeq = snapshotOutputOffset(storedSnapshot.snapshot);
+    restoreTerminalSnapshot(parser, snapshot);
+    lastProcessedSeq = snapshotOutputOffset(snapshot);
     updateBuffer();
-    return storedSnapshot.snapshot;
+    return snapshot;
   }
-
   function clearSessionSnapshot(targetSessionId: string | null | undefined) {
     if (!targetSessionId) return;
     clearRuntimeSessionSnapshot(targetSessionId);
@@ -3982,20 +3990,20 @@
   export function storeSnapshot(): Promise<void> {
     if (sessionId && parser) {
       processPendingOutputSlice(true);
-      storeRuntimeSessionSnapshot(sessionId, createRuntimeTerminalSnapshot(parser));
+      const runtimeSnapshot = createRuntimeTerminalSnapshot(parser);
+      storeRuntimeSessionSnapshot(sessionId, runtimeSnapshot);
+      // Text was captured by value once, before any remount. Only runtime recovery
+      // retains decoded images; deferred persistence shares the detached text rows.
+      const { runtimeImageState: _images, ...snapshot } = runtimeSnapshot;
       if (kind === "local") {
         try {
-          saveSessionSnapshot(sessionId);
+          saveSessionSnapshot(sessionId, snapshot);
         } catch (error) {
           console.error("Store local terminal snapshot error:", error);
         }
         return Promise.resolve();
       }
-      return sshStoreSessionSnapshot(
-        sessionId,
-        createTerminalSnapshot(parser),
-        lastProcessedSeq
-      ).catch(() => {});
+      return sshStoreSessionSnapshot(sessionId, snapshot, lastProcessedSeq).catch(() => {});
     }
     return Promise.resolve();
   }

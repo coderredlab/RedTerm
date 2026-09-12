@@ -309,6 +309,37 @@ describe("AnsiParser terminal capabilities and SGR", () => {
     expect(parser.getFullBuffer()[0][0].style).toMatchObject({ underline: true, italic: false });
   });
 });
+describe("AnsiParser blank cell isolation", () => {
+  test("keeps blank rows isolated while palette changes update the saved main screen", () => {
+    const parser = new AnsiParser(5, 2);
+    parser.write("\x1b[31mA\x1b[0m\x1b[?1049h\x1b[2;4HZ");
+    parser.write("\x1b]4;1;#123456\x07");
+    expect(parser.getBuffer().map((row) => row.map((cell) => cell.char).join("")))
+      .toEqual(["     ", "   Z "]);
+    parser.write("\x1b[2J\x1b[?1049l");
+    expect(parser.getBuffer().map((row) => row.map((cell) => cell.char).join("")))
+      .toEqual(["A    ", "     "]);
+    expect(parser.getBuffer()[0][0].style.fg).toBe("#123456");
+  });
+
+  test("keeps editable snapshot cells detached from live and restored blank rows", () => {
+    const source = new AnsiParser(5, 2);
+    const snapshot = source.createSnapshot();
+    snapshot.bufferRows[0][0].char = "S";
+    expect(visibleRowText(source)).toBe("");
+    const restored = new AnsiParser(5, 2);
+    restored.restoreSnapshot(snapshot);
+    restored.write("\x1b[2;3HR");
+    snapshot.bufferRows[0][0].char = "T";
+    snapshot.bufferRows[1][0].char = "U";
+    expect(restored.getBuffer().map((row) => row.map((cell) => cell.char).join("")))
+      .toEqual(["S    ", "  R  "]);
+    restored.write("\x1b[1;1H\x1b[2K");
+    expect(restored.getBuffer().map((row) => row.map((cell) => cell.char).join("")))
+      .toEqual(["     ", "  R  "]);
+  });
+});
+
 describe("AnsiParser OSC compatibility", () => {
   test("emits bounded title and file URI events across BEL and ST boundaries", () => {
     const parser = new AnsiParser(20, 3);
@@ -1535,7 +1566,22 @@ describe("AnsiParser Kitty images", () => {
     source.write("\x1b[1;4r\x1b[4;1H\n");
     const snapshot = source.createRuntimeSnapshot();
 
-    expect(snapshot.runtimeImageState!.kittyVirtualPlacements[0][1].originRow).toBe(1);
+    const restored = new AnsiParser(20, 2);
+    restored.restoreSnapshot(snapshot);
+    expect(restored.getImages()).toMatchObject([{ imageId: 95, row: 1 }]);
+  });
+
+  test("retains shifted saved-main virtual images when the active screen has no placements", () => {
+    const source = new AnsiParser(20, 4);
+    source.write(kittyRgbaTransmit({ imageId: 96 }));
+    source.write("\x1b[3;1H\x1b_Ga=p,i=96,p=1,U=1,c=1,r=1\x1b\\");
+    source.write("\x1b[38;5;96m\u{10eeee}\x1b[0m");
+    source.write("\x1b[2;4r\x1b[4;1H\n\x1b[?1049h");
+    expect(source.getImages()).toEqual([]);
+    const restored = new AnsiParser(20, 2);
+    restored.restoreSnapshot(source.createRuntimeSnapshot());
+    restored.write("\x1b[?1049l");
+    expect(restored.getImages()).toMatchObject([{ imageId: 96, row: 1 }]);
   });
 
   test("discards relative placements whose restored parent is outside the viewport", () => {

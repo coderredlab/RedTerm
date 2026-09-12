@@ -9,6 +9,7 @@ import {
 } from "@tauri-apps/plugin-dialog";
 import type { Update } from "@tauri-apps/plugin-updater";
 import type { TerminalSnapshot } from "$lib/terminal/ansi-parser";
+import { decodeTerminalSnapshot, encodeTerminalSnapshot } from "$lib/terminal/snapshot-codec";
 import type {
   VoiceInputEvent,
   VoiceInputLanguage,
@@ -291,13 +292,20 @@ export async function sshStoreSessionSnapshot(
   snapshot: TerminalSnapshot,
   lastSeq: number
 ): Promise<void> {
-  return invoke("ssh_store_session_snapshot", { sessionId, snapshot, lastSeq });
+  return invoke("ssh_store_session_snapshot", {
+    sessionId, snapshot: encodeTerminalSnapshot(snapshot), lastSeq,
+  });
 }
 
 export async function sshGetSessionSnapshot(
   sessionId: string
 ): Promise<StoredSessionSnapshot | null> {
-  return invoke<StoredSessionSnapshot | null>("ssh_get_session_snapshot", { sessionId });
+  const stored = await invoke<unknown>("ssh_get_session_snapshot", { sessionId });
+  if (!stored || typeof stored !== "object" || !("snapshot" in stored) ||
+      !("last_seq" in stored) || typeof stored.last_seq !== "number" ||
+      !Number.isSafeInteger(stored.last_seq) || stored.last_seq < 0) return null;
+  const snapshot = decodeTerminalSnapshot(stored.snapshot);
+  return snapshot ? { snapshot, last_seq: stored.last_seq } : null;
 }
 
 export async function sshUploadClipboardImage(

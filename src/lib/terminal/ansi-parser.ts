@@ -309,7 +309,11 @@ export const DEFAULT_STYLE: TextStyle = {
   hidden: false,
 };
 
-const DEFAULT_STYLE_KEY = 'fg:default|bg:transparent|b:0|d:0|i:0|u:0|v:0|s:0|h:0';
+function getStyleKey(style: TextStyle): string {
+  return `fg:${style.fg ?? 'default'}|bg:${style.bg}|fi:${style.ansiFgIndex ?? ''}|bi:${style.ansiBgIndex ?? ''}|b:${style.bold ? 1 : 0}|d:${style.dim ? 1 : 0}|i:${style.italic ? 1 : 0}|u:${style.underline ? 1 : 0}|v:${style.inverse ? 1 : 0}|s:${style.strikethrough ? 1 : 0}|h:${style.hidden ? 1 : 0}|ki:${style.kittyForegroundId ?? ''}|kp:${style.kittyUnderlineId ?? ''}`;
+}
+
+const DEFAULT_STYLE_KEY = getStyleKey(DEFAULT_STYLE);
 const MAX_STYLE_POOL_SIZE = 4096;
 const MAX_CSI_PARAMETER = 0x7fffffff;
 const MAX_CSI_REP_COUNT = 256;
@@ -487,6 +491,11 @@ export class AnsiParser {
   private stylePool = new Map<string, TextStyle>([
     [DEFAULT_STYLE_KEY, Object.freeze({ ...DEFAULT_STYLE })],
   ]);
+  // Internal default blanks are immutable and shared; row writes replace cells.
+  private readonly emptyCell: Cell = Object.freeze({
+    char: ' ',
+    style: this.getInternedStyle(DEFAULT_STYLE),
+  });
   private parseState: TerminalParseState = 'normal';
   private escapeBuffer = '';
   private images: TerminalImage[] = [];
@@ -628,19 +637,15 @@ export class AnsiParser {
   }
 
   private createEmptyRow(): Cell[] {
-    const row: Cell[] = [];
-    for (let x = 0; x < this.cols; x++) {
-      row.push(this.createEmptyCell());
-    }
-    return row;
+    return new Array<Cell>(this.cols).fill(this.emptyCell);
   }
 
   private createEmptyCell(): Cell {
-    return { char: ' ', style: this.getInternedStyle(DEFAULT_STYLE) };
+    return this.emptyCell;
   }
 
-  private cloneRow(row: Cell[]): Cell[] {
-    return row.map((cell) => ({
+  private cloneRow(row: Cell[], shareEmptyCells = false): Cell[] {
+    return row.map((cell) => shareEmptyCells && cell === this.emptyCell ? cell : ({
       char: cell.char,
       style: cell.style,
       hyperlink: cell.hyperlink ? { ...cell.hyperlink } : undefined,
@@ -649,8 +654,8 @@ export class AnsiParser {
     }));
   }
 
-  private cloneBuffer(buffer: Cell[][]): Cell[][] {
-    return buffer.map((row) => this.cloneRow(row));
+  private cloneBuffer(buffer: Cell[][], shareEmptyCells = false): Cell[][] {
+    return buffer.map((row) => this.cloneRow(row, shareEmptyCells));
   }
 
   private isFullScreenRegion(scrollTop: number, scrollBottom: number, rowCount: number): boolean {
@@ -1601,7 +1606,11 @@ export class AnsiParser {
     this.style = refresh(this.style, false);
     for (const rows of [this.scrollback, this.buffer, this.mainScreenScrollback, this.mainScreenBuffer ?? []]) {
       for (const row of rows) {
-        for (const cell of row) cell.style = refresh(cell.style, true);
+        for (let col = 0; col < row.length; col++) {
+          const cell = row[col];
+          const style = refresh(cell.style, true);
+          if (style !== cell.style) row[col] = { ...cell, style };
+        }
       }
     }
     this.markAllRowsDirty();
@@ -4075,8 +4084,8 @@ export class AnsiParser {
   private enterAlternateScreen() {
     if (this.usingAlternateScreen) return;
 
-    this.mainScreenBuffer = this.cloneBuffer(this.buffer);
-    this.mainScreenScrollback = this.cloneBuffer(this.scrollback);
+    this.mainScreenBuffer = this.cloneBuffer(this.buffer, true);
+    this.mainScreenScrollback = this.cloneBuffer(this.scrollback, true);
     this.mainScreenCursor = { x: this.cursorX, y: this.cursorY };
     this.mainScreenScrollRegion = { top: this.scrollTop, bottom: this.scrollBottom };
     this.mainScreenImages = this.images;
@@ -4429,8 +4438,10 @@ export class AnsiParser {
       }
     };
 
-    refresh(this.kittyVirtualPlacements, this.scrollback.concat(this.buffer));
-    if (this.mainScreenBuffer) {
+    if (this.kittyVirtualPlacements.size > 0) {
+      refresh(this.kittyVirtualPlacements, this.scrollback.concat(this.buffer));
+    }
+    if (this.mainScreenBuffer && this.mainScreenKittyVirtualPlacements.size > 0) {
       refresh(
         this.mainScreenKittyVirtualPlacements,
         this.mainScreenScrollback.concat(this.mainScreenBuffer),
@@ -4950,11 +4961,10 @@ export class AnsiParser {
     }
     if (!this.prepareTextSizingWrite(char, isWide ? 2 : 1)) return;
 
-    const cell: Cell = {
-      char,
-      hyperlink: this.activeHyperlink ?? undefined,
-      style: this.getInternedStyle(this.style),
-    };
+    const style = this.getInternedStyle(this.style);
+    const cell: Cell = char === ' ' && !this.activeHyperlink && style === this.emptyCell.style
+      ? this.emptyCell
+      : { char, hyperlink: this.activeHyperlink ?? undefined, style };
     if (char.codePointAt(0) === 0x10eeee && this.style.kittyForegroundId !== undefined) {
       const previous = this.cursorX > 0 ? this.buffer[this.cursorY][this.cursorX - 1].imagePlaceholder : undefined;
       const imageIdLow = this.style.kittyForegroundId & 0xffffff;
@@ -4999,12 +5009,9 @@ export class AnsiParser {
     }
   }
 
-  private getStyleKey(style: TextStyle): string {
-    return `fg:${style.fg ?? 'default'}|bg:${style.bg}|fi:${style.ansiFgIndex ?? ''}|bi:${style.ansiBgIndex ?? ''}|b:${style.bold ? 1 : 0}|d:${style.dim ? 1 : 0}|i:${style.italic ? 1 : 0}|u:${style.underline ? 1 : 0}|v:${style.inverse ? 1 : 0}|s:${style.strikethrough ? 1 : 0}|h:${style.hidden ? 1 : 0}|ki:${style.kittyForegroundId ?? ''}|kp:${style.kittyUnderlineId ?? ''}`;
-  }
 
   private getInternedStyle(style: TextStyle): TextStyle {
-    const key = this.getStyleKey(style);
+    const key = getStyleKey(style);
     const cached = this.stylePool.get(key);
     if (cached) {
       // Keep recently used styles hot and allow old truecolor styles to age out.
@@ -5756,7 +5763,7 @@ export class AnsiParser {
   }
 
   private restoreSnapshotTextStyle(value: unknown): TextStyle {
-    if (!value || typeof value !== 'object') return this.getInternedStyle(DEFAULT_STYLE);
+    if (!value || typeof value !== 'object') return { ...DEFAULT_STYLE };
     const record = value as Record<string, unknown>;
     const color = (candidate: unknown, fallback: string | null): string | null =>
       candidate === null || (typeof candidate === 'string' && candidate.length <= 128)
@@ -5766,7 +5773,7 @@ export class AnsiParser {
       Number.isInteger(candidate) && (candidate as number) >= 0 && (candidate as number) <= 0xffffffff
         ? candidate as number
         : undefined;
-    return this.getInternedStyle({
+    return {
       fg: color(record.fg, DEFAULT_STYLE.fg),
       bg: color(record.bg, DEFAULT_STYLE.bg) ?? DEFAULT_STYLE.bg,
       bold: record.bold === true,
@@ -5780,7 +5787,7 @@ export class AnsiParser {
       ansiBgIndex: optionalIndex(record.ansiBgIndex),
       kittyForegroundId: optionalIndex(record.kittyForegroundId),
       kittyUnderlineId: optionalIndex(record.kittyUnderlineId),
-    });
+    };
   }
 
   private restoreParserStreamState(snapshot: TerminalSnapshot) {
@@ -5982,11 +5989,15 @@ export class AnsiParser {
 
   private snapshotRowToBufferRow(snapshotRow: Cell[]): Cell[] {
     const row = this.createEmptyRow();
+    const emptyStyle = this.emptyCell.style;
     for (let x = 0; x < Math.min(snapshotRow.length, this.cols); x++) {
       const source = snapshotRow[x];
+      const style = this.getInternedStyle(source.style);
+      if (source.char === ' ' && style === emptyStyle &&
+          !source.hyperlink && !source.imagePlaceholder && !source.textSizing) continue;
       row[x] = {
         char: source.char,
-        style: this.getInternedStyle(source.style),
+        style,
         hyperlink: source.hyperlink ? { ...source.hyperlink } : undefined,
         imagePlaceholder: source.imagePlaceholder ? { ...source.imagePlaceholder } : undefined,
         textSizing: source.textSizing ? { ...source.textSizing } : undefined,

@@ -288,7 +288,7 @@ export class CanvasRenderer {
             : sizing.verticalAlign === 2 ? (cellHeight - renderHeight) / 2 : 0)
         : y;
       const targetFontSize = sizing ? fontSize * sizing.scale * fraction : fontSize;
-      if (!style.hidden && !cell.imagePlaceholder && targetFontSize > 0) {
+      if (cell.char !== ' ' && !style.hidden && !cell.imagePlaceholder && targetFontSize > 0) {
         this.ctx.fillStyle = this.resolveFg(style);
         const fontPrefix = this.getFontPrefix(style);
         const sizedFont = sizing ? targetFontSize + 'px ' + fontFamily : baseFont;
