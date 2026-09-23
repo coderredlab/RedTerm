@@ -423,6 +423,31 @@ function encodeLegacyControl(event: KittyKeyboardEvent): string {
   return "";
 }
 
+function encodeLegacyFunctionKey(
+  event: KittyKeyboardEvent,
+  eventType: KittyKeyboardEventType,
+): string | null {
+  const match = /^F([1-9]|1[0-2])$/.exec(event.key);
+  if (!match || eventType === "release") return null;
+
+  const number = Number(match[1]);
+  const modifiers = 1 +
+    (event.shiftKey ? 1 : 0) +
+    (event.altKey ? 2 : 0) +
+    (event.ctrlKey ? 4 : 0) +
+    (event.metaKey ? 8 : 0);
+
+  if (number <= 4) {
+    const final = "PQRS"[number - 1];
+    return modifiers === 1 ? `\x1bO${final}` : `${CSI}1;${modifiers}${final}`;
+  }
+
+  const parameter = CSI_KEYS[event.key].parameter;
+  return modifiers === 1
+    ? `${CSI}${parameter}~`
+    : `${CSI}${parameter};${modifiers}~`;
+}
+
 export function encodeKittyKeyboardEvent(
   event: KittyKeyboardEvent,
   rawFlags: number,
@@ -493,6 +518,9 @@ export function encodeTerminalKeyboardEvent(
       },
       platform,
     );
+  }
+  if ((rawFlags & KITTY_KEYBOARD_SUPPORTED_FLAGS) === 0) {
+    return encodeLegacyFunctionKey(event, eventType);
   }
   return encodeKittyKeyboardEvent(event, rawFlags, eventType);
 }

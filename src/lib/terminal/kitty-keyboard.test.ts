@@ -82,6 +82,29 @@ describe("Kitty keyboard event encoding", () => {
     }
   });
 
+  test("sends legacy function keys when Kitty keyboard mode is inactive", () => {
+    const expected = [
+      "\x1bOP", "\x1bOQ", "\x1bOR", "\x1bOS",
+      "\x1b[15~", "\x1b[17~", "\x1b[18~", "\x1b[19~",
+      "\x1b[20~", "\x1b[21~", "\x1b[23~", "\x1b[24~",
+    ];
+    for (const [index, sequence] of expected.entries()) {
+      const key = plainKey(`F${index + 1}`, `F${index + 1}`);
+      expect(encodeTerminalKeyboardEvent(key, "MacIntel", 0)).toBe(sequence);
+    }
+    expect(encodeTerminalKeyboardEvent(plainKey("F2", "F2"), "MacIntel", 0, "release"))
+      .toBeNull();
+    expect(encodeTerminalKeyboardEvent(plainKey("F13", "F13"), "MacIntel", 0))
+      .toBeNull();
+  });
+
+  test("keeps modified legacy F2 and negotiated Kitty F2 distinct", () => {
+    const key = { ...plainKey("F2", "F2"), shiftKey: true, ctrlKey: true };
+    expect(encodeTerminalKeyboardEvent(key, "MacIntel", 0)).toBe("\x1b[1;6Q");
+    expect(encodeTerminalKeyboardEvent(plainKey("F2", "F2"), "MacIntel", 7))
+      .toBe("\x1b[Q");
+  });
+
   test("reports shifted and base-layout alternate keys", () => {
     expect(
       encodeKittyKeyboardEvent(
