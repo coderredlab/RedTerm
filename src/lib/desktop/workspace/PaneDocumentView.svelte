@@ -945,6 +945,12 @@
     line-height: 1.7;
   }
 
+  .markdown-body::selection,
+  .markdown-body :global(::selection) {
+    background: color-mix(in srgb, var(--accent-primary) 30%, transparent);
+    color: var(--text-primary);
+  }
+
   .markdown-body :global(h1),
   .markdown-body :global(h2),
   .markdown-body :global(h3) {
