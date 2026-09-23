@@ -345,6 +345,72 @@ function replaceLeaf(
   };
 }
 
+type SplitPathEntry = {
+  node: Extract<PaneNode, { type: "split" }>;
+  side: 0 | 1;
+};
+
+type PanePath = {
+  leaf: Extract<PaneNode, { type: "leaf" }>;
+  splits: SplitPathEntry[];
+};
+
+function pathToPane(
+  node: PaneNode,
+  paneId: string
+): PanePath | null {
+  if (node.type === "leaf") {
+    return leafPaneIds(node).includes(paneId) ? { leaf: node, splits: [] } : null;
+  }
+  for (const side of [0, 1] as const) {
+    const found = pathToPane(node.children[side], paneId);
+    if (found) return { leaf: found.leaf, splits: [{ node, side }, ...found.splits] };
+  }
+  return null;
+}
+
+function sameDirectionRunPath(
+  splits: SplitPathEntry[],
+  dir: "row" | "col"
+): (0 | 1)[] | null {
+  let first = splits.length - 1;
+  if (first < 0 || splits[first].node.dir !== dir) return null;
+  while (first > 0 && splits[first - 1].node.dir === dir) first--;
+  return splits.slice(0, first).map(({ side }) => side);
+}
+
+function splitSliceCount(node: PaneNode, dir: "row" | "col"): number {
+  if (node.type !== "split" || node.dir !== dir) return 1;
+  return splitSliceCount(node.children[0], dir) + splitSliceCount(node.children[1], dir);
+}
+
+function balanceSplitRun(node: PaneNode, dir: "row" | "col"): PaneNode {
+  if (node.type !== "split" || node.dir !== dir) return node;
+  const firstCount = splitSliceCount(node.children[0], dir);
+  const secondCount = splitSliceCount(node.children[1], dir);
+  return {
+    ...node,
+    ratio: firstCount / (firstCount + secondCount),
+    children: [
+      balanceSplitRun(node.children[0], dir),
+      balanceSplitRun(node.children[1], dir),
+    ],
+  };
+}
+
+function balanceSplitRunAtPath(
+  node: PaneNode,
+  path: (0 | 1)[],
+  dir: "row" | "col"
+): PaneNode {
+  if (path.length === 0) return balanceSplitRun(node, dir);
+  if (node.type !== "split") return node;
+  const [side, ...rest] = path;
+  const children: [PaneNode, PaneNode] = [...node.children];
+  children[side] = balanceSplitRunAtPath(children[side], rest, dir);
+  return { ...node, children };
+}
+
 function updateRatio(
   node: PaneNode,
   splitId: string,
@@ -1435,6 +1501,11 @@ function createTabsStore() {
         target.layout = replaceLeaf(target.layout, paneId, (leafNode) =>
           makeSplit(dir, 0.5, [leafNode, leaf(pane.id)])
         );
+        const insertedPath = pathToPane(target.layout, pane.id);
+        const runPath = insertedPath && sameDirectionRunPath(insertedPath.splits, dir);
+        if (runPath) {
+          target.layout = balanceSplitRunAtPath(target.layout, runPath, dir);
+        }
         target.activePaneId = pane.id;
         syncTabFromPanes(target);
         newPaneId = pane.id;
@@ -1462,6 +1533,12 @@ function createTabsStore() {
         removedAtMutation =
           candidate.panes.find((pane) => pane.id === paneId) ?? null;
         if (!removedAtMutation) return;
+        const closingPath = pathToPane(candidate.layout, paneId);
+        const closingDir = closingPath?.splits.at(-1)?.node.dir;
+        const runPath =
+          closingPath && closingDir && leafPaneIds(closingPath.leaf).length === 1
+            ? sameDirectionRunPath(closingPath.splits, closingDir)
+            : null;
         candidate.panes = candidate.panes.filter(
           (pane) => pane.id !== paneId
         );
@@ -1478,6 +1555,13 @@ function createTabsStore() {
           new Set(candidate.panes.map((pane) => pane.id))
         );
         candidate.layout = pruned ?? leaf(candidate.panes[0]!.id);
+        if (runPath && closingDir) {
+          candidate.layout = balanceSplitRunAtPath(
+            candidate.layout,
+            runPath,
+            closingDir
+          );
+        }
         const stillAlive = collectPaneIds(candidate.layout);
         if (!stillAlive.includes(candidate.activePaneId ?? "")) {
           candidate.activePaneId = stillAlive[0] ?? null;

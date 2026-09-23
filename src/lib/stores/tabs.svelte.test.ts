@@ -59,6 +59,78 @@ afterEach(() => {
 });
 
 describe("tabs store persistence", () => {
+  for (const dir of ["row", "col"] as const) {
+    test(`keeps ${dir} panes equal after splitting and closing`, async () => {
+      const storage = new MemoryStorage();
+      installBrowserStorage(storage);
+      const { tabsStore } = await import(`./tabs.svelte.ts?equal-${dir}`);
+      const tabId = tabsStore.addLocalTab();
+      try {
+        const first = tabsStore.getTab(tabId)!.activePaneId!;
+        const second = (await tabsStore.splitPane(tabId, first, dir))!;
+        const third = (await tabsStore.splitPane(tabId, first, dir))!;
+        const layout = tabsStore.getTab(tabId)!.layout;
+        expect(layout).toMatchObject({
+          type: "split",
+          dir,
+          children: [{ type: "split", dir, ratio: 0.5 }, { type: "leaf", paneId: second }],
+        });
+        expect(layout.ratio).toBeCloseTo(2 / 3);
+        expect(JSON.parse(storage.getItem(STORAGE_KEY)!).tabs[0].layout.ratio).toBeCloseTo(2 / 3);
+        const { tabsStore: restored } = await import(`./tabs.svelte.ts?equal-${dir}-restore`);
+        expect(restored.getTab(tabId)!.layout.ratio).toBeCloseTo(2 / 3);
+
+        const fourth = (await tabsStore.splitPane(tabId, second, dir))!;
+        expect(tabsStore.getTab(tabId)!.layout.ratio).toBe(0.5);
+        await tabsStore.closePane(tabId, fourth);
+        expect(tabsStore.getTab(tabId)!.layout.ratio).toBeCloseTo(2 / 3);
+
+        await tabsStore.closePane(tabId, third);
+        expect(tabsStore.getTab(tabId)!.layout).toMatchObject({
+          type: "split",
+          dir,
+          ratio: 0.5,
+          children: [{ type: "leaf", paneId: first }, { type: "leaf", paneId: second }],
+        });
+
+        const fifth = (await tabsStore.splitPane(tabId, second, dir))!;
+        expect(tabsStore.getTab(tabId)!.layout.ratio).toBeCloseTo(1 / 3);
+        await tabsStore.closePane(tabId, first);
+        expect(tabsStore.getTab(tabId)!.layout).toMatchObject({
+          type: "split",
+          dir,
+          ratio: 0.5,
+          children: [{ type: "leaf", paneId: second }, { type: "leaf", paneId: fifth }],
+        });
+      } finally {
+        tabsStore.removeTab(tabId);
+      }
+    });
+  }
+
+  test("balances only the changed split direction", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte.ts?equal-mixed");
+    const tabId = tabsStore.addLocalTab();
+    try {
+      const first = tabsStore.getTab(tabId)!.activePaneId!;
+      const right = (await tabsStore.splitPane(tabId, first, "row"))!;
+      const rowId = tabsStore.getTab(tabId)!.layout.id;
+      tabsStore.updateSplitRatio(tabId, rowId, 0.7);
+      const lower = (await tabsStore.splitPane(tabId, first, "col"))!;
+      const bottom = (await tabsStore.splitPane(tabId, lower, "col"))!;
+      expect(tabsStore.getTab(tabId)!.layout.ratio).toBe(0.7);
+      expect(tabsStore.getTab(tabId)!.layout.children[0].ratio).toBeCloseTo(1 / 3);
+
+      await tabsStore.closePane(tabId, bottom);
+      expect(tabsStore.getTab(tabId)!.layout.ratio).toBe(0.7);
+      expect(tabsStore.getTab(tabId)!.layout.children[0].ratio).toBe(0.5);
+      expect(tabsStore.getTab(tabId)!.layout.children[1].paneId).toBe(right);
+    } finally {
+      tabsStore.removeTab(tabId);
+    }
+  });
+
   test("restores key-auth tabs without a stale runtime passphrase", async () => {
     const storage = new MemoryStorage();
     installBrowserStorage(storage);
