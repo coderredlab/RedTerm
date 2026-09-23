@@ -1678,6 +1678,67 @@ function createTabsStore() {
       });
     },
 
+    /** Move one whole split leaf into a new top-level tab. */
+    async movePaneToNewTab(
+      sourceTabId: string,
+      paneId: string,
+      insertIndex: number
+    ): Promise<string | null> {
+      let newTabId: string | null = null;
+      await withPreservedLayout([sourceTabId], () => {
+        const source = tabs.find((tab) => tab.id === sourceTabId);
+        if (!source || source.layout.type !== "split") return;
+        const path = pathToPane(source.layout, paneId);
+        if (!path) return;
+        const movedIds = new Set(leafPaneIds(path.leaf));
+        const movedPanes = source.panes.filter((pane) => movedIds.has(pane.id));
+        if (movedPanes.length === 0 || movedPanes.length === source.panes.length) return;
+        const movedDocuments = source.documents.filter((document) =>
+          movedIds.has(document.sourcePaneId)
+        );
+        const closingDir = path.splits.at(-1)?.node.dir;
+        const runPath = closingDir
+          ? sameDirectionRunPath(path.splits, closingDir)
+          : null;
+        const remainingPanes = source.panes.filter((pane) => !movedIds.has(pane.id));
+        const remainingLayout = pruneLayout(
+          source.layout,
+          new Set(remainingPanes.map((pane) => pane.id))
+        );
+        if (!remainingLayout) return;
+
+        source.panes = remainingPanes;
+        source.documents = source.documents.filter((document) =>
+          !movedIds.has(document.sourcePaneId)
+        );
+        source.layout = runPath && closingDir
+          ? balanceSplitRunAtPath(remainingLayout, runPath, closingDir)
+          : remainingLayout;
+        if (movedIds.has(source.activePaneId ?? "")) {
+          source.activePaneId = collectPaneIds(source.layout)[0] ?? null;
+        }
+        syncTabFromPanes(source);
+
+        const id = crypto.randomUUID();
+        const newTab = buildTab(
+          id,
+          movedPanes.map((pane) => ({ ...pane, tabId: id })),
+          path.leaf,
+          path.leaf.activeItem.kind === "terminal"
+            ? path.leaf.activeItem.id
+            : path.leaf.paneId,
+          undefined,
+          movedDocuments
+        );
+        const reordered = [...tabs];
+        reordered.splice(Math.max(0, Math.min(insertIndex, reordered.length)), 0, newTab);
+        tabs = reordered;
+        activeTabId = id;
+        newTabId = id;
+      });
+      return newTabId;
+    },
+
     /** Move a terminal tab or whole split leaf within its existing top-level tab. */
     async movePaneWithinTab(
       tabId: string,

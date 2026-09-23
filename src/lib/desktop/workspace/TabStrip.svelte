@@ -30,7 +30,16 @@
   }: Props = $props();
 
   let stripEl: HTMLDivElement | null = $state(null);
+  let tabsEl: HTMLDivElement | null = $state(null);
   let suppressClick = false;
+
+  onMount(() => {
+    const strip = tabsEl;
+    dragTargets.tabStrip = strip;
+    return () => {
+      if (dragTargets.tabStrip === strip) dragTargets.tabStrip = null;
+    };
+  });
 
   // macOS keeps the native traffic lights over this strip; Windows and
   // Linux render app-owned window controls instead.
@@ -277,7 +286,7 @@
     </svg>
   </button>
 
-  <div class="tabs" role="tablist" aria-label="Terminal sessions" data-tauri-drag-region>
+  <div class="tabs" role="tablist" aria-label="Terminal sessions" data-tauri-drag-region bind:this={tabsEl}>
     {#each tabsStore.tabs as tab, index (tab.id)}
       <div
         class="session-tab"

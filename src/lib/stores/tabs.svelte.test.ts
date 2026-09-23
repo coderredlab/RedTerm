@@ -131,6 +131,71 @@ describe("tabs store persistence", () => {
     }
   });
 
+  test("moves a whole pane with its terminal tabs and documents into a new top-level tab", async () => {
+    const storage = new MemoryStorage();
+    installBrowserStorage(storage);
+    const { tabsStore } = await import("./tabs.svelte.ts?detach-pane");
+    const sourceTabId = tabsStore.addLocalTab();
+    try {
+      const first = tabsStore.getTab(sourceTabId)!.activePaneId!;
+      const middle = (await tabsStore.splitPane(sourceTabId, first, "row"))!;
+      const last = (await tabsStore.splitPane(sourceTabId, middle, "row"))!;
+      const secondTerminal = (await tabsStore.addPaneTab(sourceTabId, middle))!;
+      tabsStore.setPaneConnected(sourceTabId, middle, "middle-session");
+      tabsStore.setPaneConnected(sourceTabId, secondTerminal, "second-session");
+      const documentId = (await tabsStore.openDocument(sourceTabId, secondTerminal, {
+        name: "notes.txt", path: "/notes.txt", size: 10,
+      }))!;
+      tabsStore.setDocumentLoaded(sourceTabId, documentId, "original", false);
+      tabsStore.setDocumentContent(sourceTabId, documentId, "unsaved");
+      await tabsStore.setActiveDocument(sourceTabId, documentId);
+
+      const newTabId = (await tabsStore.movePaneToNewTab(sourceTabId, middle, 0))!;
+      expect(tabsStore.tabs.map((tab) => tab.id)).toEqual([newTabId, sourceTabId]);
+      expect(tabsStore.activeTabId).toBe(newTabId);
+      expect(tabsStore.getTab(sourceTabId)!.layout).toMatchObject({
+        type: "split", dir: "row", ratio: 0.5,
+        children: [{ paneId: first }, { paneId: last }],
+      });
+      expect(tabsStore.getTab(sourceTabId)!.documents).toHaveLength(0);
+      expect(tabsStore.getTab(newTabId)!).toMatchObject({
+        layout: {
+          type: "leaf",
+          paneIds: [middle, secondTerminal],
+          documentIds: [documentId],
+          activeItem: { kind: "document", id: documentId },
+        },
+      });
+      expect(tabsStore.getTab(newTabId)!.panes.map((pane) =>
+        [pane.id, pane.tabId, pane.sessionId]
+      )).toEqual([
+        [middle, newTabId, "middle-session"],
+        [secondTerminal, newTabId, "second-session"],
+      ]);
+      expect(tabsStore.getTab(newTabId)!.documents[0]).toMatchObject({
+        id: documentId, sourcePaneId: secondTerminal, content: "unsaved", dirty: true,
+      });
+      expect(JSON.parse(storage.getItem(STORAGE_KEY)!).tabs.map((tab) => tab.id))
+        .toEqual([newTabId, sourceTabId]);
+    } finally {
+      tabsStore.removeTab(sourceTabId);
+      for (const tab of [...tabsStore.tabs]) tabsStore.removeTab(tab.id);
+    }
+  });
+
+  test("does not detach the only pane of a top-level tab", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte.ts?detach-only-pane");
+    const tabId = tabsStore.addLocalTab();
+    try {
+      const paneId = tabsStore.getTab(tabId)!.activePaneId!;
+      expect(await tabsStore.movePaneToNewTab(tabId, paneId, 1)).toBeNull();
+      expect(tabsStore.tabs.map((tab) => tab.id)).toEqual([tabId]);
+    } finally {
+      tabsStore.removeTab(tabId);
+    }
+  });
+
   test("restores key-auth tabs without a stale runtime passphrase", async () => {
     const storage = new MemoryStorage();
     installBrowserStorage(storage);

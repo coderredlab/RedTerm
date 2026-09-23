@@ -26,7 +26,17 @@ export const tabDrag = $state({
 /** Workspace element registered by DesktopApp for drop hit-testing. */
 export const dragTargets = {
   workspace: null as HTMLElement | null,
+  tabStrip: null as HTMLElement | null,
 };
+
+export function tabStripInsertIndexFromPoint(x: number, y: number): number | null {
+  const strip = dragTargets.tabStrip;
+  if (!strip) return null;
+  const rect = strip.getBoundingClientRect();
+  if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return null;
+  const tabs = Array.from(strip.querySelectorAll<HTMLElement>('[data-tab-id]'));
+  return insertionIndexFromPoint(tabs.map((tab) => tab.getBoundingClientRect()), x);
+}
 
 export function resetTabDrag() {
   tabDrag.active = false;

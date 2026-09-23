@@ -13,6 +13,7 @@
   import {
     paneTargetFromPoint,
     resetTabDrag,
+    tabStripInsertIndexFromPoint,
     tabDrag,
   } from "./drag-state.svelte";
   import { getWorkspaceApi } from "./workspace-context";
@@ -135,11 +136,16 @@
     const updateTarget = (x: number, y: number) => {
       tabDrag.pointerX = x;
       tabDrag.pointerY = y;
+      const insertIndex = wholePane && tabsStore.getTab(tabId)?.layout.type === "split"
+        ? tabStripInsertIndexFromPoint(x, y)
+        : null;
+      tabDrag.overTabStrip = insertIndex !== null;
+      tabDrag.insertIndex = insertIndex;
       const target = tabsStore.activeTabId === tabId ? paneTargetFromPoint(tabId, x, y) : null;
       const sameLeaf = node.type === "leaf" && target !== null && node.paneIds.includes(target.paneId);
-      tabDrag.paneTarget = sameLeaf && (wholePane ||
+      tabDrag.paneTarget = (insertIndex !== null || sameLeaf && (wholePane ||
         (target?.zone === "merge" && target.insertIndex === null) ||
-        (target?.zone !== "merge" && node.type === "leaf" && node.paneIds.length === 1)) ? null : target;
+        (target?.zone !== "merge" && node.type === "leaf" && node.paneIds.length === 1))) ? null : target;
     };
     const onMove = (moveEvent: PointerEvent) => {
       if (moveEvent.pointerId !== capturedPointerId || settled) return;

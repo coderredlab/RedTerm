@@ -787,6 +787,25 @@
 
   async function handlePaneDrop(tabId: string, paneId: string) {
     if (paneIsClosing(tabId, paneId) || tabsStore.activeTabId !== tabId) return;
+    const insertIndex = tabDrag.wholePane && tabDrag.overTabStrip
+      ? tabDrag.insertIndex
+      : null;
+    if (insertIndex !== null) {
+      await serializeLayoutSnapshotOperation(async () => {
+        await storeTabSnapshots([tabId]);
+        await tick();
+        if (paneIsClosing(tabId, paneId)) return;
+        const newTabId = await tabsStore.movePaneToNewTab(tabId, paneId, insertIndex);
+        if (!newTabId) return;
+        for (const pane of tabsStore.getTab(newTabId)?.panes ?? []) {
+          terminals.get(pane.id)?.syncSize();
+        }
+        for (const pane of tabsStore.getTab(tabId)?.panes ?? []) {
+          terminals.get(pane.id)?.syncSize();
+        }
+      });
+      return;
+    }
     const target = tabDrag.paneTarget ? { ...tabDrag.paneTarget } : null;
     const wholePane = tabDrag.wholePane;
     if (!target || target.tabId !== tabId) return;
