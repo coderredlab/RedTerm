@@ -479,8 +479,10 @@ function makeSplitWithId(
   first: PaneNode,
   second: PaneNode
 ): PaneNode {
+  const sliceCount = splitSliceCount(first, source.dir) + splitSliceCount(second, source.dir);
+  const minimumRatio = Math.min(0.1, 1 / sliceCount);
   const ratio = Number.isFinite(source.ratio)
-    ? Math.min(0.9, Math.max(0.1, source.ratio))
+    ? Math.min(1 - minimumRatio, Math.max(minimumRatio, source.ratio))
     : 0.5;
   return {
     type: "split",

@@ -106,6 +106,28 @@ describe("tabs store persistence", () => {
         tabsStore.removeTab(tabId);
       }
     });
+
+    test(`restores eleven equal ${dir} panes without changing their proportions`, async () => {
+      const storage = new MemoryStorage();
+      installBrowserStorage(storage);
+      const { tabsStore } = await import(`./tabs.svelte.ts?equal-eleven-${dir}`);
+      const tabId = tabsStore.addLocalTab();
+      try {
+        const first = tabsStore.getTab(tabId)!.activePaneId!;
+        let last = first;
+        for (let index = 1; index < 11; index++) {
+          last = (await tabsStore.splitPane(tabId, dir === "row" ? first : last, dir))!;
+        }
+        const expectedRatio = dir === "row" ? 10 / 11 : 1 / 11;
+        expect(tabsStore.getTab(tabId)!.layout.ratio).toBeCloseTo(expectedRatio);
+
+        const { tabsStore: restored } = await import(`./tabs.svelte.ts?equal-eleven-${dir}-restore`);
+        expect(restored.getTab(tabId)!.layout.ratio).toBeCloseTo(expectedRatio);
+        expect(restored.getTab(tabId)!.panes).toHaveLength(11);
+      } finally {
+        tabsStore.removeTab(tabId);
+      }
+    });
   }
 
   test("balances only the changed split direction", async () => {
