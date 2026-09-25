@@ -46,7 +46,6 @@
     sanitizeDownloadDialogFileName,
     localDownloadFile,
     localDownloadToDir,
-    localFileVersion,
     localReadFile,
     localSaveCopy,
     previewCacheAcquire,
@@ -281,7 +280,8 @@
     if (
       (editable || fileKind === "unknown") &&
       document.content !== null &&
-      document.savedContent !== null
+      document.savedContent !== null &&
+      (document.dirty || document.saveState === "saving" || (boundKind === "ssh" && !document.sourceSessionId))
     ) {
       if (fileKind === "unknown") fileKind = "text";
       currentContent = document.content;
@@ -366,14 +366,8 @@
       if (boundKind === "ssh" && !document.sourceSessionId) {
         throw new Error("The SSH session for this file is no longer available.");
       }
-      if (boundKind === "local") {
-        const version = await localFileVersion(boundPath);
-        if (token !== loadToken || mode !== "preview") return;
-        if (version !== null && version === document.fileVersion) return;
-      }
-
-      // SFTP v3 reports second-resolution mtime: equal size/version cannot
-      // prove equal bytes, so an explicit remote refresh must read the file.
+      // An explicit refresh must compare bytes: metadata can remain unchanged
+      // after a local rewrite or a same-second SFTP update.
       const content = await readInline();
       if (
         token !== loadToken || mode !== "preview" || document.dirty ||
@@ -693,6 +687,7 @@
 
   $effect(() => {
     document.id;
+    document.reopenRevision;
     document.sourceSessionId;
     document.cachedLocalPath;
     const action = cachedPathChangeAction;

@@ -705,32 +705,6 @@ pub async fn local_list_dir(path: String) -> Result<Vec<SftpDirEntry>, String> {
 }
 
 #[tauri::command]
-pub async fn local_file_version(path: String) -> Result<Option<String>, String> {
-    let scoped = ensure_within_home(Path::new(&path))?;
-    let metadata = tokio::fs::metadata(&scoped)
-        .await
-        .map_err(|e| e.to_string())?;
-    if !metadata.file_type().is_file() {
-        return Err("Not a regular file".to_string());
-    }
-    #[cfg(windows)]
-    {
-        let file = tokio::fs::File::open(&scoped)
-            .await
-            .map_err(|e| e.to_string())?;
-        let opened_metadata = file.metadata().await.map_err(|e| e.to_string())?;
-        if !opened_metadata.is_file() {
-            return Err("Not a regular file".to_string());
-        }
-        Ok(windows_local_version_from_file(&file, &opened_metadata))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(local_version_from_metadata(&metadata))
-    }
-}
-
-#[tauri::command]
 pub async fn local_read_file(path: String) -> Result<SftpFileContent, String> {
     use base64::Engine as _;
 
@@ -2075,7 +2049,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_preview_revision_detects_same_size_rewrite() {
+    async fn local_preview_read_returns_same_size_rewrite() {
         use base64::Engine as _;
 
         let home = local_home_dir_path().expect("test home directory");
@@ -2088,24 +2062,15 @@ mod tests {
         let first = local_read_file(path_text.clone())
             .await
             .expect("initial preview");
-        let unchanged = local_file_version(path_text.clone())
-            .await
-            .expect("stat unchanged file");
 
         std::fs::write(&path, b"later").expect("rewrite same-size file");
         std::fs::File::open(&path)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
             .expect("set known modified time");
-        let changed = local_file_version(path_text.clone())
-            .await
-            .expect("stat changed file");
         let refreshed = local_read_file(path_text).await.expect("changed preview");
         std::fs::remove_file(&path).expect("remove test file");
 
-        assert_eq!(first.version, unchanged);
-        assert_ne!(first.version, changed);
-        assert_eq!(refreshed.version, changed);
         assert_eq!(refreshed.size, first.size);
         assert_eq!(
             base64::engine::general_purpose::STANDARD
@@ -2116,7 +2081,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_preview_revision_detects_atomic_replacement_with_preserved_mtime() {
+    async fn local_preview_read_returns_atomic_replacement_with_preserved_mtime() {
         let home = local_home_dir_path().expect("test home directory");
         let path = home.join(format!(".redterm-revision-{}", uuid::Uuid::new_v4()));
         let replacement = home.join(format!(".redterm-revision-{}", uuid::Uuid::new_v4()));
@@ -2136,9 +2101,6 @@ mod tests {
             .set_modified(fixed_time)
             .expect("preserve replacement mtime");
         std::fs::rename(&replacement, &path).expect("atomically replace original");
-        let version = local_file_version(path_text.clone())
-            .await
-            .expect("replacement version");
         let replaced = local_read_file(path_text)
             .await
             .expect("replacement preview");
@@ -2146,8 +2108,6 @@ mod tests {
         std::fs::remove_file(&path).expect("remove replacement");
         assert_eq!(metadata.len(), original.size);
         assert_eq!(metadata.modified().unwrap(), fixed_time);
-        assert_ne!(original.version, version);
-        assert_eq!(replaced.version, version);
         assert_eq!(replaced.content_base64, "bGF0ZXI=");
     }
     #[tokio::test]
@@ -2406,9 +2366,10 @@ mod tests {
         assert_ne!(saved.path, path_text);
         assert_eq!(
             saved.version,
-            local_file_version(saved.path.clone())
+            local_read_file(saved.path.clone())
                 .await
-                .expect("saved copy version")
+                .expect("read saved copy")
+                .version
         );
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
         assert_eq!(tokio::fs::read(&saved.path).await.unwrap(), b"mine");
@@ -2457,11 +2418,11 @@ mod tests {
         assert_eq!(Path::new(&first.path).parent(), path.parent());
         assert_eq!(
             first.version,
-            local_file_version(first.path.clone()).await.unwrap()
+            local_read_file(first.path.clone()).await.unwrap().version
         );
         assert_eq!(
             second.version,
-            local_file_version(second.path.clone()).await.unwrap()
+            local_read_file(second.path.clone()).await.unwrap().version
         );
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
         assert_eq!(tokio::fs::read(&first.path).await.unwrap(), b"first");
@@ -2701,7 +2662,7 @@ mod windows_revision_tests {
     use windows::Win32::Storage::FileSystem::SetFileTime;
 
     #[tokio::test]
-    async fn local_preview_revision_detects_in_place_rewrite_with_restored_mtime() {
+    async fn local_preview_read_returns_in_place_rewrite_with_restored_mtime() {
         let home = local_home_dir_path().expect("test home directory");
         let path = home.join(format!(".redterm-revision-{}", uuid::Uuid::new_v4()));
         let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
@@ -2726,9 +2687,6 @@ mod windows_revision_tests {
             .set_modified(fixed_time)
             .expect("restore original mtime");
         let current_metadata = std::fs::metadata(&path).unwrap();
-        let current = local_file_version(path_text.clone())
-            .await
-            .expect("refresh preview version");
         let refreshed = local_read_file(path_text).await.expect("updated preview");
         std::fs::remove_file(path).expect("remove test file");
         assert_eq!(original_metadata.len(), current_metadata.len());
@@ -2740,16 +2698,12 @@ mod windows_revision_tests {
             original_metadata.creation_time(),
             current_metadata.creation_time()
         );
-        assert_ne!(
-            original.version, current,
-            "in-place rewrite must invalidate Refresh"
-        );
-        assert_eq!(refreshed.version, current);
+        assert_eq!(original.content_base64, "Zmlyc3Q=");
         assert_eq!(refreshed.content_base64, "bGF0ZXI=");
     }
 
     #[tokio::test]
-    async fn local_preview_revision_detects_replacement_with_identical_legacy_metadata() {
+    async fn local_preview_read_returns_replacement_with_identical_legacy_metadata() {
         let home = local_home_dir_path().expect("test home directory");
         let path = home.join(format!(".redterm-revision-{}", uuid::Uuid::new_v4()));
         let replacement = home.join(format!(".redterm-revision-{}", uuid::Uuid::new_v4()));
@@ -2795,26 +2749,23 @@ mod windows_revision_tests {
         );
 
         std::fs::rename(&replacement, &path).expect("atomically replace original");
-        let replaced = local_file_version(path_text.clone())
-            .await
-            .expect("replacement revision");
         let preview = local_read_file(path_text.clone())
             .await
             .expect("replacement preview");
-        assert_ne!(original.version, replaced);
-        assert_eq!(preview.version, replaced);
+        assert_eq!(original.content_base64, "Zmlyc3Q=");
         assert_eq!(preview.content_base64, "bGF0ZXI=");
 
         let saved = local_save_copy(path_text.clone(), "saved".into(), "later".into())
             .await
             .expect("save distinct revision");
         assert_ne!(saved.path, path_text);
-        assert_ne!(saved.version, replaced);
+        assert_ne!(saved.version, preview.version);
         assert_eq!(
             saved.version,
-            local_file_version(saved.path.clone())
+            local_read_file(saved.path.clone())
                 .await
-                .expect("saved revision")
+                .expect("read saved copy")
+                .version
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"later");
         assert_eq!(std::fs::read(&saved.path).unwrap(), b"saved");

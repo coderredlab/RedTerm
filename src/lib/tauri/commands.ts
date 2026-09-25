@@ -571,10 +571,6 @@ export async function localListDir(path: string): Promise<SftpDirEntry[]> {
   return invoke<SftpDirEntry[]>("local_list_dir", { path });
 }
 
-export async function localFileVersion(path: string): Promise<string | null> {
-  return invoke<string | null>("local_file_version", { path });
-}
-
 export async function localReadFile(path: string): Promise<SftpFileContent> {
   return invoke<SftpFileContent>("local_read_file", { path });
 }

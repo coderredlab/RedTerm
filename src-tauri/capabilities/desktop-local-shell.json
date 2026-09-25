@@ -18,7 +18,6 @@
     "allow-local-home-dir",
     "allow-local-list-dir",
     "allow-local-read-file",
-    "allow-local-file-version",
     "allow-local-save-copy",
     "allow-local-create-dir",
     "allow-local-create-file",

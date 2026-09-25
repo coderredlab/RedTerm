@@ -42,10 +42,10 @@ use commands::{
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use commands::{
     local_create_dir, local_create_file, local_download_file, local_download_folder,
-    local_download_to_dir, local_file_version, local_home_dir, local_list_dir, local_read_file,
-    local_remove_path, local_save_copy, local_shell_disconnect, local_shell_get_output,
-    local_shell_resize, local_shell_start, local_shell_write, local_upload, sftp_download_folder,
-    sftp_upload, DesktopClipboardState, LocalShellManager,
+    local_download_to_dir, local_home_dir, local_list_dir, local_read_file, local_remove_path,
+    local_save_copy, local_shell_disconnect, local_shell_get_output, local_shell_resize,
+    local_shell_start, local_shell_write, local_upload, sftp_download_folder, sftp_upload,
+    DesktopClipboardState, LocalShellManager,
 };
 
 use storage::{
@@ -207,8 +207,6 @@ pub fn run() {
             local_home_dir,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_list_dir,
-            #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            local_file_version,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_read_file,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]

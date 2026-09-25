@@ -1,5 +1,6 @@
 import { tick } from "svelte";
 import type { AuthConfig, SavedFileCopy } from "$lib/tauri/commands";
+import { previewKindOf } from "$lib/desktop/workspace/file-kinds";
 
 /** Connection target owned by a single terminal pane. */
 export interface PaneConnection {
@@ -50,6 +51,8 @@ export interface PaneDocument {
   cachedLocalPath: string | null;
   hasUtf8Bom: boolean;
   fileVersion: string | null;
+  /** Explicitly reopening a clean document rereads its source even if its view stays mounted. */
+  reopenRevision: number;
 }
 
 function documentTargetMatchesPane(
@@ -1133,6 +1136,7 @@ function createTabsStore() {
         cachedLocalPath: null,
         hasUtf8Bom: false,
         fileVersion: null,
+        reopenRevision: 0,
       };
       const existingOwner = existing
         ? tab.panes.find((pane) => pane.id === existing.sourcePaneId)
@@ -1150,17 +1154,25 @@ function createTabsStore() {
         if (!target) return;
         if (!existing) {
           target.documents = [...target.documents, document];
-        } else if (retargetExisting) {
+        } else {
           const targetDocument = target.documents.find(
             (candidate) => candidate.id === existing.id
           );
           if (!targetDocument) return;
-          target.layout = removeDocumentsFromLayout(
-            target.layout,
-            new Set([targetDocument.id])
-          );
-          targetDocument.sourcePaneId = sourcePaneId;
-          targetDocument.sourceSessionId = source.sessionId;
+          if (retargetExisting) {
+            target.layout = removeDocumentsFromLayout(
+              target.layout,
+              new Set([targetDocument.id])
+            );
+            targetDocument.sourcePaneId = sourcePaneId;
+            targetDocument.sourceSessionId = source.sessionId;
+          }
+          if (!targetDocument.dirty && targetDocument.saveState !== "saving") {
+            const kind = previewKindOf(targetDocument.name);
+            if (kind === "markdown" || kind === "code" || kind === "text" || kind === "unknown") {
+              targetDocument.reopenRevision += 1;
+            }
+          }
         }
         target.layout = replaceLeaf(target.layout, targetPaneId, (leafNode) =>
           leaf(

@@ -50,7 +50,6 @@ fn main() {
             "local_home_dir",
             "local_list_dir",
             "local_read_file",
-            "local_file_version",
             "local_save_copy",
             "local_create_dir",
             "local_create_file",
