@@ -1259,7 +1259,6 @@
   .entry-main {
     flex: 1;
     min-width: 0;
-    min-height: 28px;
     display: grid;
     grid-template-columns: 18px minmax(0, 1fr) auto;
     align-items: center;
@@ -1271,6 +1270,11 @@
     font-size: 11px;
     text-align: left;
     cursor: pointer;
+    padding: 0;
+  }
+
+  .entry:not(.dir) .entry-main {
+    min-height: 28px;
     padding: 4px 0 4px 8px;
   }
 
