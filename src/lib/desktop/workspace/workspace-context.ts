@@ -17,6 +17,9 @@ export interface WorkspaceApi {
   activateDocument(tabId: string, documentId: string): void;
   /** Commit a pane drag that ended over the workspace. */
   paneDragDropped(tabId: string, paneId: string): void;
+  documentDragDropped(tabId: string, documentId: string): void;
+  moveDocument(tabId: string, documentId: string, targetPaneId: string,
+    dir: "row" | "col" | "merge", side: "before" | "after", insertIndex?: number): Promise<void>;
 }
 
 const WORKSPACE_KEY = Symbol("redterm-desktop-workspace");

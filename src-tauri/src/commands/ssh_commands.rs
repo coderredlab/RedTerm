@@ -1294,6 +1294,7 @@ pub(crate) fn make_remove_progress_emitter(
 pub struct SftpFileContent {
     pub path: String,
     pub content_base64: String,
+    pub version: Option<String>,
     pub size: u64,
 }
 
@@ -1321,16 +1322,69 @@ fn local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
         .app_cache_dir()
         .map_err(|e| format!("Failed to resolve app cache dir: {}", e))?
         .join("sftp-preview");
-
-    std::fs::create_dir_all(&base_dir)
-        .map_err(|e| format!("Failed to prepare preview cache dir: {}", e))?;
+    protect_local_sftp_preview_dir(&base_dir)?;
     Ok(base_dir)
+}
+
+fn protect_local_sftp_preview_dir(base_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(&base_dir)
+        .map_err(|e| format!("Failed to prepare preview cache dir: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(&base_dir)
+            .map_err(|e| format!("Failed to inspect preview cache dir: {e}"))?;
+        if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err("Preview cache directory must be owned by this account".to_string());
+        }
+        std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("Failed to protect preview cache dir: {e}"))?;
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe extern "C" {
+                fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+                fn acl_set_fd_np(
+                    fd: libc::c_int,
+                    acl: *mut libc::c_void,
+                    kind: libc::c_int,
+                ) -> libc::c_int;
+                fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+            }
+            let directory = std::fs::File::open(&base_dir)
+                .map_err(|e| format!("Failed to open preview cache dir: {e}"))?;
+            let empty = unsafe { acl_init(0) };
+            if empty.is_null() {
+                return Err(format!(
+                    "Failed to clear preview cache ACL: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let result = unsafe { acl_set_fd_np(directory.as_raw_fd(), empty, 0x100) };
+            let error = (result == -1).then(std::io::Error::last_os_error);
+            unsafe { acl_free(empty) };
+            if let Some(error) = error {
+                return Err(format!("Failed to clear preview cache ACL: {error}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_local_sftp_preview_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base_dir = local_sftp_preview_dir(app)?;
     prune_stale_sftp_previews(&base_dir);
     Ok(base_dir)
+}
+pub(crate) async fn create_private_preview_file(path: &Path) -> Result<tokio::fs::File, String> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(path)
+        .await
+        .map_err(|error| format!("Failed to create preview download file: {error}"))
 }
 
 fn resolve_existing_file_within(
@@ -1549,29 +1603,30 @@ pub async fn sftp_read_file(
     use base64::Engine as _;
 
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
-    let data = connection
-        .read_file_via_sftp(&path, MAX_SFTP_PREVIEW_READ_BYTES)
+    let (data, version) = connection
+        .read_file_with_version_via_sftp(&path, MAX_SFTP_PREVIEW_READ_BYTES)
         .await
         .map_err(|e| e.to_string())?;
     let size = data.len() as u64;
     Ok(SftpFileContent {
         path,
         content_base64: base64::engine::general_purpose::STANDARD.encode(&data),
+        version,
         size,
     })
 }
 
 #[tauri::command]
-pub async fn sftp_write_file(
+pub async fn sftp_save_copy(
     session_manager: State<'_, Arc<SessionManager>>,
     session_id: String,
     path: String,
     content: String,
     expected_content: String,
-) -> Result<(), String> {
+) -> Result<crate::SavedFileCopy, String> {
     let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
     connection
-        .write_file_via_sftp(
+        .save_copy_via_sftp(
             &path,
             content.as_bytes(),
             expected_content.as_bytes(),
@@ -1609,9 +1664,7 @@ pub async fn sftp_download_file(
         .await
         .unwrap_or(None);
     let on_progress = make_download_progress_emitter(app.clone(), remote_path.clone(), total);
-    let mut part_file = tokio::fs::File::create(&part_path)
-        .await
-        .map_err(|error| format!("Failed to create preview download file: {error}"))?;
+    let mut part_file = create_private_preview_file(&part_path).await?;
     let size = match connection
         .download_file_via_sftp(
             &remote_path,
@@ -2126,6 +2179,61 @@ pub async fn sftp_download_to_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_cache_protects_existing_directory_and_local_or_remote_stage() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("redterm-preview-private-{}", Uuid::new_v4()));
+        let base = root.join("sftp-preview");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(target_os = "macos")]
+        assert!(std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow read,file_inherit"])
+            .arg(&base)
+            .status()
+            .unwrap()
+            .success());
+        protect_local_sftp_preview_dir(&base).unwrap();
+        assert_eq!(
+            std::fs::metadata(&base).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe extern "C" {
+                fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+            }
+            let directory = std::fs::File::open(&base).unwrap();
+            assert!(
+                unsafe { acl_get_fd_np(directory.as_raw_fd(), 0x100) }.is_null(),
+                "inherited read ACL must be removed before storing private previews"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENOENT)
+            );
+        }
+        let part = base.join("file.part");
+        let mut file = create_private_preview_file(&part).await.unwrap();
+        use tokio::io::AsyncWriteExt;
+        file.write_all(b"private contents").await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(&part).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(std::fs::read(&part).unwrap(), b"private contents");
+        let link = root.join("linked-cache");
+        std::os::unix::fs::symlink(&base, &link).unwrap();
+        protect_local_sftp_preview_dir(&link)
+            .expect_err("symlink cache root must never be trusted");
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn preview_cache_scope_accepts_only_files_inside_base() {

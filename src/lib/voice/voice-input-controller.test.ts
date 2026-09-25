@@ -7,12 +7,21 @@ function decode(bytes: Uint8Array): string {
   return new TextDecoder().decode(bytes);
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 describe("voice input popup contract", () => {
   let writes: Array<{ sessionId: string; text: string }>;
   let bridgeCalls: string[];
   let voiceEvent: ((event: VoiceInputEvent) => void) | undefined;
 
-  function makeController(activeSessionId: string | null = "session-1") {
+  function makeController(
+    activeSessionId: string | null = "session-1",
+    sendFailure: () => boolean = () => false,
+  ) {
     writes = [];
     bridgeCalls = [];
     voiceEvent = undefined;
@@ -20,6 +29,7 @@ describe("voice input popup contract", () => {
     return createVoiceInputController({
       getActiveSessionId: () => activeSessionId,
       writeSsh: async (sessionId: string, data: Uint8Array) => {
+        if (sendFailure()) throw new Error("SSH session closed");
         writes.push({ sessionId, text: decode(data) });
       },
       bridge: {
@@ -92,6 +102,30 @@ describe("voice input popup contract", () => {
     expect(controller.state.open).toBe(false);
   });
 
+  test("rejected SSH voice send stops capture, keeps text, and permits a later retry", async () => {
+    let disconnected = true;
+    const controller = makeController("session-1", () => disconnected);
+    await controller.open();
+    voiceEvent?.({ kind: "final", transcript: "dictated command" });
+
+    await controller.send();
+    expect(bridgeCalls).toEqual(["start:ko-KR", "stop", "unlisten"]);
+    expect(controller.state.open).toBe(true);
+    expect(controller.state.status).toBe("error");
+    expect(controller.state.errorMessage).toBe("Unable to send voice text: SSH session closed");
+    expect(controller.displayText).toBe("dictated command");
+    expect(writes).toEqual([]);
+    expect(controller.canRotateLanguage).toBe(false);
+    await controller.rotateLanguage();
+    expect(bridgeCalls).toEqual(["start:ko-KR", "stop", "unlisten"]);
+    expect(controller.displayText).toBe("dictated command");
+
+    disconnected = false;
+    await controller.send();
+    expect(writes).toEqual([{ sessionId: "session-1", text: "dictated command" }]);
+    expect(controller.state.open).toBe(false);
+  });
+
   test("cancel discards recognized text without writing SSH", async () => {
     const controller = makeController();
 
@@ -121,6 +155,8 @@ describe("voice input popup contract", () => {
     expect(controller.state.transcript).toBe("hello ");
     expect(controller.state.partialTranscript).toBe("");
     expect(bridgeCalls).toEqual(["start:ko-KR", "cancel", "start:en-US"]);
+    voiceEvent?.({ kind: "final", transcript: "again" });
+    expect(controller.displayText).toBe("hello again");
   });
 
   test("native start failure surfaces in popup instead of staying listening", async () => {
@@ -242,5 +278,169 @@ describe("voice input popup contract", () => {
     expect(writes).toEqual([]);
     expect(controller.state.open).toBe(true);
     expect(controller.state.errorMessage).toBe("No active SSH session");
+  });
+  test("recognition controls become visible spaces before preview and the SSH write", async () => {
+    const controller = makeController();
+    await controller.open();
+    voiceEvent?.({ kind: "partial", transcript: "pwd\r\n\u001b[31m\u009b" });
+    expect(controller.displayText).toBe("pwd   [31m ");
+    expect(writes).toEqual([]);
+
+    voiceEvent?.({ kind: "final", transcript: "echo hello\nworld\u2028" });
+    expect(controller.displayText).toBe("echo hello world ");
+    await controller.send();
+    expect(writes).toEqual([{ sessionId: "session-1", text: "echo hello world " }]);
+  });
+
+  test("send rejects control characters injected into visible state instead of sending hidden PTY input", async () => {
+    const controller = makeController();
+    await controller.open();
+    controller.state.transcript = "pwd\rnext";
+    await controller.send();
+    expect(writes).toEqual([]);
+    expect(controller.state.errorMessage).toBe("Voice text contains unsupported control characters");
+  });
+
+  test("Cancel during permission check prevents a late microphone start", async () => {
+    const entered = deferred<void>();
+    const permission = deferred<{ microphone: string }>();
+    const calls: string[] = [];
+    const controller = createVoiceInputController({
+      getActiveSessionId: () => "session-1",
+      writeSsh: async () => undefined,
+      bridge: {
+        listen: async () => () => calls.push("unlisten"),
+        checkPermissions: () => { entered.resolve(); return permission.promise; },
+        requestPermissions: async () => ({ microphone: "granted" }),
+        listLanguages: async () => [{ tag: "en-US", label: "English" }],
+        start: async () => calls.push("start"),
+        stop: async () => calls.push("stop"),
+        cancel: async () => calls.push("cancel"),
+      },
+    });
+
+    const observed: string[] = [];
+    controller.onChange(() => observed.push(controller.state.status));
+    const opening = controller.open();
+    await entered.promise;
+    expect(observed).toEqual(["preparing"]);
+    await controller.cancel();
+    permission.resolve({ microphone: "granted" });
+    await opening;
+    expect(controller.state.open).toBe(false);
+    expect(controller.state.status).toBe("idle");
+    expect(calls).toEqual(["cancel", "unlisten"]);
+  });
+
+  test("reopen cannot rotate into a stale language before permission is granted", async () => {
+    const waitingForPermission = deferred<void>();
+    const permission = deferred<{ microphone: string }>();
+    const calls: string[] = [];
+    let checks = 0;
+    const controller = createVoiceInputController({
+      getActiveSessionId: () => "session-1",
+      writeSsh: async () => undefined,
+      bridge: {
+        listen: async () => () => calls.push("unlisten"),
+        checkPermissions: () => {
+          if (++checks === 1) return Promise.resolve({ microphone: "granted" });
+          waitingForPermission.resolve();
+          return permission.promise;
+        },
+        requestPermissions: async () => ({ microphone: "denied" }),
+        listLanguages: async () => [
+          { tag: "en-US", label: "English" },
+          { tag: "ko-KR", label: "Korean" },
+        ],
+        start: async (tag) => calls.push("start:" + tag),
+        stop: async () => calls.push("stop"),
+        cancel: async () => calls.push("cancel"),
+      },
+    });
+
+    await controller.open();
+    expect(controller.canRotateLanguage).toBe(true);
+    await controller.cancel();
+    const reopened = controller.open();
+    await waitingForPermission.promise;
+    expect(controller.state.languages).toEqual([]);
+    expect(controller.canRotateLanguage).toBe(false);
+    await controller.rotateLanguage();
+    permission.resolve({ microphone: "denied" });
+    await reopened;
+    expect(calls.filter((call) => call.startsWith("start:"))).toEqual(["start:en-US"]);
+    expect(controller.state.status).toBe("error");
+    expect(controller.state.errorMessage).toBe("Microphone permission is required");
+  });
+
+  test("a delayed microphone start is cancelled before a new popup starts listening", async () => {
+    const started = deferred<void>();
+    const release = deferred<void>();
+    const calls: string[] = [];
+    const callbacks: Array<(event: VoiceInputEvent) => void> = [];
+    let starts = 0;
+    const controller = createVoiceInputController({
+      getActiveSessionId: () => "session-1",
+      writeSsh: async () => undefined,
+      bridge: {
+        listen: async (callback) => { callbacks.push(callback); return () => calls.push("unlisten"); },
+        checkPermissions: async () => ({ microphone: "granted" }),
+        requestPermissions: async () => ({ microphone: "granted" }),
+        listLanguages: async () => [{ tag: "en-US", label: "English" }],
+        start: async () => {
+          calls.push("start");
+          if (++starts === 1) { started.resolve(); await release.promise; }
+        },
+        stop: async () => calls.push("stop"),
+        cancel: async () => calls.push("cancel"),
+      },
+    });
+
+    const first = controller.open();
+    await started.promise;
+    const cancelling = controller.cancel();
+    const reopened = controller.open();
+    release.resolve();
+    await Promise.all([first, cancelling, reopened]);
+    expect(calls).toEqual(["start", "cancel", "unlisten", "start"]);
+    callbacks[0]({ kind: "final", transcript: "stale" });
+    callbacks[1]({ kind: "final", transcript: "current" });
+    expect(controller.displayText).toBe("current");
+    expect(controller.state.open).toBe(true);
+  });
+
+  test("Cancel during language rotation prevents the queued restart", async () => {
+    const rotating = deferred<void>();
+    const release = deferred<void>();
+    const calls: string[] = [];
+    let cancels = 0;
+    const controller = createVoiceInputController({
+      getActiveSessionId: () => "session-1",
+      writeSsh: async () => undefined,
+      bridge: {
+        listen: async () => () => calls.push("unlisten"),
+        checkPermissions: async () => ({ microphone: "granted" }),
+        requestPermissions: async () => ({ microphone: "granted" }),
+        listLanguages: async () => [
+          { tag: "en-US", label: "English" },
+          { tag: "ko-KR", label: "Korean" },
+        ],
+        start: async (tag) => calls.push("start:" + tag),
+        stop: async () => calls.push("stop"),
+        cancel: async () => {
+          calls.push("cancel");
+          if (++cancels === 1) { rotating.resolve(); await release.promise; }
+        },
+      },
+    });
+
+    await controller.open();
+    const rotation = controller.rotateLanguage();
+    await rotating.promise;
+    const cancelling = controller.cancel();
+    release.resolve();
+    await Promise.all([rotation, cancelling]);
+    expect(calls).toEqual(["start:en-US", "cancel", "cancel", "unlisten"]);
+    expect(controller.state.open).toBe(false);
   });
 });

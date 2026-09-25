@@ -1,5 +1,5 @@
 import { tick } from "svelte";
-import type { AuthConfig } from "$lib/tauri/commands";
+import type { AuthConfig, SavedFileCopy } from "$lib/tauri/commands";
 
 /** Connection target owned by a single terminal pane. */
 export interface PaneConnection {
@@ -46,8 +46,10 @@ export interface PaneDocument {
   savedContent: string | null;
   saveState: "idle" | "saving" | "saved" | "error";
   saveError: string;
+  savedCopyNotice: string;
   cachedLocalPath: string | null;
   hasUtf8Bom: boolean;
+  fileVersion: string | null;
 }
 
 function documentTargetMatchesPane(
@@ -92,6 +94,9 @@ function copyAvailableDocumentState(
     target.saveState = source.saveState;
     target.saveError = source.saveError;
     target.hasUtf8Bom = source.hasUtf8Bom;
+  }
+  if (!target.savedCopyNotice && source.savedCopyNotice) {
+    target.savedCopyNotice = source.savedCopyNotice;
   }
 }
 
@@ -367,6 +372,27 @@ function pathToPane(
     if (found) return { leaf: found.leaf, splits: [{ node, side }, ...found.splits] };
   }
   return null;
+}
+function pathToDocument(node: PaneNode, documentId: string): PanePath | null {
+  if (node.type === "leaf") {
+    return node.documentIds.includes(documentId) ? { leaf: node, splits: [] } : null;
+  }
+  for (const side of [0, 1] as const) {
+    const found = pathToDocument(node.children[side], documentId);
+    if (found) return { leaf: found.leaf, splits: [{ node, side }, ...found.splits] };
+  }
+  return null;
+}
+
+function documentsClosedWithPane(tab: Tab, paneId: string): PaneDocument[] {
+  const owner = pathToPane(tab.layout, paneId)?.leaf;
+  if (!owner) return [];
+  const lastTerminal = owner.paneIds.length === 1;
+  return tab.documents.filter((document) =>
+    (owner.documentIds.includes(document.id) &&
+      (lastTerminal || document.sourcePaneId === paneId)) ||
+    (document.sourceKind === "ssh" && document.sourcePaneId === paneId)
+  );
 }
 
 function sameDirectionRunPath(
@@ -1103,8 +1129,10 @@ function createTabsStore() {
         savedContent: null,
         saveState: "idle",
         saveError: "",
+        savedCopyNotice: "",
         cachedLocalPath: null,
         hasUtf8Bom: false,
+        fileVersion: null,
       };
       const existingOwner = existing
         ? tab.panes.find((pane) => pane.id === existing.sourcePaneId)
@@ -1114,7 +1142,7 @@ function createTabsStore() {
       );
       const targetPaneId = retargetExisting
         ? sourcePaneId
-        : existing?.sourcePaneId ?? sourcePaneId;
+        : (existing && pathToDocument(tab.layout, existing.id)?.leaf.paneId) ?? existing?.sourcePaneId ?? sourcePaneId;
       let documentId: string | null = null;
 
       await withPreservedLayout([tabId], () => {
@@ -1153,23 +1181,16 @@ function createTabsStore() {
 
     async setActiveDocument(tabId: string, documentId: string) {
       const tab = tabs.find((candidate) => candidate.id === tabId);
-      const document = tab?.documents.find((candidate) => candidate.id === documentId);
-      if (!document) return;
+      if (!tab?.documents.some((document) => document.id === documentId)) return;
       await withPreservedLayout([tabId], () => {
         const target = tabs.find((candidate) => candidate.id === tabId);
-        if (!target) return;
-        target.layout = replaceLeaf(
-          target.layout,
-          document.sourcePaneId,
-          (leafNode) =>
-            leaf(
-              document.sourcePaneId,
-              leafPaneIds(leafNode),
-              leafNode.documentIds,
-              { kind: "document", id: document.id }
-            )
+        const location = target && pathToDocument(target.layout, documentId);
+        if (!target || !location) return;
+        target.layout = replaceLeaf(target.layout, location.leaf.paneId, (leafNode) =>
+          leaf(leafNode.paneId, leafPaneIds(leafNode), leafNode.documentIds,
+            { kind: "document", id: documentId })
         );
-        target.activePaneId = document.sourcePaneId;
+        target.activePaneId = location.leaf.paneId;
         syncTabFromPanes(target);
       });
     },
@@ -1184,37 +1205,29 @@ function createTabsStore() {
 
       await withPreservedLayout([tabId], () => {
         const target = tabs.find((candidate) => candidate.id === tabId);
-        if (!target) return;
+        const location = target && pathToDocument(target.layout, documentId);
+        if (!target || !location) return;
         target.documents = target.documents.filter((candidate) => candidate.id !== documentId);
-        let alignedPaneId: string | null = null;
-        target.layout = replaceLeaf(
-          target.layout,
-          document.sourcePaneId,
-          (leafNode) => {
-            const paneIds = leafPaneIds(leafNode);
-            const wasFocused =
-              target.activePaneId !== null && paneIds.includes(target.activePaneId);
-            const documentIds = leafNode.documentIds.filter((id) => id !== documentId);
-            const activeItem =
-              leafNode.activeItem.kind === "document" &&
-              leafNode.activeItem.id === documentId
-                ? documentIds.length > 0
-                  ? { kind: "document" as const, id: documentIds.at(-1)! }
-                  : { kind: "terminal" as const, id: document.sourcePaneId }
-                : leafNode.activeItem;
-            const activePaneId =
-              activeItem.kind === "terminal"
-                ? activeItem.id
-                : target.documents.find((candidate) => candidate.id === activeItem.id)
-                    ?.sourcePaneId ?? leafNode.paneId;
-            if (wasFocused) alignedPaneId = activePaneId;
-            return leaf(activePaneId, paneIds, documentIds, activeItem);
-          }
-        );
-        if (alignedPaneId) target.activePaneId = alignedPaneId;
+        const wasFocused = location.leaf.paneIds.includes(target.activePaneId ?? "") &&
+          location.leaf.activeItem.kind === "document" && location.leaf.activeItem.id === documentId;
+        target.layout = replaceLeaf(target.layout, location.leaf.paneId, (leafNode) => {
+          const documentIds = leafNode.documentIds.filter((id) => id !== documentId);
+          const activeItem = leafNode.activeItem.kind === "document" && leafNode.activeItem.id === documentId
+            ? documentIds.length > 0
+              ? { kind: "document" as const, id: documentIds.at(-1)! }
+              : { kind: "terminal" as const, id: leafNode.paneId }
+            : leafNode.activeItem;
+          return leaf(leafNode.paneId, leafPaneIds(leafNode), documentIds, activeItem);
+        });
+        if (wasFocused) target.activePaneId = location.leaf.paneId;
         syncTabFromPanes(target);
       });
       return document;
+    },
+
+    documentsClosedWithPane(tabId: string, paneId: string): PaneDocument[] {
+      const tab = tabs.find((candidate) => candidate.id === tabId);
+      return tab ? documentsClosedWithPane(tab, paneId) : [];
     },
 
     closeDocuments(
@@ -1223,10 +1236,9 @@ function createTabsStore() {
     ): PaneDocument[] {
       const tab = tabs.find((candidate) => candidate.id === tabId);
       if (!tab) return [];
-      const removed = tab.documents.filter(
-        (document) =>
-          sourcePaneId === undefined || document.sourcePaneId === sourcePaneId
-      );
+      const removed = sourcePaneId === undefined
+        ? tab.documents
+        : documentsClosedWithPane(tab, sourcePaneId);
       if (removed.length === 0) return [];
       const removedIds = new Set(removed.map((document) => document.id));
       tab.documents = tab.documents.filter(
@@ -1244,7 +1256,9 @@ function createTabsStore() {
       tabId: string,
       documentId: string,
       content: string,
-      hasUtf8Bom: boolean
+      hasUtf8Bom: boolean,
+      version: string | null = null,
+      size?: number
     ) {
       const document = findRuntimeDocument(tabId, documentId);
       if (!document) return;
@@ -1252,8 +1266,17 @@ function createTabsStore() {
       document.savedContent = content;
       document.dirty = false;
       document.hasUtf8Bom = hasUtf8Bom;
+      document.fileVersion = version;
+      if (size !== undefined) document.size = size;
       document.saveState = "idle";
       document.saveError = "";
+    },
+
+    setDocumentFileVersion(tabId: string, documentId: string, version: string | null, size: number) {
+      const document = findRuntimeDocument(tabId, documentId);
+      if (!document) return;
+      document.fileVersion = version;
+      document.size = size;
     },
 
     setDocumentCachedLocalPath(
@@ -1281,15 +1304,22 @@ function createTabsStore() {
       if (!document) return;
       document.saveState = "saving";
       document.saveError = "";
+      document.savedCopyNotice = "";
     },
 
-    setDocumentSaved(tabId: string, documentId: string, content: string) {
+    setDocumentSaved(tabId: string, documentId: string, content: string, saved: SavedFileCopy, size: number) {
       const document = findRuntimeDocument(tabId, documentId);
       if (!document) return;
+      document.path = saved.path;
+      const separator = Math.max(saved.path.lastIndexOf("/"), document.sourceKind === "local" ? saved.path.lastIndexOf("\\") : -1);
+      document.name = saved.path.slice(separator + 1);
+      document.size = size;
       document.savedContent = content;
+      document.fileVersion = saved.version;
       document.dirty = document.content !== content;
       document.saveState = document.dirty ? "idle" : "saved";
       document.saveError = "";
+      document.savedCopyNotice = "Saved a separate file at " + saved.path + ". The previous file remains unchanged.";
     },
 
     setDocumentSaveFailed(tabId: string, documentId: string, error: string) {
@@ -1297,6 +1327,7 @@ function createTabsStore() {
       if (!document) return;
       document.saveState = "error";
       document.saveError = error;
+      document.savedCopyNotice = "";
     },
 
     clearDocumentSavedState(tabId: string, documentId: string) {
@@ -1545,12 +1576,10 @@ function createTabsStore() {
           (pane) => pane.id !== paneId
         );
         const removedDocumentIds = new Set(
-          candidate.documents
-            .filter((document) => document.sourcePaneId === paneId)
-            .map((document) => document.id)
+          documentsClosedWithPane(candidate, paneId).map((document) => document.id)
         );
         candidate.documents = candidate.documents.filter(
-          (document) => document.sourcePaneId !== paneId
+          (document) => !removedDocumentIds.has(document.id)
         );
         const pruned = pruneLayout(
           removeDocumentsFromLayout(candidate.layout, removedDocumentIds),
@@ -1584,7 +1613,7 @@ function createTabsStore() {
       dir: "row" | "col",
       side: "before" | "after"
     ) {
-      const result: { status: "merged" | "conflict" | "noop"; path?: string } = {
+      const result: { status: "merged" | "conflict" | "saving" | "noop"; path?: string } = {
         status: "noop",
       };
       if (sourceTabId === targetTabId) return result;
@@ -1607,6 +1636,11 @@ function createTabsStore() {
             documentsShareTargetPath(candidate, sourceDocument)
           );
           if (!destinationDocument) continue;
+          if (sourceDocument.saveState === "saving" || destinationDocument.saveState === "saving") {
+            result.status = "saving";
+            result.path = sourceDocument.path;
+            return;
+          }
           if (
             sourceDocument.dirty &&
             destinationDocument.dirty &&
@@ -1680,6 +1714,62 @@ function createTabsStore() {
       });
     },
 
+
+    /** Move a document tab without changing its source session or save target. */
+    async moveDocumentWithinTab(
+      tabId: string,
+      documentId: string,
+      targetPaneId: string,
+      dir: "row" | "col" | "merge",
+      side: "before" | "after",
+      insertIndex: number | null = null,
+    ) {
+      await withPreservedLayout([tabId], () => {
+        const tab = tabs.find((entry) => entry.id === tabId);
+        if (!tab?.documents.some((document) => document.id === documentId)) return;
+        const source = pathToDocument(tab.layout, documentId)?.leaf;
+        const target = pathToPane(tab.layout, targetPaneId)?.leaf;
+        if (!source || !target) return;
+
+        const withoutDocument = replaceLeaf(tab.layout, source.paneId, (leafNode) => {
+          const ids = leafNode.documentIds.filter((id) => id !== documentId);
+          const activeItem = leafNode.activeItem.kind === "document" && leafNode.activeItem.id === documentId
+            ? ids.length > 0
+              ? { kind: "document" as const, id: ids.at(-1)! }
+              : { kind: "terminal" as const, id: leafNode.paneId }
+            : leafNode.activeItem;
+          return leaf(leafNode.paneId, leafPaneIds(leafNode), ids, activeItem);
+        });
+        if (dir === "merge") {
+          tab.layout = replaceLeaf(withoutDocument, target.paneId, (leafNode) => {
+            const ids = [...leafNode.documentIds];
+            const index = source === target && insertIndex !== null &&
+              insertIndex > source.documentIds.indexOf(documentId) ? insertIndex - 1 : insertIndex;
+            ids.splice(Math.max(0, Math.min(index ?? ids.length, ids.length)), 0, documentId);
+            return leaf(leafNode.paneId, leafPaneIds(leafNode), ids,
+              { kind: "document", id: documentId });
+          });
+          tab.activePaneId = target.paneId;
+        } else {
+          // A split leaf always has a terminal slot. Clone the target's connection
+          // as the existing Split action does; the document still saves to its original session.
+          const terminal = tab.panes.find((pane) => pane.id === targetPaneId);
+          if (!terminal) return;
+          const connection = { ...terminal.connection, auth: { ...terminal.connection.auth } };
+          const pane: Pane = { ...makePane(tabId, connection), kind: terminal.kind };
+          tab.panes = [...tab.panes, pane];
+          tab.layout = replaceLeaf(withoutDocument, targetPaneId, (destination) => {
+            const moved = leaf(pane.id, [pane.id], [documentId],
+              { kind: "document", id: documentId });
+            return makeSplit(dir, 0.5, side === "before"
+              ? [moved, destination] : [destination, moved]);
+          });
+          tab.activePaneId = pane.id;
+        }
+        syncTabFromPanes(tab);
+      });
+    },
+
     /** Move one whole split leaf into a new top-level tab. */
     async movePaneToNewTab(
       sourceTabId: string,
@@ -1695,8 +1785,13 @@ function createTabsStore() {
         const movedIds = new Set(leafPaneIds(path.leaf));
         const movedPanes = source.panes.filter((pane) => movedIds.has(pane.id));
         if (movedPanes.length === 0 || movedPanes.length === source.panes.length) return;
+        const movedDocumentIds = new Set(path.leaf.documentIds);
+        if (source.documents.some((document) =>
+          document.sourceKind === "ssh" &&
+          movedIds.has(document.sourcePaneId) !== movedDocumentIds.has(document.id)
+        )) return;
         const movedDocuments = source.documents.filter((document) =>
-          movedIds.has(document.sourcePaneId)
+          movedDocumentIds.has(document.id)
         );
         const closingDir = path.splits.at(-1)?.node.dir;
         const runPath = closingDir
@@ -1711,7 +1806,7 @@ function createTabsStore() {
 
         source.panes = remainingPanes;
         source.documents = source.documents.filter((document) =>
-          !movedIds.has(document.sourcePaneId)
+          !movedDocuments.includes(document)
         );
         source.layout = runPath && closingDir
           ? balanceSplitRunAtPath(remainingLayout, runPath, closingDir)
@@ -1763,9 +1858,11 @@ function createTabsStore() {
         if (source === target && options.wholePane) return;
         const movedIds = options.wholePane ? [...source.paneIds] : [paneId];
         const movedSet = new Set(movedIds);
-        const movedDocumentIds = candidate.documents
-          .filter((document) => movedSet.has(document.sourcePaneId))
-          .map((document) => document.id);
+        // A single-tab source leaf is pruned, so every displayed document must follow it.
+        const movedDocumentIds = options.wholePane || (source !== target && source.paneIds.length === 1)
+          ? source.documentIds
+          : source.documentIds.filter((id) => candidate.documents.some((document) =>
+              document.id === id && document.sourcePaneId === paneId));
         const activeItem: PaneItem = options.wholePane ? source.activeItem : { kind: "terminal", id: paneId };
         const activePane = options.wholePane ? source.paneId : paneId;
 

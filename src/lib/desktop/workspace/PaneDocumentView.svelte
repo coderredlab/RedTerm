@@ -46,14 +46,15 @@
     sanitizeDownloadDialogFileName,
     localDownloadFile,
     localDownloadToDir,
+    localFileVersion,
     localReadFile,
+    localSaveCopy,
     previewCacheAcquire,
     previewCacheRelease,
-    localWriteFile,
     sftpDownloadFile,
     sftpDownloadToDir,
     sftpReadFile,
-    sftpWriteFile,
+    sftpSaveCopy,
   } from "$lib/tauri/commands";
   import {
     formatBytes,
@@ -82,6 +83,7 @@
   const editorThemeCompartment = new Compartment();
   let appliedEditorDarkTheme: boolean | null = null;
   let downloading = $state(false);
+  let refreshing = $state(false);
   let downloadedHint = $state(false);
   let loadToken = 0;
   let markdownToken = 0;
@@ -126,7 +128,7 @@
   let cachedPathChangeAction: "load-document" | "load-media" | "ignore" | null = null;
 
   const boundKind = untrack(() => document.sourceKind);
-  const boundPath = untrack(() => document.path);
+  const boundPath = $derived(document.path);
   let fileKind = $state<FilePreviewKind>(
     untrack(() => previewKindOf(document.name))
   );
@@ -181,6 +183,11 @@
       bytes[index] = binary.charCodeAt(index);
     }
     return bytes;
+  }
+
+  function decodeTextFile(bytes: Uint8Array): { text: string; hasUtf8Bom: boolean } {
+    const hasUtf8Bom = bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(bytes), hasUtf8Bom };
   }
 
   function releaseMediaLease() {
@@ -266,6 +273,7 @@
 
   async function loadDocument() {
     const token = ++loadToken;
+    refreshing = false;
     loadState = "loading";
     errorMessage = "";
     revokeMediaUrl();
@@ -323,14 +331,9 @@
       if (fileKind === "image") {
         mediaUrl = URL.createObjectURL(new Blob([bytes], { type: mimeOf(document.name) }));
       } else {
-        const hasUtf8Bom =
-          bytes.length >= 3 &&
-          bytes[0] === 0xef &&
-          bytes[1] === 0xbb &&
-          bytes[2] === 0xbf;
-        let decoded: string;
+        let decoded: { text: string; hasUtf8Bom: boolean };
         try {
-          decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          decoded = decodeTextFile(bytes);
         } catch (error) {
           if (fileKind === "unknown") {
             loadState = "ready";
@@ -339,14 +342,58 @@
           throw error;
         }
         if (fileKind === "unknown") fileKind = "text";
-        currentContent = decoded;
-        tabsStore.setDocumentLoaded(tabId, document.id, decoded, hasUtf8Bom);
+        currentContent = decoded.text;
+        tabsStore.setDocumentLoaded(tabId, document.id, decoded.text, decoded.hasUtf8Bom, content.version, content.size);
       }
       loadState = "ready";
     } catch (error) {
       if (token !== loadToken) return;
       loadState = "error";
       errorMessage = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  async function refreshMarkdown() {
+    if (
+      refreshing || fileKind !== "markdown" || mode !== "preview" || loadState !== "ready" ||
+      document.dirty || document.saveState === "saving" || document.savedContent === null
+    ) return;
+    const token = loadToken;
+    const original = document.savedContent;
+    refreshing = true;
+    actionError = "";
+    try {
+      if (boundKind === "ssh" && !document.sourceSessionId) {
+        throw new Error("The SSH session for this file is no longer available.");
+      }
+      if (boundKind === "local") {
+        const version = await localFileVersion(boundPath);
+        if (token !== loadToken || mode !== "preview") return;
+        if (version !== null && version === document.fileVersion) return;
+      }
+
+      // SFTP v3 reports second-resolution mtime: equal size/version cannot
+      // prove equal bytes, so an explicit remote refresh must read the file.
+      const content = await readInline();
+      if (
+        token !== loadToken || mode !== "preview" || document.dirty ||
+        document.savedContent !== original
+      ) return;
+      const decoded = decodeTextFile(decodeBase64(content.content_base64));
+      if (decoded.text === original && decoded.hasUtf8Bom === document.hasUtf8Bom) {
+        tabsStore.setDocumentFileVersion(tabId, document.id, content.version, content.size);
+        return;
+      }
+      currentContent = decoded.text;
+      tabsStore.setDocumentLoaded(
+        tabId, document.id, decoded.text, decoded.hasUtf8Bom, content.version, content.size
+      );
+    } catch (error) {
+      if (token === loadToken) {
+        actionError = `Unable to refresh preview: ${error instanceof Error ? error.message : String(error)}`;
+      }
+    } finally {
+      if (token === loadToken) refreshing = false;
     }
   }
 
@@ -402,12 +449,10 @@
       : document.savedContent;
     tabsStore.setDocumentSaveStarted(tabId, document.id);
     try {
-      if (boundKind === "local") {
-        await localWriteFile(boundPath, contentToWrite, expectedContent);
-      } else {
-        await sftpWriteFile(sessionId!, boundPath, contentToWrite, expectedContent);
-      }
-      tabsStore.setDocumentSaved(tabId, document.id, contentToSave);
+      const saved = boundKind === "local"
+        ? await localSaveCopy(boundPath, contentToWrite, expectedContent)
+        : await sftpSaveCopy(sessionId!, boundPath, contentToWrite, expectedContent);
+      tabsStore.setDocumentSaved(tabId, document.id, contentToSave, saved, new TextEncoder().encode(contentToWrite).byteLength);
       setTimeout(() => {
         tabsStore.clearDocumentSavedState(tabId, document.id);
       }, 1800);
@@ -688,12 +733,26 @@
           <button class:active={mode === "preview"} onclick={() => (mode = "preview")}>Preview</button>
         </div>
       {/if}
+      {#if fileKind === "markdown" && mode === "preview"}
+        <button
+          class="toolbar-button refresh-button"
+          aria-label={refreshing ? "Checking for file changes" : "Refresh preview"}
+          title={document.dirty ? "Save your changes before refreshing" : "Check for file changes"}
+          disabled={refreshing || loadState !== "ready" || document.dirty || document.saveState === "saving"}
+          onclick={() => void refreshMarkdown()}
+        >
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" />
+          </svg>
+        </button>
+      {/if}
       {#if editable}
         <button
           class="toolbar-button primary"
+          title="Save your changes to a separate file without replacing this one"
           disabled={document.saveState === "saving" || !document.dirty}
           onclick={() => void save()}
-        >{document.saveState === "saving" ? "Saving…" : document.saveState === "saved" ? "Saved" : "Save"}</button>
+        >{document.saveState === "saving" ? "Saving copy…" : document.saveState === "saved" ? "Copy saved" : "Save copy"}</button>
       {/if}
       <button class="toolbar-button" disabled={downloading} onclick={() => void downloadCopy()}>
         {downloading ? "Downloading…" : downloadedHint ? "Downloaded" : "Download"}
@@ -703,6 +762,9 @@
 
   {#if document.saveError || actionError}
     <div class="document-error" role="status">{document.saveError || actionError}</div>
+  {/if}
+  {#if document.savedCopyNotice}
+    <div class="document-note" role="status">{document.savedCopyNotice}</div>
   {/if}
 
   <div class="document-body">
@@ -765,6 +827,7 @@
     min-height: 38px;
     flex: 0 0 auto;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
@@ -774,6 +837,7 @@
   }
 
   .document-location {
+    flex: 1 1 120px;
     min-width: 0;
     display: flex;
     align-items: center;
@@ -798,6 +862,14 @@
     display: flex;
     align-items: center;
     gap: 4px;
+  }
+
+  .document-actions {
+    min-width: 0;
+    flex: 0 1 auto;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    overflow-x: auto;
   }
 
   .mode-switch {
@@ -833,6 +905,14 @@
     height: 28px;
     padding: 0 10px;
     border: 1px solid var(--border-primary);
+  }
+
+  .refresh-button {
+    width: 28px;
+    padding: 0;
+    display: grid;
+    place-items: center;
+    color: var(--text-secondary);
   }
 
   .toolbar-button.primary {
@@ -967,6 +1047,24 @@
   .markdown-body :global(ul),
   .markdown-body :global(ol) {
     margin: 0.8em 0;
+  }
+
+  .markdown-body :global(table) {
+    width: 100%;
+    margin: 1em 0;
+    border-collapse: collapse;
+  }
+
+  .markdown-body :global(th),
+  .markdown-body :global(td) {
+    padding: 8px 12px;
+    border: 1px solid color-mix(in srgb, var(--text-muted) 65%, var(--bg-primary));
+    vertical-align: top;
+  }
+
+  .markdown-body :global(th) {
+    background: var(--bg-secondary);
+    text-align: left;
   }
 
   .markdown-body :global(pre) {

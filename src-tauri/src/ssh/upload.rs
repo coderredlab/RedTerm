@@ -11,6 +11,7 @@ use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 
+use super::client::BoundedSftpStream;
 use super::{SshConnection, SshError};
 use crate::storage::unique_destination_names;
 
@@ -94,6 +95,8 @@ impl std::ops::Deref for LocalFile {
 
 pub(crate) struct LocalSource {
     root: File,
+    #[cfg(unix)]
+    _ancestors: Vec<File>,
     #[cfg(windows)]
     path: PathBuf,
     #[cfg(windows)]
@@ -132,14 +135,58 @@ pub(crate) fn validate_type(file: &File) -> io::Result<bool> {
 }
 
 #[cfg(unix)]
-fn open_local(path: &Path) -> io::Result<File> {
+fn open_local_at(parent: &File, name: &std::ffi::OsStr, directory: bool) -> io::Result<File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let name = std::ffi::CString::new(name.as_encoded_bytes())
+        .map_err(|_| invalid_source("Invalid upload file name"))?;
+    let flags = libc::O_RDONLY
+        | libc::O_NOFOLLOW
+        | libc::O_NONBLOCK
+        | libc::O_CLOEXEC
+        | if directory { libc::O_DIRECTORY } else { 0 };
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn open_local(path: &Path) -> io::Result<(File, Vec<File>)> {
     use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
+    let mut components = path.components().peekable();
+    if path.file_name().is_none() {
+        return Err(invalid_source("Select a named file or folder"));
+    }
+    let base = if matches!(components.peek(), Some(Component::RootDir)) {
+        components.next();
+        "/"
+    } else {
+        if matches!(components.peek(), Some(Component::CurDir)) {
+            components.next();
+        }
+        "."
+    };
+    let mut parent = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    validate_type(&file)?;
-    Ok(file)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(base)?;
+    let mut ancestors = Vec::new();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(invalid_source("Upload path escapes the selected folder"));
+        };
+        let directory = components.peek().is_some();
+        let child = open_local_at(&parent, name, directory)?;
+        validate_type(&child)?;
+        if !directory {
+            ancestors.push(parent);
+            return Ok((child, ancestors));
+        }
+        ancestors.push(parent);
+        parent = child;
+    }
+    Err(invalid_source("Select a named file or folder"))
 }
 
 #[cfg(windows)]
@@ -176,6 +223,9 @@ impl LocalSource {
         };
         #[cfg(windows)]
         let path = canonical_path.as_path();
+        #[cfg(unix)]
+        let (root, ancestors) = open_local(path)?;
+        #[cfg(windows)]
         let root = open_local(path)?;
         if validate_type(&root)? != folder {
             return Err(invalid_source(if folder {
@@ -185,6 +235,8 @@ impl LocalSource {
             }));
         }
         Ok(Self {
+            #[cfg(unix)]
+            _ancestors: ancestors,
             root,
             #[cfg(windows)]
             path: canonical_path,
@@ -205,20 +257,7 @@ impl LocalSource {
             };
             #[cfg(unix)]
             {
-                use std::os::fd::{AsRawFd, FromRawFd};
-                let name = std::ffi::CString::new(name.as_encoded_bytes())
-                    .map_err(|_| invalid_source("Invalid upload file name"))?;
-                let fd = unsafe {
-                    libc::openat(
-                        file.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-                    )
-                };
-                if fd < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                file = unsafe { File::from_raw_fd(fd) };
+                file = open_local_at(&file, name, false)?;
             }
             #[cfg(windows)]
             {
@@ -315,6 +354,103 @@ fn sftp_error(error: impl std::fmt::Display) -> SshError {
 fn missing(error: &SftpError) -> bool {
     matches!(error, SftpError::Status(status) if status.status_code == StatusCode::NoSuchFile)
 }
+pub(super) fn safe_stage_component(uid: u32, owner: u32, mode: u32, stage: bool) -> bool {
+    (uid == owner || uid == 0)
+        && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+        && (!stage || (uid == owner && mode & 0o7777 == 0o700))
+}
+// Linux ACL access masks are represented by group mode bits: a 0700
+// directory cannot grant named users traversal on Linux.
+async fn verify_linux_stage_parent(
+    sftp: &RawSftpSession,
+    path: &str,
+    owner: u32,
+    stage: bool,
+) -> Result<(), SshError> {
+    let root = sftp.lstat("/").await.map_err(sftp_error)?.attrs;
+    if !root.file_type().is_dir()
+        || !root
+            .uid
+            .zip(root.permissions)
+            .is_some_and(|(uid, mode)| safe_stage_component(uid, owner, mode, stage && path == "/"))
+    {
+        return Err(sftp_error("Remote staging directory root is not protected"));
+    }
+    let mut current = String::new();
+    for component in path.split('/').filter(|part| !part.is_empty()) {
+        current.push('/');
+        current.push_str(component);
+        let attrs = sftp.lstat(&current).await.map_err(sftp_error)?.attrs;
+        let uid = attrs
+            .uid
+            .ok_or_else(|| sftp_error("Remote directory owner is unavailable"))?;
+        let mode = attrs
+            .permissions
+            .ok_or_else(|| sftp_error("Remote directory mode is unavailable"))?;
+        if !attrs.file_type().is_dir()
+            || !safe_stage_component(uid, owner, mode, current == path && stage)
+        {
+            return Err(sftp_error("Remote staging directory is not private"));
+        }
+    }
+    Ok(())
+}
+
+// macOS ACLs are not exposed by SFTPv3. Traverse through O_NOFOLLOW
+// descriptors and check each ACL before creating any payload.
+pub(super) async fn verify_macos_stage_parent(
+    connection: &SshConnection,
+    path: &str,
+    stage: bool,
+) -> Result<(), SshError> {
+    let script = r#"
+import ctypes, errno, os, stat, sys
+path, stage = sys.argv[1], sys.argv[2] == '1'
+libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+libc.acl_get_fd.argtypes = [ctypes.c_int]
+libc.acl_get_fd.restype = ctypes.c_void_p
+libc.acl_free.argtypes = [ctypes.c_void_p]
+libc.acl_free.restype = ctypes.c_int
+if not path.startswith('/') or '\x00' in path or any(p in ('.', '..') for p in path.split('/')):
+    raise ValueError('invalid staging path')
+fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for component in [''] + [p for p in path.split('/') if p]:
+        if component:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        info = os.fstat(fd)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid())
+                or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+            raise ValueError('staging ancestor is writable by another account')
+        ctypes.set_errno(0)
+        acl = libc.acl_get_fd(fd)
+        if acl:
+            libc.acl_free(acl)
+            raise ValueError('staging ancestor has an ACL')
+        if ctypes.get_errno() != errno.ENOENT:
+            raise ValueError('cannot verify staging ancestor ACL')
+    if stage and (info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700):
+        raise ValueError('staging directory is not owned and private')
+    print('PRIVATE')
+finally:
+    os.close(fd)
+"#;
+    let command = format!(
+        "/usr/bin/python3 -c '{}' '{}' {}",
+        script.replace('\'', "'\\''"),
+        path.replace('\'', "'\\''"),
+        if stage { 1 } else { 0 }
+    );
+    let (status, stdout, stderr) = connection.exec_capture(&command).await?;
+    if status != Some(0) || stdout != "PRIVATE" || !stderr.is_empty() {
+        return Err(sftp_error(format!(
+            "Cannot verify private remote staging directory: {stderr}"
+        )));
+    }
+    Ok(())
+}
 
 async fn commit_upload(
     sftp: &RawSftpSession,
@@ -336,7 +472,7 @@ async fn commit_upload(
             Ok(_) => return Ok(target),
             Err(error) => match sftp.lstat(&target).await {
                 Ok(_) => continue, // Another writer claimed this candidate.
-                Err(_) => return Err(sftp_error(error)),
+                Err(_) => return Err(sftp_error(format!("Atomic rename from private remote staging failed (possibly different filesystems): {error}"))),
             },
         }
     }
@@ -454,7 +590,7 @@ impl SshConnection {
         }
         let channel = self.handle.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
-        let sftp = RawSftpSession::new(channel.into_stream());
+        let sftp = RawSftpSession::new(BoundedSftpStream::new(channel.into_stream()));
         let version = sftp.init().await.map_err(sftp_error)?;
         if version.version != 3 {
             return Err(sftp_error(
@@ -482,6 +618,87 @@ impl SshConnection {
         {
             return Err(sftp_error("Upload destination is not a remote directory"));
         }
+        // Prefer a verified writable ancestor on the destination filesystem.
+        // A sticky shared directory (such as /tmp) itself is safe; a non-sticky
+        // shared directory may have a private parent on that same filesystem.
+        // If no such parent exists, home staging can fail on cross-device
+        // rename; never replace the atomic publish with an unsafe copy.
+        let remote_os = self.detect_remote_os().await?;
+        if remote_os != "linux" && remote_os != "macos" {
+            return Err(sftp_error(
+                "Cannot verify private staging on this SFTP server",
+            ));
+        }
+        let (status, stdout, stderr) = self.exec_capture("id -u").await?;
+        if status != Some(0) || !stderr.is_empty() {
+            return Err(sftp_error("Cannot identify the remote staging owner"));
+        }
+        let remote_uid = stdout.parse::<u32>().map_err(sftp_error)?;
+        let owner = (remote_os == "linux").then_some(remote_uid);
+        if destination
+            .split('/')
+            .any(|part| part == "." || part == "..")
+        {
+            return Err(sftp_error("Invalid remote upload directory"));
+        }
+        let mut candidate = destination.as_str();
+        let mut stage_parent = None;
+        loop {
+            let verified = match owner {
+                Some(uid) => verify_linux_stage_parent(&sftp, candidate, uid, false)
+                    .await
+                    .is_ok(),
+                None => verify_macos_stage_parent(self, candidate, false)
+                    .await
+                    .is_ok(),
+            };
+            if verified {
+                if let Ok(attrs) = sftp.lstat(candidate).await.map(|reply| reply.attrs) {
+                    if let (Some(uid), Some(mode)) = (attrs.uid, attrs.permissions) {
+                        let user_writable = uid == remote_uid && mode & 0o300 == 0o300;
+                        let sticky_shared = (uid == 0 || uid == remote_uid)
+                            && mode & 0o1000 != 0
+                            && mode & 0o003 == 0o003;
+                        if user_writable || sticky_shared {
+                            stage_parent = Some(candidate.to_owned());
+                            break;
+                        }
+                    }
+                }
+            }
+            if candidate == "/" {
+                break;
+            }
+            candidate = match candidate.rsplit_once('/') {
+                Some(("", _)) => "/",
+                Some((parent, _)) => parent,
+                None => break,
+            };
+        }
+        let stage_parent = if let Some(parent) = stage_parent {
+            parent
+        } else {
+            let home = sftp
+                .realpath(".")
+                .await
+                .map_err(sftp_error)?
+                .files
+                .into_iter()
+                .next()
+                .ok_or_else(|| sftp_error("Remote staging parent could not be resolved"))?
+                .filename;
+            if !home.starts_with('/')
+                || home.contains('\0')
+                || home.split('/').any(|part| part == "." || part == "..")
+            {
+                return Err(sftp_error("Invalid remote staging parent"));
+            }
+            match owner {
+                Some(uid) => verify_linux_stage_parent(&sftp, &home, uid, false).await?,
+                None => verify_macos_stage_parent(self, &home, false).await?,
+            }
+            home
+        };
         let mut result = SftpUploadResult::default();
         let mut progress = UploadProgress {
             phase: UploadPhase::Preparing,
@@ -541,12 +758,30 @@ impl SshConnection {
             if is_dir {
                 progress.file_count = entries.iter().filter(|entry| !entry.is_dir).count();
             }
-            let stage = remote_child(
-                &destination,
+            let stage_root = remote_child(
+                &stage_parent,
                 &format!(".redterm-upload-{}", uuid::Uuid::new_v4()),
             );
+            let stage = remote_child(&stage_root, "payload");
             let mut created = Vec::new();
             let uploaded = async {
+                // Until this exact directory is attested, do not add its name
+                // to rollback: a hostile inherited ACL could let another user
+                // populate it or swap the name even before the first write.
+                sftp.mkdir(
+                    &stage_root,
+                    FileAttributes {
+                        permissions: Some(0o700),
+                        ..FileAttributes::default()
+                    },
+                )
+                .await
+                .map_err(sftp_error)?;
+                match owner {
+                    Some(uid) => verify_linux_stage_parent(&sftp, &stage_root, uid, true).await?,
+                    None => verify_macos_stage_parent(self, &stage_root, true).await?,
+                }
+                created.push((stage_root.clone(), true));
                 let mut size = 0;
                 for entry in entries {
                     let remote = if entry.relative.as_os_str().is_empty() {
@@ -604,7 +839,19 @@ impl SshConnection {
             .await;
             last_preparing = None;
             match uploaded {
-                Ok(item) => result.uploaded.push(item),
+                Ok(item) => {
+                    result.uploaded.push(item);
+                    // The child was moved, leaving only our private container.
+                    // Never undo the published destination in a shared parent.
+                    if let Err(error) = sftp.rmdir(&stage_root).await {
+                        result.failed.push(SftpUploadFailure {
+                            name,
+                            error: format!(
+                                "Uploaded, but could not remove private staging directory: {error}"
+                            ),
+                        });
+                    }
+                }
                 Err(error) => result.failed.push(SftpUploadFailure {
                     name,
                     error: cleanup_upload(&sftp, &created, error).await.to_string(),
@@ -623,13 +870,24 @@ mod tests {
     use std::io::Read;
     use std::os::unix::fs::symlink;
 
+    #[test]
+    fn remote_stage_requires_owner_and_replacement_protection() {
+        let owner = 501;
+        assert!(safe_stage_component(owner, owner, 0o755, false));
+        assert!(safe_stage_component(0, owner, 0o1777, false)); // /tmp
+        assert!(!safe_stage_component(owner, owner, 0o777, false));
+        assert!(!safe_stage_component(502, owner, 0o1777, false));
+        assert!(safe_stage_component(owner, owner, 0o700, true));
+        assert!(!safe_stage_component(owner, owner, 0o755, true));
+        assert!(!safe_stage_component(0, owner, 0o700, true));
+    }
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
             let path =
                 std::env::temp_dir().join(format!("redterm-upload-test-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&path).unwrap();
-            Self(path)
+            Self(std::fs::canonicalize(path).unwrap())
         }
     }
     impl Drop for Fixture {
@@ -690,5 +948,295 @@ mod tests {
         symlink(outside.join("sub"), moved.join("sub")).unwrap();
         assert!(source.open(Path::new("sub/file")).is_err());
         assert!(source.open(Path::new("../outside/sub/file")).is_err());
+    }
+    #[test]
+    fn upload_source_rejects_substituted_ancestor_before_opening_selected_file() {
+        let fixture = Fixture::new();
+        let selected = fixture.0.join("selected");
+        let private = fixture.0.join("private");
+        std::fs::create_dir_all(selected.join("nested")).unwrap();
+        std::fs::create_dir_all(private.join("nested")).unwrap();
+        std::fs::write(selected.join("nested/file"), b"selected bytes").unwrap();
+        std::fs::write(private.join("nested/file"), b"private bytes").unwrap();
+        let picked = selected.join("nested/file");
+        std::fs::rename(&selected, fixture.0.join("moved")).unwrap();
+        symlink(&private, &selected).unwrap();
+        assert!(LocalSource::new(&picked, false).is_err());
+    }
+
+    #[test]
+    fn upload_source_accepts_nested_folder_and_pins_swapped_ancestor() {
+        let fixture = Fixture::new();
+        let selected = fixture.0.join("selected");
+        let private = fixture.0.join("private");
+        std::fs::create_dir_all(selected.join("nested/deeper")).unwrap();
+        std::fs::create_dir_all(private.join("nested/deeper")).unwrap();
+        std::fs::write(selected.join("nested/deeper/file"), b"selected bytes").unwrap();
+        std::fs::write(private.join("nested/deeper/file"), b"private bytes").unwrap();
+        let source = LocalSource::new(&selected.join("nested"), true).unwrap();
+        assert_eq!(source.entries("nested").unwrap().len(), 3);
+        std::fs::rename(&selected, fixture.0.join("moved")).unwrap();
+        symlink(&private, &selected).unwrap();
+        let mut bytes = String::new();
+        source
+            .open(Path::new("deeper/file"))
+            .unwrap()
+            .file
+            .read_to_string(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, "selected bytes");
+    }
+
+    #[test]
+    fn upload_source_rejects_relative_and_absolute_parent_escapes() {
+        let fixture = Fixture::new();
+        std::fs::create_dir(fixture.0.join("selected")).unwrap();
+        std::fs::write(fixture.0.join("private"), b"private bytes").unwrap();
+        assert_eq!(
+            LocalSource::new(Path::new("../private"), false)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            LocalSource::new(&fixture.0.join("selected/../private"), false)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn openssh_upload_uses_private_stage_for_shared_acl_and_safe_rollback() {
+        use crate::ssh::{AuthConfig, AuthMethod};
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Child, Command, Stdio};
+
+        struct Server(Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let fixture = Fixture::new();
+        let root = &fixture.0;
+        let key = root.join("client_key");
+        let host_key = root.join("host_key");
+        for path in [&key, &host_key] {
+            assert!(Command::new("/usr/bin/ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        fs::copy(key.with_extension("pub"), root.join("authorized_keys")).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let known_hosts = root.join("known_hosts");
+        fs::write(
+            &known_hosts,
+            format!(
+                "[127.0.0.1]:{port} {}",
+                fs::read_to_string(host_key.with_extension("pub")).unwrap()
+            ),
+        )
+        .unwrap();
+        let config = root.join("sshd_config");
+        fs::write(
+            &config,
+            format!(
+                "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\nStrictModes no\nUsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\nSubsystem sftp internal-sftp\nPidFile {}\nLogLevel ERROR\n",
+                host_key.display(),
+                root.join("authorized_keys").display(),
+                root.join("sshd.pid").display()
+            ),
+        )
+        .unwrap();
+        let mut server = Server(
+            Command::new("/usr/sbin/sshd")
+                .args(["-D", "-e", "-f"])
+                .arg(&config)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let mut ready = false;
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                ready = true;
+                break;
+            }
+            assert!(
+                server.0.try_wait().unwrap().is_none(),
+                "isolated sshd exited"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ready, "isolated sshd did not start");
+        let connection = SshConnection::connect(
+            "127.0.0.1",
+            port,
+            AuthConfig {
+                username: std::env::var("USER").unwrap(),
+                method: AuthMethod::ResolvedKey {
+                    key_path: key.to_str().unwrap().to_owned(),
+                    passphrase: None,
+                },
+            },
+            known_hosts,
+        )
+        .await
+        .unwrap();
+
+        // /tmp is writable by other accounts but sticky: stage there on the
+        // destination filesystem; preserve an existing file on name collision.
+        let filename = format!("redterm-shared-{}.bin", uuid::Uuid::new_v4());
+        let source = root.join(&filename);
+        fs::write(&source, b"private upload bytes").unwrap();
+        let collision = Path::new("/tmp").join(&filename);
+        fs::write(&collision, b"existing destination bytes").unwrap();
+        let phases = std::sync::Mutex::new(Vec::new());
+        let shared_result = connection
+            .upload_paths_via_sftp(
+                "/tmp",
+                vec![source.clone()],
+                UploadSelectionKind::Files,
+                &|progress| {
+                    phases
+                        .lock()
+                        .unwrap()
+                        .push((progress.phase, progress.transferred));
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            shared_result.failed.is_empty(),
+            "{:?}",
+            shared_result.failed
+        );
+        assert_eq!(shared_result.uploaded.len(), 1);
+        let progress = phases.lock().unwrap();
+        assert!(progress.contains(&(UploadPhase::Uploading, b"private upload bytes".len() as u64)));
+        assert!(progress
+            .iter()
+            .any(|(phase, _)| *phase == UploadPhase::Finishing));
+        drop(progress);
+        assert_eq!(fs::read(&collision).unwrap(), b"existing destination bytes");
+        assert_eq!(
+            fs::read(&shared_result.uploaded[0].remote_path).unwrap(),
+            b"private upload bytes"
+        );
+        fs::remove_file(&collision).unwrap();
+        fs::remove_file(&shared_result.uploaded[0].remote_path).unwrap();
+
+        let shared = root.join("acl-shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(Command::new("/bin/chmod")
+            .args(["+a", "everyone allow read,file_inherit,directory_inherit"])
+            .arg(&shared)
+            .status()
+            .unwrap()
+            .success());
+        let sentinel = root.join("unrelated-sentinel");
+        fs::write(&sentinel, b"must survive rollback").unwrap();
+        let trap = shared.join(".redterm-upload-adversary");
+        symlink(&sentinel, &trap).unwrap();
+        let ok = connection
+            .upload_paths_via_sftp(
+                shared.to_str().unwrap(),
+                vec![source.clone()],
+                UploadSelectionKind::Files,
+                &|progress| {
+                    if progress.phase == UploadPhase::Uploading {
+                        assert_eq!(fs::read_dir(&shared).unwrap().count(), 1);
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(ok.failed.is_empty(), "{:?}", ok.failed);
+        assert_eq!(
+            fs::read(&ok.uploaded[0].remote_path).unwrap(),
+            b"private upload bytes"
+        );
+        assert_eq!(
+            fs::metadata(&ok.uploaded[0].remote_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        fs::remove_file(&ok.uploaded[0].remote_path).unwrap();
+
+        let folder = root.join("selected-folder");
+        fs::create_dir(&folder).unwrap();
+        fs::create_dir(folder.join("nested")).unwrap();
+        fs::write(folder.join("nested/document.txt"), b"nested upload bytes").unwrap();
+        let folder_upload = connection
+            .upload_paths_via_sftp(
+                shared.to_str().unwrap(),
+                vec![folder],
+                UploadSelectionKind::Folder,
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        assert!(
+            folder_upload.failed.is_empty(),
+            "{:?}",
+            folder_upload.failed
+        );
+        assert_eq!(folder_upload.uploaded.len(), 1);
+        assert!(folder_upload.uploaded[0].is_dir);
+        assert_eq!(
+            fs::read(Path::new(&folder_upload.uploaded[0].remote_path).join("nested/document.txt"))
+                .unwrap(),
+            b"nested upload bytes"
+        );
+        fs::remove_dir_all(&folder_upload.uploaded[0].remote_path).unwrap();
+        let failed = connection
+            .upload_paths_via_sftp(
+                shared.to_str().unwrap(),
+                vec![source],
+                UploadSelectionKind::Files,
+                &|progress| {
+                    if progress.phase == UploadPhase::Uploading {
+                        fs::set_permissions(&shared, fs::Permissions::from_mode(0o555)).unwrap();
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.uploaded.len(), 0);
+        assert_eq!(failed.failed.len(), 1);
+        assert!(
+            failed.failed[0].error.contains("Atomic rename"),
+            "{:?}",
+            failed.failed
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"must survive rollback");
+        assert!(fs::symlink_metadata(&trap)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(fs::read_dir(&shared).unwrap().count(), 1);
+        assert!(!fs::read_dir(root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".redterm-upload-")
+        }));
     }
 }

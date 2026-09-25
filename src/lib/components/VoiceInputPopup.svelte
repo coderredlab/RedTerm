@@ -32,7 +32,7 @@
       displayText: controller.displayText,
       errorMessage: state.errorMessage,
       activeLanguageLabel: controller.activeLanguage?.label ?? "Default language",
-      languageCount: state.languages.length,
+      canRotateLanguage: controller.canRotateLanguage,
       canSend: controller.canSend,
     };
   });
@@ -75,7 +75,7 @@
           type="button"
           class="voice-btn"
           onclick={() => void controller.rotateLanguage()}
-          disabled={view.languageCount <= 1}
+          disabled={!view.canRotateLanguage}
         >
           Switch language
         </button>

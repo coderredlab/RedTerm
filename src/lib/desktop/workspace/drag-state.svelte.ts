@@ -13,6 +13,7 @@ export const tabDrag = $state({
   kind: "tab" as DragKind,
   tabId: null as string | null,
   paneId: null as string | null,
+  documentId: null as string | null,
   wholePane: false,
   paneTarget: null as PaneDropTarget | null,
   title: "",
@@ -43,6 +44,7 @@ export function resetTabDrag() {
   tabDrag.kind = "tab";
   tabDrag.tabId = null;
   tabDrag.paneId = null;
+  tabDrag.documentId = null;
   tabDrag.wholePane = false;
   tabDrag.paneTarget = null;
   tabDrag.title = "";
@@ -53,13 +55,13 @@ export function resetTabDrag() {
   tabDrag.dropZone = null;
 }
 
-export function paneTargetFromPoint(tabId: string, x: number, y: number): PaneDropTarget | null {
+export function paneTargetFromPoint(tabId: string, x: number, y: number, documentTab = false): PaneDropTarget | null {
   const pane = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-pane-id]');
   if (!pane?.dataset.paneId || pane.dataset.workspaceTabId !== tabId || !dragTargets.workspace?.contains(pane)) return null;
   const header = pane.querySelector<HTMLElement>('.pane-header');
   const headerRect = header?.getBoundingClientRect();
   if (headerRect && y >= headerRect.top && y <= headerRect.bottom) {
-    const tabs = Array.from(pane.querySelectorAll<HTMLElement>('[data-pane-tab-id]'));
+    const tabs = Array.from(pane.querySelectorAll<HTMLElement>(documentTab ? '[data-document-tab-id]' : '[data-pane-tab-id]'));
     return {
       tabId, paneId: pane.dataset.paneId, zone: 'merge',
       insertIndex: insertionIndexFromPoint(tabs.map((tab) => tab.getBoundingClientRect()), x),

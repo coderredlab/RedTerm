@@ -171,6 +171,7 @@ describe("tabs store persistence", () => {
       tabsStore.setDocumentLoaded(sourceTabId, documentId, "original", false);
       tabsStore.setDocumentContent(sourceTabId, documentId, "unsaved");
       await tabsStore.setActiveDocument(sourceTabId, documentId);
+      tabsStore.setDocumentSaveStarted(sourceTabId, documentId);
 
       const newTabId = (await tabsStore.movePaneToNewTab(sourceTabId, middle, 0))!;
       expect(tabsStore.tabs.map((tab) => tab.id)).toEqual([newTabId, sourceTabId]);
@@ -197,12 +198,63 @@ describe("tabs store persistence", () => {
       expect(tabsStore.getTab(newTabId)!.documents[0]).toMatchObject({
         id: documentId, sourcePaneId: secondTerminal, content: "unsaved", dirty: true,
       });
+      tabsStore.setDocumentSaved(sourceTabId, documentId, "unsaved", {
+        path: "/notes.redterm-1.txt", version: "7:future",
+      }, 7);
+      expect(tabsStore.getDocument(newTabId, documentId)).toMatchObject({
+        path: "/notes.redterm-1.txt",
+        savedCopyNotice: "Saved a separate file at /notes.redterm-1.txt. The previous file remains unchanged.",
+      });
       expect(JSON.parse(storage.getItem(STORAGE_KEY)!).tabs.map((tab) => tab.id))
         .toEqual([newTabId, sourceTabId]);
     } finally {
       tabsStore.removeTab(sourceTabId);
       for (const tab of [...tabsStore.tabs]) tabsStore.removeTab(tab.id);
     }
+  });
+
+  test("keeps SSH source and remote document in the same top-level tab", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte.ts?detach-ssh-document");
+    const tabId = tabsStore.addTab("remote.example.com", 22, { username: "user", method: { type: "password", password: "" } });
+    try {
+      const source = tabsStore.getTab(tabId)!.activePaneId!;
+      tabsStore.setPaneConnected(tabId, source, "source-session");
+      const doc = (await tabsStore.openDocument(tabId, source, { name: "draft.md", path: "/draft.md", size: 5 }))!;
+      tabsStore.setDocumentLoaded(tabId, doc, "initial", false);
+      tabsStore.setDocumentContent(tabId, doc, "dirty");
+      const viewer = (await tabsStore.splitPane(tabId, source, "row"))!;
+      await tabsStore.moveDocumentWithinTab(tabId, doc, viewer, "merge", "after");
+      const before = JSON.stringify(tabsStore.getTab(tabId));
+      for (const paneId of [viewer, source]) {
+        expect(await tabsStore.movePaneToNewTab(tabId, paneId, 0)).toBeNull();
+        expect(tabsStore.tabs.map((tab) => tab.id)).toEqual([tabId]);
+        expect(JSON.stringify(tabsStore.getTab(tabId))).toBe(before);
+      }
+      await tabsStore.moveDocumentWithinTab(tabId, doc, source, "merge", "after");
+      const newTabId = (await tabsStore.movePaneToNewTab(tabId, source, 1))!;
+      expect(newTabId).not.toBeNull();
+      expect(tabsStore.getTab(newTabId)!.documents).toMatchObject([{ id: doc, sourcePaneId: source, dirty: true }]);
+      expect(tabsStore.getPane(newTabId, source)?.sessionId).toBe("source-session");
+      expect(tabsStore.getTab(tabId)!.documents).toEqual([]);
+    } finally { for (const tab of [...tabsStore.tabs]) tabsStore.removeTab(tab.id); }
+  });
+
+  test("allows a local file viewer to detach from its source pane", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte.ts?detach-local-viewer");
+    const tabId = tabsStore.addLocalTab();
+    try {
+      const source = tabsStore.getTab(tabId)!.activePaneId!;
+      const doc = (await tabsStore.openDocument(tabId, source, { name: "draft.md", path: "/draft.md", size: 5 }))!;
+      const viewer = (await tabsStore.splitPane(tabId, source, "row"))!;
+      await tabsStore.moveDocumentWithinTab(tabId, doc, viewer, "merge", "after");
+      const viewerTabId = (await tabsStore.movePaneToNewTab(tabId, viewer, 1))!;
+      expect(viewerTabId).not.toBeNull();
+      expect(tabsStore.getTab(viewerTabId)!.documents).toMatchObject([{ id: doc, sourceKind: "local", sourcePaneId: source }]);
+      await tabsStore.closePane(tabId, source);
+      expect(tabsStore.getDocument(viewerTabId, doc)).toBeDefined();
+    } finally { for (const tab of [...tabsStore.tabs]) tabsStore.removeTab(tab.id); }
   });
 
   test("does not detach the only pane of a top-level tab", async () => {
@@ -850,7 +902,7 @@ describe("tabs store persistence", () => {
         path: "/srv/merged.md",
         size: 32,
       });
-      tabsStore.setDocumentLoaded(sourceTabId, documentId!, "before", false);
+      tabsStore.setDocumentLoaded(sourceTabId, documentId!, "before", false, "sha256:before-save");
       tabsStore.setDocumentContent(sourceTabId, documentId!, "after");
       tabsStore.setDocumentSaveStarted(sourceTabId, documentId!);
       const activeSourcePaneId = await tabsStore.addPaneTab(sourceTabId, sourcePaneId);
@@ -864,16 +916,27 @@ describe("tabs store persistence", () => {
         content: "after",
         savedContent: "before",
         saveState: "saving",
+        fileVersion: "sha256:before-save",
       });
       expect(JSON.stringify(tabsStore.getTab(targetTabId)?.layout)).toContain(
         documentId!
       );
       expect(tabsStore.getTab(targetTabId)?.activePaneId).toBe(activeSourcePaneId);
-      tabsStore.setDocumentSaved(sourceTabId, documentId!, "after");
+      const postSaveRevision = "sha256:after-save";
+      const savedCopyPath = "/srv/merged.redterm-1.md";
+      tabsStore.setDocumentSaved(sourceTabId, documentId!, "after", {
+        path: savedCopyPath,
+        version: postSaveRevision,
+      }, 5);
       expect(tabsStore.getDocument(targetTabId, documentId!)).toMatchObject({
+        path: savedCopyPath,
+        name: "merged.redterm-1.md",
+        size: 5,
         dirty: false,
         savedContent: "after",
         saveState: "saved",
+        fileVersion: postSaveRevision,
+        savedCopyNotice: "Saved a separate file at /srv/merged.redterm-1.md. The previous file remains unchanged.",
       });
     } finally {
       tabsStore.removeTab(sourceTabId);
@@ -976,6 +1039,51 @@ describe("tabs store persistence", () => {
     } finally {
       tabsStore.removeTab(sourceTabId);
       tabsStore.removeTab(targetTabId);
+    }
+  });
+
+  test("does not deduplicate an in-flight saved copy during a same-file tab merge", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const auth = { username: "deploy", method: { type: "password" as const, password: "" } };
+
+    for (const savingSide of ["source", "destination"] as const) {
+      const sourceTabId = tabsStore.addTab("merge.example.com", 22, auth);
+      const targetTabId = tabsStore.addTab("merge.example.com", 22, auth);
+      try {
+        const sourceDocumentId = (await tabsStore.openDocument(sourceTabId, tabsStore.getTab(sourceTabId)!.activePaneId!, {
+          name: "shared.md", path: "/srv/shared.md", size: 4,
+        }))!;
+        const targetDocumentId = (await tabsStore.openDocument(targetTabId, tabsStore.getTab(targetTabId)!.activePaneId!, {
+          name: "shared.md", path: "/srv/shared.md", size: 4,
+        }))!;
+        for (const [tabId, id] of [[sourceTabId, sourceDocumentId], [targetTabId, targetDocumentId]]) {
+          tabsStore.setDocumentLoaded(tabId, id, "base", false);
+          tabsStore.setDocumentContent(tabId, id, "edit");
+        }
+        const savingTabId = savingSide === "source" ? sourceTabId : targetTabId;
+        const savingDocumentId = savingSide === "source" ? sourceDocumentId : targetDocumentId;
+        tabsStore.setDocumentSaveStarted(savingTabId, savingDocumentId);
+
+        expect(await tabsStore.mergeTab(sourceTabId, targetTabId, "row", "before"))
+          .toEqual({ status: "saving", path: "/srv/shared.md" });
+        expect(tabsStore.getTab(sourceTabId)?.documents).toHaveLength(1);
+        expect(tabsStore.getTab(targetTabId)?.documents).toHaveLength(1);
+
+        tabsStore.setDocumentSaved(savingTabId, savingDocumentId, "edit", {
+          path: "/srv/shared.redterm-1.md", version: "4:later",
+        }, 4);
+        expect(tabsStore.getDocument(savingTabId, savingDocumentId)).toMatchObject({
+          path: "/srv/shared.redterm-1.md", dirty: false, saveState: "saved",
+        });
+        expect(await tabsStore.mergeTab(sourceTabId, targetTabId, "row", "before"))
+          .toEqual({ status: "merged" });
+        expect(tabsStore.getDocument(targetTabId, savingDocumentId)?.path)
+          .toBe("/srv/shared.redterm-1.md");
+      } finally {
+        tabsStore.removeTab(sourceTabId);
+        tabsStore.removeTab(targetTabId);
+      }
     }
   });
 
@@ -1268,6 +1376,27 @@ describe("tabs store persistence", () => {
     } finally { tabsStore.removeTab(tabId); }
   });
 
+  test("keeps an unsaved moved document visible when its leaf’s last terminal tab moves", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte.ts?last-terminal-document-move");
+    const tabId = tabsStore.addLocalTab();
+    try {
+      const source = tabsStore.getTab(tabId)!.activePaneId!;
+      const doc = (await tabsStore.openDocument(tabId, source, { name: "draft.md", path: "/draft.md", size: 8 }))!;
+      tabsStore.setDocumentLoaded(tabId, doc, "original", false);
+      tabsStore.setDocumentContent(tabId, doc, "unsaved");
+      const viewer = (await tabsStore.splitPane(tabId, source, "row"))!;
+      await tabsStore.moveDocumentWithinTab(tabId, doc, viewer, "merge", "after");
+      expect(tabsStore.getTab(tabId)!.layout.children[1].documentIds).toEqual([doc]);
+
+      await tabsStore.movePaneWithinTab(tabId, viewer, source, "merge", "after");
+      expect(tabsStore.getTab(tabId)!.layout).toMatchObject({ type: "leaf", documentIds: [doc] });
+      expect(tabsStore.getDocument(tabId, doc)).toMatchObject({ sourcePaneId: source, content: "unsaved", dirty: true });
+      await tabsStore.setActiveDocument(tabId, doc);
+      expect(tabsStore.getTab(tabId)!.layout.activeItem).toEqual({ kind: "document", id: doc });
+    } finally { tabsStore.removeTab(tabId); }
+  });
+
   test("splits a selected tab from its own leaf and can merge it back", async () => {
     installBrowserStorage(new MemoryStorage());
     const { tabsStore } = await import("./tabs.svelte");
@@ -1301,6 +1430,107 @@ describe("tabs store persistence", () => {
       expect(tabsStore.getTab(otherTab)!.panes).toHaveLength(1);
     } finally { tabsStore.removeTab(tabId); tabsStore.removeTab(otherTab); }
   });
+  test("moves Markdown and video documents across panes without changing their source or dirty state", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const tabId = tabsStore.addTab("source.example.com", 22, { username: "user", method: { type: "password", password: "" } });
+    try {
+      const source = tabsStore.getTab(tabId)!.activePaneId!;
+      tabsStore.setPaneConnected(tabId, source, "source-session");
+      const markdown = (await tabsStore.openDocument(tabId, source, { name: "notes.md", path: "/notes.md", size: 12 }))!;
+      const video = (await tabsStore.openDocument(tabId, source, { name: "video.mp4", path: "/video.mp4", size: 100 }))!;
+      tabsStore.setDocumentLoaded(tabId, markdown, "before", false);
+      tabsStore.setDocumentContent(tabId, markdown, "after");
+      await tabsStore.moveDocumentWithinTab(tabId, markdown, source, "merge", "after", 2);
+      expect(tabsStore.getTab(tabId)!.layout.documentIds).toEqual([video, markdown]);
+      const target = (await tabsStore.splitPane(tabId, source, "row"))!;
+      tabsStore.setPaneConnected(tabId, target, "other-session");
+      await tabsStore.moveDocumentWithinTab(tabId, markdown, target, "merge", "after", 0);
+      expect(tabsStore.getTab(tabId)!.layout).toMatchObject({
+        children: [{ documentIds: [video] }, { documentIds: [markdown], activeItem: { kind: "document", id: markdown } }],
+      });
+      expect(tabsStore.getDocument(tabId, markdown)).toMatchObject({ sourcePaneId: source, sourceSessionId: "source-session", content: "after", dirty: true });
+      const unrelated = (await tabsStore.openDocument(tabId, target, { name: "other.md", path: "/other.md", size: 5 }))!;
+      expect(tabsStore.documentsClosedWithPane(tabId, source).map((doc) => doc.id)).toEqual([markdown, video]);
+      expect(tabsStore.documentsClosedWithPane(tabId, source).find((doc) => doc.id === markdown)?.dirty).toBe(true);
+      expect(tabsStore.documentsClosedWithPane(tabId, target).map((doc) => doc.id)).toEqual([markdown, unrelated]);
+      await tabsStore.setActivePane(tabId, source);
+      await tabsStore.setActiveDocument(tabId, markdown);
+      expect(tabsStore.getTab(tabId)!.activePaneId).toBe(target);
+      expect(await tabsStore.openDocument(tabId, source, { name: "notes.md", path: "/notes.md", size: 12 })).toBe(markdown);
+      expect(tabsStore.getTab(tabId)!.layout.children[1].documentIds).toEqual([markdown, unrelated]);
+      expect(tabsStore.closeDocuments(tabId, source).map((doc) => doc.id)).toEqual([markdown, video]);
+      expect(tabsStore.getTab(tabId)!.layout.children[1].documentIds).toEqual([unrelated]);
+      tabsStore.setPaneDisconnected(tabId, source);
+      await tabsStore.closePane(tabId, source);
+      expect(tabsStore.getDocument(tabId, markdown)).toBeUndefined();
+      expect(tabsStore.getDocument(tabId, unrelated)).toBeDefined();
+      expect(tabsStore.getPane(tabId, target)?.sessionId).toBe("other-session");
+      expect(tabsStore.closeDocuments(tabId, target).map((doc) => doc.id)).toEqual([unrelated]);
+    } finally { tabsStore.removeTab(tabId); }
+  });
+
+  test("closing an SSH source pane directly also closes its displayed dependent", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte.ts?close-remote-source");
+    const tabId = tabsStore.addTab("remote.example.com", 22, { username: "user", method: { type: "password", password: "" } });
+    try {
+      const source = tabsStore.getTab(tabId)!.activePaneId!;
+      const dependent = (await tabsStore.openDocument(tabId, source, { name: "draft.md", path: "/draft.md", size: 5 }))!;
+      const viewer = (await tabsStore.splitPane(tabId, source, "row"))!;
+      await tabsStore.moveDocumentWithinTab(tabId, dependent, viewer, "merge", "after");
+      const unrelated = (await tabsStore.openDocument(tabId, viewer, { name: "other.md", path: "/other.md", size: 6 }))!;
+      await tabsStore.closePane(tabId, source);
+      expect(tabsStore.getTab(tabId)!.layout).toMatchObject({ paneId: viewer, documentIds: [unrelated] });
+      expect(tabsStore.getDocument(tabId, dependent)).toBeUndefined();
+      expect(tabsStore.getDocument(tabId, unrelated)).toBeDefined();
+    } finally { tabsStore.removeTab(tabId); }
+  });
+
+  test("closing a local source leaves its file viewer in another leaf", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte.ts?close-local-source");
+    const tabId = tabsStore.addLocalTab();
+    try {
+      const source = tabsStore.getTab(tabId)!.activePaneId!;
+      const documentId = (await tabsStore.openDocument(tabId, source, { name: "draft.md", path: "/draft.md", size: 5 }))!;
+      const viewer = (await tabsStore.splitPane(tabId, source, "row"))!;
+      await tabsStore.moveDocumentWithinTab(tabId, documentId, viewer, "merge", "after");
+      expect(tabsStore.documentsClosedWithPane(tabId, source)).toEqual([]);
+      expect(tabsStore.closeDocuments(tabId, source)).toEqual([]);
+      await tabsStore.closePane(tabId, source);
+      expect(tabsStore.getTab(tabId)!.layout).toMatchObject({ paneId: viewer, documentIds: [documentId] });
+      expect(tabsStore.getDocument(tabId, documentId)).toMatchObject({ sourceKind: "local", sourcePaneId: source });
+    } finally { tabsStore.removeTab(tabId); }
+  });
+
+  test("splits a video viewer from its own leaf and closes it without deleting its sibling", async () => {
+    installBrowserStorage(new MemoryStorage());
+    const { tabsStore } = await import("./tabs.svelte");
+    const tabId = tabsStore.addLocalTab();
+    try {
+      const source = tabsStore.getTab(tabId)!.activePaneId!;
+      const video = (await tabsStore.openDocument(tabId, source, { name: "video.mp4", path: "/video.mp4", size: 100 }))!;
+      const markdown = (await tabsStore.openDocument(tabId, source, { name: "notes.md", path: "/notes.md", size: 20 }))!;
+      await tabsStore.moveDocumentWithinTab(tabId, video, source, "col", "before");
+      const tab = tabsStore.getTab(tabId)!;
+      expect(tab.layout).toMatchObject({ type: "split", dir: "col", children: [
+        { documentIds: [video], activeItem: { kind: "document", id: video } },
+        { paneId: source, documentIds: [markdown] },
+      ] });
+      expect(tab.panes).toHaveLength(2);
+      expect(tabsStore.getDocument(tabId, video)?.sourcePaneId).toBe(source);
+      const viewerPane = tab.activePaneId!;
+      expect(viewerPane).not.toBe(source);
+      await tabsStore.closeDocument(tabId, video);
+      expect(tabsStore.getTab(tabId)!.activePaneId).toBe(viewerPane);
+      expect(tabsStore.getTab(tabId)!.layout.children[0].activeItem).toEqual({ kind: "terminal", id: viewerPane });
+      expect(tabsStore.getTab(tabId)!.layout.children[0].documentIds).toEqual([]);
+      expect(tabsStore.getTab(tabId)!.layout.children[1].documentIds).toEqual([markdown]);
+    } finally { tabsStore.removeTab(tabId); }
+  });
+
+
 
 });
 

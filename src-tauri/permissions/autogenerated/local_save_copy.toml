@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-local-save-copy"
+description = "Enables the local_save_copy command without any pre-configured scope."
+commands.allow = ["local_save_copy"]
+
+[[permission]]
+identifier = "deny-local-save-copy"
+description = "Denies the local_save_copy command without any pre-configured scope."
+commands.deny = ["local_save_copy"]

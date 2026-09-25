@@ -8,10 +8,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 
 use super::ssh_commands::{
-    append_cleanup_error, claim_download_destination, ensure_local_sftp_preview_dir,
-    make_download_progress_emitter, make_remove_progress_emitter, resolve_sftp_preview_cache_file,
-    sanitize_file_name, RemoveOrigin, SftpDownloadedFile, SftpFileContent,
-    MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
+    append_cleanup_error, claim_download_destination, create_private_preview_file,
+    ensure_local_sftp_preview_dir, make_download_progress_emitter, make_remove_progress_emitter,
+    resolve_sftp_preview_cache_file, sanitize_file_name, RemoveOrigin, SftpDownloadedFile,
+    SftpFileContent, MAX_SFTP_PREVIEW_DOWNLOAD_BYTES,
 };
 use crate::ssh::{RemovePhase, RemoveProgress, SftpDirEntry};
 
@@ -360,6 +360,90 @@ fn unix_mtime(metadata: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+#[cfg(not(windows))]
+fn local_version_from_metadata(metadata: &std::fs::Metadata) -> Option<String> {
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return Some(format!(
+            "{}:{}:{}:{}:{}:{}",
+            metadata.len(),
+            modified.as_nanos(),
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        ));
+    }
+    #[cfg(not(unix))]
+    {
+        Some(format!("{}:{}", metadata.len(), modified.as_nanos()))
+    }
+}
+
+#[cfg(windows)]
+fn windows_local_file_identity(file: &tokio::fs::File) -> Option<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }.ok()?;
+    Some((
+        info.dwVolumeSerialNumber,
+        ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+    ))
+}
+
+#[cfg(windows)]
+fn windows_local_version_from_file(
+    file: &tokio::fs::File,
+    metadata: &std::fs::Metadata,
+) -> Option<String> {
+    use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+    };
+
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    // Both the timestamp/size and identity must describe the open file, not a
+    // path that could have been atomically replaced between independent stats.
+    let (volume, file_index) = windows_local_file_identity(file)?;
+    let mut basic_info = FILE_BASIC_INFO::default();
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileBasicInfo,
+            (&raw mut basic_info).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .ok()?;
+    // The same open file supplies metadata, identity, and ChangeTime.
+    // LastWriteTime can be restored after an in-place edit. ChangeTime tracks
+    // that metadata update even when the length and content timestamp match.
+    Some(format!(
+        "{}:{}:{}:{}:{}:{}",
+        metadata.len(),
+        modified.as_nanos(),
+        metadata.creation_time(),
+        volume,
+        file_index,
+        basic_info.ChangeTime
+    ))
+}
+
 /// Strip the Windows verbatim prefix (`\\?\C:\...`) that canonicalize
 /// returns — Win32 does not normalize forward slashes after it, so the
 /// frontend's slash-based path model would break.
@@ -592,7 +676,9 @@ pub async fn local_list_dir(path: String) -> Result<Vec<SftpDirEntry>, String> {
         .map_err(|e| format!("Failed to read directory: {}", e))?
     {
         if entries.len() >= MAX_LOCAL_LIST_ENTRIES {
-            break;
+            return Err(format!(
+                "Local directory contains more than {MAX_LOCAL_LIST_ENTRIES} entries; listing was not loaded"
+            ));
         }
         let name = entry.file_name().to_string_lossy().to_string();
         if name == "." || name == ".." {
@@ -619,6 +705,32 @@ pub async fn local_list_dir(path: String) -> Result<Vec<SftpDirEntry>, String> {
 }
 
 #[tauri::command]
+pub async fn local_file_version(path: String) -> Result<Option<String>, String> {
+    let scoped = ensure_within_home(Path::new(&path))?;
+    let metadata = tokio::fs::metadata(&scoped)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !metadata.file_type().is_file() {
+        return Err("Not a regular file".to_string());
+    }
+    #[cfg(windows)]
+    {
+        let file = tokio::fs::File::open(&scoped)
+            .await
+            .map_err(|e| e.to_string())?;
+        let opened_metadata = file.metadata().await.map_err(|e| e.to_string())?;
+        if !opened_metadata.is_file() {
+            return Err("Not a regular file".to_string());
+        }
+        Ok(windows_local_version_from_file(&file, &opened_metadata))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(local_version_from_metadata(&metadata))
+    }
+}
+
+#[tauri::command]
 pub async fn local_read_file(path: String) -> Result<SftpFileContent, String> {
     use base64::Engine as _;
 
@@ -641,6 +753,26 @@ pub async fn local_read_file(path: String) -> Result<SftpFileContent, String> {
     let mut file = tokio::fs::File::open(&scoped)
         .await
         .map_err(|e| format!("Failed to read file: {}", e))?;
+    #[cfg(windows)]
+    let version = {
+        let opened_metadata = file
+            .metadata()
+            .await
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+        if !opened_metadata.is_file() {
+            return Err("Not a regular file".to_string());
+        }
+        if opened_metadata.len() > MAX_LOCAL_PREVIEW_READ_BYTES {
+            return Err(format!(
+                "File is too large to preview ({} bytes exceeds the {} byte limit)",
+                opened_metadata.len(),
+                MAX_LOCAL_PREVIEW_READ_BYTES
+            ));
+        }
+        windows_local_version_from_file(&file, &opened_metadata)
+    };
+    #[cfg(not(windows))]
+    let version = local_version_from_metadata(&metadata);
     let mut data = Vec::new();
     let mut buffer = vec![0_u8; 256 * 1024];
     loop {
@@ -664,6 +796,7 @@ pub async fn local_read_file(path: String) -> Result<SftpFileContent, String> {
     Ok(SftpFileContent {
         path,
         content_base64: base64::engine::general_purpose::STANDARD.encode(&data),
+        version,
         size,
     })
 }
@@ -692,21 +825,461 @@ async fn read_local_file_for_save(path: &Path) -> Result<Vec<u8>, String> {
     }
     Ok(data)
 }
+#[cfg(target_os = "macos")]
+fn copy_local_save_attributes(
+    source: &std::fs::File,
+    staged: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+        fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+        fn acl_set_fd_np(fd: libc::c_int, acl: *mut libc::c_void, kind: libc::c_int)
+            -> libc::c_int;
+        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+    }
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x100;
+    let original_acl = unsafe { acl_get_fd_np(source.as_raw_fd(), ACL_TYPE_EXTENDED) };
+    let acl = if original_acl.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error);
+        }
+        // A new inode may inherit a parent ACL even if the original has none.
+        unsafe { acl_init(0) }
+    } else {
+        original_acl
+    };
+    if acl.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = unsafe { acl_set_fd_np(staged.as_raw_fd(), acl, ACL_TYPE_EXTENDED) };
+    let error = (result == -1).then(std::io::Error::last_os_error);
+    unsafe { acl_free(acl) };
+    if let Some(error) = error {
+        return Err(error);
+    }
+    // fcopyfile's ACL option drops inherited entries. The native ACL copy
+    // above retains them; use fcopyfile only for xattrs and resource forks.
+    let result = unsafe {
+        libc::fcopyfile(
+            source.as_raw_fd(),
+            staged.as_raw_fd(),
+            std::ptr::null_mut(),
+            libc::COPYFILE_XATTR,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn list_local_save_attributes(fd: libc::c_int) -> std::io::Result<Vec<std::ffi::CString>> {
+    let length = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
+    if length < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut names = vec![0u8; length as usize];
+    let actual = unsafe { libc::flistxattr(fd, names.as_mut_ptr().cast(), names.len()) };
+    if actual < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if actual as usize != names.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "xattr names changed while copying",
+        ));
+    }
+    names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| {
+            std::ffi::CString::new(name)
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn copy_local_save_attributes(
+    source: &std::fs::File,
+    staged: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let from = source.as_raw_fd();
+    let to = staged.as_raw_fd();
+    let source_names = list_local_save_attributes(from)?;
+    // POSIX access ACLs can be inherited from the parent on creation. Remove
+    // every attribute absent from the source before copying source attributes.
+    for name in list_local_save_attributes(to)? {
+        if !source_names.iter().any(|original| original == &name)
+            && unsafe { libc::fremovexattr(to, name.as_ptr()) } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    for name in source_names {
+        let len = unsafe { libc::fgetxattr(from, name.as_ptr(), std::ptr::null_mut(), 0) };
+        if len < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut value = vec![0u8; len as usize];
+        let actual =
+            unsafe { libc::fgetxattr(from, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+        if actual < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if actual as usize != value.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "xattr value changed while copying",
+            ));
+        }
+        if unsafe { libc::fsetxattr(to, name.as_ptr(), value.as_ptr().cast(), value.len(), 0) } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn copy_local_save_attributes(_: &std::fs::File, _: &std::fs::File) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "cannot preserve ACLs and xattrs on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn copy_local_save_attributes(
+    source: &std::fs::File,
+    staged: &std::fs::File,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{
+        EqualSid, GetSecurityDescriptorControl, ACL, DACL_SECURITY_INFORMATION,
+        GROUP_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    struct SecurityInfo {
+        descriptor: PSECURITY_DESCRIPTOR,
+        owner: PSID,
+        group: PSID,
+        acl: *mut ACL,
+    }
+    impl SecurityInfo {
+        fn read(handle: HANDLE) -> std::io::Result<Self> {
+            let mut info = Self {
+                descriptor: PSECURITY_DESCRIPTOR::default(),
+                owner: PSID::default(),
+                group: PSID::default(),
+                acl: std::ptr::null_mut(),
+            };
+            let flags = OBJECT_SECURITY_INFORMATION(
+                OWNER_SECURITY_INFORMATION.0
+                    | GROUP_SECURITY_INFORMATION.0
+                    | DACL_SECURITY_INFORMATION.0,
+            );
+            let status = unsafe {
+                GetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    flags,
+                    Some(&mut info.owner),
+                    Some(&mut info.group),
+                    Some(&mut info.acl),
+                    None,
+                    Some(&mut info.descriptor),
+                )
+            };
+            if status != ERROR_SUCCESS {
+                return Err(std::io::Error::from_raw_os_error(status.0 as i32));
+            }
+            Ok(info)
+        }
+        fn protected(&self) -> std::io::Result<bool> {
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            unsafe { GetSecurityDescriptorControl(self.descriptor, &mut control, &mut revision) }
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            Ok(control & SE_DACL_PROTECTED.0 != 0)
+        }
+        fn acl_bytes(&self) -> Option<&[u8]> {
+            if self.acl.is_null() {
+                return None;
+            }
+            // GetSecurityInfo owns the ACL buffer until this descriptor is dropped.
+            let size = unsafe { (*self.acl).AclSize as usize };
+            Some(unsafe { std::slice::from_raw_parts(self.acl.cast::<u8>(), size) })
+        }
+    }
+    impl Drop for SecurityInfo {
+        fn drop(&mut self) {
+            if !self.descriptor.0.is_null() {
+                unsafe {
+                    LocalFree(Some(HLOCAL(self.descriptor.0)));
+                }
+            }
+        }
+    }
+    fn same_sid(a: PSID, b: PSID) -> bool {
+        if a.is_invalid() || b.is_invalid() {
+            a == b
+        } else {
+            unsafe { EqualSid(a, b).is_ok() }
+        }
+    }
+
+    let staged_handle = HANDLE(staged.as_raw_handle());
+    let original = SecurityInfo::read(HANDLE(source.as_raw_handle()))?;
+    let before = SecurityInfo::read(staged_handle)?;
+    if !same_sid(original.owner, before.owner) || !same_sid(original.group, before.group) {
+        // Changing owner/group requires WRITE_OWNER or a privilege. Never
+        // publish a replacement that changes the source's ownership instead.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cannot preserve file owner or group on the staged file",
+        ));
+    }
+    let protection = if original.protected()? {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    let flags = OBJECT_SECURITY_INFORMATION(DACL_SECURITY_INFORMATION.0 | protection.0);
+    let status = unsafe {
+        SetSecurityInfo(
+            staged_handle,
+            SE_FILE_OBJECT,
+            flags,
+            None,
+            None,
+            Some(original.acl),
+            None,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(std::io::Error::from_raw_os_error(status.0 as i32));
+    }
+    // Unprotected ACLs can be combined with inherited parent ACEs by the OS.
+    // Check the resulting full DACL (including inherited ACE flags), not just
+    // the SetSecurityInfo success code, before any new bytes are written.
+    let actual = SecurityInfo::read(staged_handle)?;
+    if actual.protected()? != original.protected()?
+        || !same_sid(original.owner, actual.owner)
+        || !same_sid(original.group, actual.group)
+        || actual.acl_bytes() != original.acl_bytes()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "staged file security descriptor differs from original",
+        ));
+    }
+    Ok(())
+}
+
+fn preserve_local_save_metadata(
+    source: &std::fs::File,
+    staged: &std::fs::File,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let original = source.metadata()?;
+        let temporary = staged.metadata()?;
+        if temporary.uid() != original.uid() || temporary.gid() != original.gid() {
+            use std::os::fd::AsRawFd;
+            let uid = (temporary.uid() != original.uid())
+                .then_some(original.uid())
+                .unwrap_or(!0);
+            let gid = (temporary.gid() != original.gid())
+                .then_some(original.gid())
+                .unwrap_or(!0);
+            if unsafe { libc::fchown(staged.as_raw_fd(), uid, gid) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        staged.set_permissions(std::fs::Permissions::from_mode(original.mode()))?;
+    }
+    #[cfg(windows)]
+    staged.set_permissions(source.metadata()?.permissions())?;
+    copy_local_save_attributes(source, staged)
+}
+
+#[cfg(target_os = "macos")]
+fn local_save_directory_has_unsafe_acl(directory: &Path) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+        fn acl_to_text(acl: *mut libc::c_void, length: *mut isize) -> *mut libc::c_char;
+        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+    }
+    let handle = std::fs::File::open(directory)?;
+    let acl = unsafe { acl_get_fd_np(handle.as_raw_fd(), 0x100) };
+    if acl.is_null() {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let mut length = 0;
+    let text = unsafe { acl_to_text(acl, &mut length) };
+    if text.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe { acl_free(acl) };
+        return Err(error);
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(text.cast::<u8>(), length as usize) };
+    // Denials and read-only inherited ACLs cannot rename our stage. Reject
+    // any unrecognized grant rather than assume it cannot allow delete_child.
+    let safe = std::str::from_utf8(bytes).is_ok_and(|text| {
+        text.lines().all(|line| {
+            if line.starts_with("!#acl") {
+                return true;
+            }
+            let Some((prefix, permissions)) = line.rsplit_once(':') else {
+                return false;
+            };
+            let Some((_, policy)) = prefix.rsplit_once(':') else {
+                return false;
+            };
+            if policy.split(',').next() == Some("deny") {
+                return true;
+            }
+            if policy.split(',').next() != Some("allow") {
+                return false;
+            }
+            permissions.split(',').all(|permission| {
+                matches!(
+                    permission,
+                    "read"
+                        | "list"
+                        | "search"
+                        | "execute"
+                        | "readattr"
+                        | "readextattr"
+                        | "readsecurity"
+                        | "file_inherit"
+                        | "directory_inherit"
+                )
+            })
+        })
+    });
+    unsafe {
+        acl_free(text.cast());
+        acl_free(acl)
+    };
+    Ok(!safe)
+}
+
+#[cfg(unix)]
+fn ensure_local_save_parent_protected(parent: &Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = unsafe { libc::geteuid() };
+    for directory in parent.ancestors() {
+        let metadata = std::fs::symlink_metadata(directory)
+            .map_err(|error| format!("Failed to verify save directory: {error}"))?;
+        if !metadata.file_type().is_dir()
+            || (metadata.uid() != uid && metadata.uid() != 0)
+            || (metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0)
+        {
+            return Err(
+                "Save copy requires a private or trusted sticky directory for every ancestor"
+                    .to_string(),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        if local_save_directory_has_unsafe_acl(directory)
+            .map_err(|error| format!("Failed to verify save directory ACL: {error}"))?
+        {
+            return Err("Save copy directory ACL cannot be verified as private".to_string());
+        }
+    }
+    Ok(())
+}
 
 async fn create_local_save_file(path: &Path) -> std::io::Result<tokio::fs::File> {
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
+    #[cfg(windows)]
+    {
+        // SetSecurityInfo needs WRITE_DAC on the SAME handle that was created.
+        // Deny delete/write sharing so another process cannot swap the stage.
+        options.access_mode(0x4000_0000 | 0x0004_0000 | 0x0002_0000 | 0x0000_0080 | 0x0000_0100);
+        options.share_mode(0x0000_0001);
+    }
     options.open(path).await
 }
 
+// Called only before publication; a published revision is never a cleanup target.
+async fn cleanup_unpublished_local_save(path: &Path, error: String) -> String {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => error,
+        Err(cleanup) => format!(
+            "{error}; failed to remove temporary save file {}: {cleanup}",
+            path.display()
+        ),
+    }
+}
+// Keep the origin recognizable and its extension usable in the file explorer.
+// A UUID prevents two saves (including saves by different processes) from
+// choosing the same revision name; hard_link below is the no-replace gate.
+fn local_save_copy_name(path: &Path) -> Result<String, String> {
+    let stem = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "File name cannot be used for a saved copy".to_string())?;
+    // The editor retargets to every saved copy. Remove only the final marker
+    // that this command emitted, so its name never grows with repeated saves.
+    let stem = stem
+        .rsplit_once(".redterm-")
+        .filter(|(origin, id)| {
+            !origin.is_empty() && id.len() == 36 && uuid::Uuid::parse_str(id).is_ok()
+        })
+        .map_or(stem, |(origin, _)| origin);
+    let extension = path
+        .extension()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let suffix = if extension.is_empty() {
+        String::new()
+    } else {
+        format!(".{extension}")
+    };
+    let marker = format!(".redterm-{}", uuid::Uuid::new_v4());
+    // Common file systems allow 255-byte leaf names. Leave headroom rather
+    // than making an otherwise valid long source name impossible to save.
+    let stem_limit = 240usize
+        .checked_sub(marker.len() + suffix.len())
+        .ok_or_else(|| "File extension is too long for a saved copy".to_string())?;
+    let mut end = stem.len().min(stem_limit);
+    while !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 {
+        return Err("File name is too long for a saved copy".to_string());
+    }
+    Ok(format!("{}{marker}{suffix}", &stem[..end]))
+}
 #[tauri::command]
-pub async fn local_write_file(
+pub async fn local_save_copy(
     path: String,
     content: String,
     expected_content: String,
-) -> Result<(), String> {
+) -> Result<crate::SavedFileCopy, String> {
     let scoped = ensure_within_home(Path::new(&path))?;
     let _write_guard = crate::FILE_WRITE_LOCK.lock().await;
     let metadata = tokio::fs::metadata(&scoped)
@@ -731,11 +1304,47 @@ pub async fn local_write_file(
     let parent = scoped
         .parent()
         .ok_or_else(|| "File has no parent directory".to_string())?;
+    #[cfg(unix)]
+    ensure_local_save_parent_protected(parent)?;
+    let copy_path = parent.join(local_save_copy_name(&scoped)?);
     let temp_path = parent.join(format!(".redterm-save-{}.tmp", uuid::Uuid::new_v4()));
     // On Unix, stage privately from creation, before restoring the original metadata.
     let mut temp_file = create_local_save_file(&temp_path)
         .await
         .map_err(|e| format!("Failed to create temporary save file: {}", e))?;
+    // Transfer the existing file's security metadata while the staged file is
+    // still empty. In particular, a Windows temp inherits its parent DACL;
+    // writing first could expose new bytes under the wrong ACL.
+    let source_path = scoped.clone();
+    let staged_handle = temp_file
+        .try_clone()
+        .await
+        .map_err(|error| format!("Failed to retain staged file handle: {error}"))?
+        .into_std()
+        .await;
+    let preserve_result = tokio::task::spawn_blocking(move || {
+        let source = std::fs::File::open(&source_path)?;
+        if !source.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Not a regular file",
+            ));
+        }
+        let staged = staged_handle;
+        preserve_local_save_metadata(&source, &staged)
+    })
+    .await
+    .map_err(std::io::Error::other)
+    .and_then(|result| result);
+    if let Err(error) = preserve_result {
+        drop(temp_file);
+        return Err(cleanup_unpublished_local_save(
+            &temp_path,
+            format!("Failed to preserve file metadata: {}", error),
+        )
+        .await);
+    }
+
     let write_result = async {
         temp_file.write_all(content.as_bytes()).await?;
         temp_file.flush().await?;
@@ -743,66 +1352,106 @@ pub async fn local_write_file(
         Ok::<(), std::io::Error>(())
     }
     .await;
-    drop(temp_file);
     if let Err(error) = write_result {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(format!("Failed to write temporary save file: {}", error));
+        drop(temp_file);
+        return Err(cleanup_unpublished_local_save(
+            &temp_path,
+            format!("Failed to write temporary save file: {}", error),
+        )
+        .await);
     }
 
     let current_content = match read_local_file_for_save(&scoped).await {
         Ok(content) => content,
         Err(error) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(error);
+            drop(temp_file);
+            return Err(cleanup_unpublished_local_save(&temp_path, error).await);
         }
     };
     if current_content != expected_bytes {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err("File changed since it was opened. Reload before saving.".to_string());
+        drop(temp_file);
+        return Err(cleanup_unpublished_local_save(
+            &temp_path,
+            "File changed since it was opened. Reload before saving.".to_string(),
+        )
+        .await);
     }
-    let latest_metadata = match tokio::fs::metadata(&scoped).await {
-        Ok(metadata) if metadata.file_type().is_file() => metadata,
-        Ok(_) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err("Not a regular file".to_string());
-        }
-        Err(error) => {
-            let _ = tokio::fs::remove_file(&temp_path).await;
+
+    // Link, never rename over the source or another revision. The exclusive
+    // destination creation refuses a colliding name instead of overwriting it.
+    // Keep the staged handle to identify our inode even if a path is swapped.
+    if let Err(error) = tokio::fs::hard_link(&temp_path, &copy_path).await {
+        drop(temp_file);
+        return Err(cleanup_unpublished_local_save(
+            &temp_path,
+            format!("Failed to publish saved copy: {}", error),
+        )
+        .await);
+    }
+    // Once published, NEVER delete copy_path: it contains the saved revision.
+    // Windows denies unlink while the staged handle is open. Retain its volume
+    // and file index, then read ChangeTime from the final name after unlink;
+    // removing a hard link may change the revision on either OS.
+    #[cfg(windows)]
+    let published_identity = windows_local_file_identity(&temp_file);
+    #[cfg(windows)]
+    drop(temp_file);
+    let cleanup = tokio::fs::remove_file(&temp_path).await;
+    #[cfg(not(windows))]
+    let version = temp_file
+        .metadata()
+        .await
+        .ok()
+        .filter(|m| m.is_file())
+        .as_ref()
+        .and_then(local_version_from_metadata);
+    #[cfg(not(windows))]
+    drop(temp_file);
+    cleanup.map_err(|error| {
+        format!(
+            "Saved copy at {} but failed to remove temporary link: {}",
+            copy_path.display(),
+            error
+        )
+    })?;
+    #[cfg(windows)]
+    let version = {
+        let expected = published_identity.ok_or_else(|| {
+            format!(
+                "Saved copy at {} but could not identify the published file",
+                copy_path.display()
+            )
+        })?;
+        let published = tokio::fs::File::open(&copy_path).await.map_err(|error| {
+            format!(
+                "Saved copy at {} but could not reopen it: {error}",
+                copy_path.display()
+            )
+        })?;
+        if windows_local_file_identity(&published) != Some(expected) {
             return Err(format!(
-                "Failed to read file metadata before saving: {}",
-                error
+                "Saved copy at {} but its identity changed",
+                copy_path.display()
             ));
         }
-    };
-    let preserve_result = async {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let temp_metadata = tokio::fs::metadata(&temp_path).await?;
-            let uid =
-                (temp_metadata.uid() != latest_metadata.uid()).then_some(latest_metadata.uid());
-            let gid =
-                (temp_metadata.gid() != latest_metadata.gid()).then_some(latest_metadata.gid());
-            if uid.is_some() || gid.is_some() {
-                let owner_path = temp_path.clone();
-                tokio::task::spawn_blocking(move || std::os::unix::fs::chown(owner_path, uid, gid))
-                    .await
-                    .map_err(std::io::Error::other)??;
-            }
+        let metadata = published.metadata().await.map_err(|error| {
+            format!(
+                "Saved copy at {} but could not inspect it: {error}",
+                copy_path.display()
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "Saved copy at {} is not a regular file",
+                copy_path.display()
+            ));
         }
-        tokio::fs::set_permissions(&temp_path, latest_metadata.permissions()).await?;
-        Ok::<(), std::io::Error>(())
-    }
-    .await;
-    if let Err(error) = preserve_result {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(format!("Failed to preserve file metadata: {}", error));
-    }
-    if let Err(error) = tokio::fs::rename(&temp_path, &scoped).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(format!("Failed to replace file atomically: {}", error));
-    }
-    Ok(())
+        windows_local_version_from_file(&published, &metadata)
+    };
+    Ok(crate::SavedFileCopy {
+        path: copy_path.to_string_lossy().into_owned(),
+        version,
+    })
 }
 async fn copy_with_progress(
     from: &Path,
@@ -889,9 +1538,7 @@ pub async fn local_download_file(
     ));
     let scoped_label = path.clone();
 
-    let mut part_file = tokio::fs::File::create(&part_path)
-        .await
-        .map_err(|error| format!("Failed to create preview download file: {error}"))?;
+    let mut part_file = create_private_preview_file(&part_path).await?;
     let downloaded = match local_download(
         &app,
         &scoped,
@@ -1042,6 +1689,32 @@ pub async fn local_upload(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_directory_over_limit_fails_instead_of_hiding_unlisted_files() {
+        struct TestDirectory(std::path::PathBuf);
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let home = local_home_dir_path().expect("test home directory");
+        let root = home.join(format!(".redterm-list-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let fixture = TestDirectory(root);
+        for index in 0..MAX_LOCAL_LIST_ENTRIES {
+            std::fs::File::create(fixture.0.join(format!("{index:05}"))).unwrap();
+        }
+        let path = fixture.0.to_string_lossy().into_owned();
+        assert_eq!(
+            local_list_dir(path.clone()).await.unwrap().len(),
+            MAX_LOCAL_LIST_ENTRIES
+        );
+        std::fs::File::create(fixture.0.join("overflow")).unwrap();
+        local_list_dir(path)
+            .await
+            .expect_err("over-limit entries must not be reported as a complete listing");
+    }
 
     #[test]
     fn requested_download_file_name_preserves_whitespace() {
@@ -1219,7 +1892,308 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_write_rejects_stale_content_without_overwriting() {
+    async fn local_preview_revision_detects_same_size_rewrite() {
+        use base64::Engine as _;
+
+        let home = local_home_dir_path().expect("test home directory");
+        let path = home.join(format!(
+            ".redterm-preview-revision-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"first").expect("create test file");
+        let path_text = path.to_string_lossy().to_string();
+        let first = local_read_file(path_text.clone())
+            .await
+            .expect("initial preview");
+        let unchanged = local_file_version(path_text.clone())
+            .await
+            .expect("stat unchanged file");
+
+        std::fs::write(&path, b"later").expect("rewrite same-size file");
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+            .expect("set known modified time");
+        let changed = local_file_version(path_text.clone())
+            .await
+            .expect("stat changed file");
+        let refreshed = local_read_file(path_text).await.expect("changed preview");
+        std::fs::remove_file(&path).expect("remove test file");
+
+        assert_eq!(first.version, unchanged);
+        assert_ne!(first.version, changed);
+        assert_eq!(refreshed.version, changed);
+        assert_eq!(refreshed.size, first.size);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(refreshed.content_base64)
+                .unwrap(),
+            b"later"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_preview_revision_detects_atomic_replacement_with_preserved_mtime() {
+        let home = local_home_dir_path().expect("test home directory");
+        let path = home.join(format!(".redterm-revision-{}", uuid::Uuid::new_v4()));
+        let replacement = home.join(format!(".redterm-revision-{}", uuid::Uuid::new_v4()));
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::write(&path, b"first").expect("create original");
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(fixed_time)
+            .expect("set original mtime");
+        let path_text = path.to_string_lossy().to_string();
+        let original = local_read_file(path_text.clone())
+            .await
+            .expect("original preview");
+        std::fs::write(&replacement, b"later").expect("stage replacement");
+        std::fs::File::open(&replacement)
+            .unwrap()
+            .set_modified(fixed_time)
+            .expect("preserve replacement mtime");
+        std::fs::rename(&replacement, &path).expect("atomically replace original");
+        let version = local_file_version(path_text.clone())
+            .await
+            .expect("replacement version");
+        let replaced = local_read_file(path_text)
+            .await
+            .expect("replacement preview");
+        let metadata = std::fs::metadata(&path).expect("replacement metadata");
+        std::fs::remove_file(&path).expect("remove replacement");
+        assert_eq!(metadata.len(), original.size);
+        assert_eq!(metadata.modified().unwrap(), fixed_time);
+        assert_ne!(original.version, version);
+        assert_eq!(replaced.version, version);
+        assert_eq!(replaced.content_base64, "bGF0ZXI=");
+    }
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn local_save_copy_rejects_unprotected_parent_and_delete_child_acl() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = local_home_dir_path().unwrap().join(format!(
+            ".redterm-shared-save-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.md");
+        std::fs::write(&source, b"original").unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        local_save_copy(
+            source.to_string_lossy().into_owned(),
+            "private".into(),
+            "original".into(),
+        )
+        .await
+        .expect_err("nonsticky shared parent must not permit another account to replace stage");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow delete_child,add_file"])
+            .arg(&directory)
+            .status()
+            .unwrap()
+            .success());
+        local_save_copy(
+            source.to_string_lossy().into_owned(),
+            "private".into(),
+            "original".into(),
+        )
+        .await
+        .expect_err("macOS ACL can grant deletion despite 0700 mode");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        assert!(std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&directory)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let saved = local_save_copy(
+            source.to_string_lossy().into_owned(),
+            "private".into(),
+            "original".into(),
+        )
+        .await
+        .expect("owner-owned sticky directory protects stage names");
+        assert_eq!(std::fs::read(&saved.path).unwrap(), b"private");
+        assert_eq!(std::fs::read(&source).unwrap(), b"original");
+        std::fs::remove_file(saved.path).unwrap();
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn local_save_copy_preserves_original_xattr_and_mode() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = local_home_dir_path()
+            .expect("test home directory")
+            .join(format!(".redterm-metadata-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"original").expect("create original");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("set original mode");
+        let name = c"user.redterm.metadata.test";
+        let value = b"retain-this-attribute";
+        let file = std::fs::File::open(&path).expect("open original");
+        assert_eq!(
+            unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                    0,
+                )
+            },
+            0,
+            "set original xattr: {}",
+            std::io::Error::last_os_error()
+        );
+        drop(file);
+
+        let saved = local_save_copy(
+            path.to_string_lossy().into_owned(),
+            "replacement".into(),
+            "original".into(),
+        )
+        .await
+        .expect("save with metadata");
+        let copy = Path::new(&saved.path);
+        let file = std::fs::File::open(copy).expect("open saved copy");
+        let mut restored = [0u8; 64];
+        let size = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                restored.as_mut_ptr().cast(),
+                restored.len(),
+                0,
+                0,
+            )
+        };
+        let copy_mode = file.metadata().expect("copy metadata").permissions().mode() & 0o777;
+        let original = std::fs::File::open(&path).expect("open unchanged source");
+        let mut source_attr = [0u8; 64];
+        let source_size = unsafe {
+            libc::fgetxattr(
+                original.as_raw_fd(),
+                name.as_ptr(),
+                source_attr.as_mut_ptr().cast(),
+                source_attr.len(),
+                0,
+                0,
+            )
+        };
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read(copy).unwrap(), b"replacement");
+        assert_eq!(copy_mode, 0o640);
+        assert_eq!(
+            original.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            size,
+            value.len() as isize,
+            "copy xattr: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(&restored[..size as usize], value);
+        assert_eq!(source_size, value.len() as isize);
+        assert_eq!(&source_attr[..source_size as usize], value);
+        std::fs::remove_file(copy).expect("remove copy");
+        std::fs::remove_file(&path).expect("remove source");
+    }
+    #[tokio::test]
+    #[cfg(target_os = "macos")]
+    async fn local_save_copy_preserves_acl_without_inheriting_parent_acl() {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn acl_get_fd_np(fd: libc::c_int, kind: libc::c_int) -> *mut libc::c_void;
+            fn acl_to_text(acl: *mut libc::c_void, length: *mut isize) -> *mut libc::c_char;
+            fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+        }
+        fn acl_text(file: &std::fs::File) -> Option<Vec<u8>> {
+            let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), 0x100) };
+            if acl.is_null() {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENOENT)
+                );
+                return None;
+            }
+            let mut length = 0;
+            let text = unsafe { acl_to_text(acl, &mut length) };
+            assert!(
+                !text.is_null(),
+                "format ACL: {}",
+                std::io::Error::last_os_error()
+            );
+            let value =
+                unsafe { std::slice::from_raw_parts(text.cast::<u8>(), length as usize) }.to_vec();
+            unsafe {
+                acl_free(text.cast());
+                acl_free(acl);
+            }
+            Some(value)
+        }
+        fn chmod(path: &Path, arg: &str, rule: Option<&str>) {
+            let mut command = std::process::Command::new("/bin/chmod");
+            command.arg(arg);
+            if let Some(rule) = rule {
+                command.arg(rule);
+            }
+            assert!(command.arg(path).status().expect("run chmod").success());
+        }
+        let directory = local_home_dir_path()
+            .expect("test home directory")
+            .join(format!(".redterm-acl-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("create ACL parent");
+        chmod(&directory, "+a", Some("everyone allow read,file_inherit"));
+        let path = directory.join("document.md");
+        std::fs::write(&path, b"original").expect("create source with inherited ACL");
+        chmod(&path, "+a", Some("everyone deny execute"));
+        let explicit_acl = acl_text(&std::fs::File::open(&path).unwrap()).expect("source ACL");
+        let path_text = path.to_string_lossy().into_owned();
+        let first = local_save_copy(path_text.clone(), "first".into(), "original".into())
+            .await
+            .expect("save with source ACL");
+        assert_eq!(
+            acl_text(&std::fs::File::open(&path).unwrap()),
+            Some(explicit_acl.clone())
+        );
+        assert_eq!(
+            acl_text(&std::fs::File::open(&first.path).unwrap()),
+            Some(explicit_acl)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read(&first.path).unwrap(), b"first");
+
+        chmod(&path, "-N", None);
+        assert!(acl_text(&std::fs::File::open(&path).unwrap()).is_none());
+        let second = local_save_copy(path_text, "second".into(), "original".into())
+            .await
+            .expect("save without source ACL");
+        assert!(
+            acl_text(&std::fs::File::open(&second.path).unwrap()).is_none(),
+            "must not inherit parent ACL"
+        );
+        assert_eq!(std::fs::read(&first.path).unwrap(), b"first");
+        assert_eq!(std::fs::read(&second.path).unwrap(), b"second");
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        std::fs::remove_file(&first.path).expect("remove first revision");
+        std::fs::remove_file(&second.path).expect("remove second revision");
+        std::fs::remove_file(&path).expect("remove source");
+        std::fs::remove_dir(&directory).expect("remove ACL parent");
+    }
+
+    #[tokio::test]
+    async fn local_save_copy_rejects_stale_content_without_overwriting() {
         let home = local_home_dir_path().expect("test home directory");
         let path = home.join(format!(
             ".redterm-save-conflict-test-{}",
@@ -1230,60 +2204,155 @@ mod tests {
             .expect("create test file");
         let path_text = path.to_string_lossy().to_string();
 
-        local_write_file(path_text.clone(), "mine".to_string(), "stale".to_string())
+        let conflict = local_save_copy(path_text.clone(), "mine".to_string(), "stale".to_string())
             .await
             .expect_err("stale save must fail");
+        assert!(conflict.contains("File changed since it was opened"));
         assert_eq!(
             tokio::fs::read(&path).await.expect("read unchanged file"),
             b"original"
         );
 
-        local_write_file(path_text, "mine".to_string(), "original".to_string())
-            .await
-            .expect("save unchanged file");
+        let saved = local_save_copy(
+            path_text.clone(),
+            "mine".to_string(),
+            "original".to_string(),
+        )
+        .await
+        .expect("save unchanged file");
+        assert_ne!(saved.path, path_text);
         assert_eq!(
-            tokio::fs::read(&path).await.expect("read saved file"),
-            b"mine"
+            saved.version,
+            local_file_version(saved.path.clone())
+                .await
+                .expect("saved copy version")
         );
-        tokio::fs::remove_file(&path)
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
+        assert_eq!(tokio::fs::read(&saved.path).await.unwrap(), b"mine");
+        // A failed save on a changed source must leave an already published
+        // revision alone, not treat it as a temporary file to clean up.
+        tokio::fs::write(&path, b"external edit").await.unwrap();
+        local_save_copy(path_text, "later".into(), "original".into())
             .await
-            .expect("remove test file");
+            .expect_err("external writer changed the source");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"external edit");
+        assert_eq!(tokio::fs::read(&saved.path).await.unwrap(), b"mine");
+        tokio::fs::remove_file(&saved.path)
+            .await
+            .expect("remove revision");
+        tokio::fs::remove_file(&path).await.expect("remove source");
     }
     #[tokio::test]
-    async fn concurrent_local_writes_allow_only_one_shared_baseline() {
+    async fn concurrent_local_copies_preserve_each_revision_and_source() {
         let home = local_home_dir_path().expect("test home directory");
-        let path = home.join(format!(
-            ".redterm-concurrent-save-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let path = home.join(format!("document-{}.md", uuid::Uuid::new_v4()));
         tokio::fs::write(&path, b"original")
             .await
             .expect("create test file");
         let path_text = path.to_string_lossy().to_string();
 
-        let first = local_write_file(
+        let first = local_save_copy(
             path_text.clone(),
             "first".to_string(),
             "original".to_string(),
         );
-        let second = local_write_file(path_text, "second".to_string(), "original".to_string());
-        let (first_result, second_result) = tokio::join!(first, second);
-
-        assert_ne!(first_result.is_ok(), second_result.is_ok());
-        let expected: &[u8] = if first_result.is_ok() {
-            b"first"
-        } else {
-            b"second"
-        };
-        assert_eq!(
-            tokio::fs::read(&path).await.expect("read winning save"),
-            expected
+        let second = local_save_copy(
+            path_text.clone(),
+            "second".to_string(),
+            "original".to_string(),
         );
-        tokio::fs::remove_file(&path)
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first revision");
+        let second = second.expect("second revision");
+        assert_ne!(first.path, second.path);
+        assert_eq!(Path::new(&first.path).extension().unwrap(), "md");
+        assert!(Path::new(&first.path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("document-"));
+        assert_eq!(Path::new(&first.path).parent(), path.parent());
+        assert_eq!(
+            first.version,
+            local_file_version(first.path.clone()).await.unwrap()
+        );
+        assert_eq!(
+            second.version,
+            local_file_version(second.path.clone()).await.unwrap()
+        );
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
+        assert_eq!(tokio::fs::read(&first.path).await.unwrap(), b"first");
+        assert_eq!(tokio::fs::read(&second.path).await.unwrap(), b"second");
+        tokio::fs::remove_file(&first.path)
             .await
-            .expect("remove test file");
+            .expect("remove first revision");
+        tokio::fs::remove_file(&second.path)
+            .await
+            .expect("remove second revision");
+        tokio::fs::remove_file(&path).await.expect("remove source");
     }
 
+    #[tokio::test]
+    async fn repeated_local_saves_keep_origin_and_bounded_names_without_replacing_copies() {
+        let home = local_home_dir_path().expect("test home directory");
+        let path = home.join(format!(
+            "notes.redterm-not-a-uuid-{}.md",
+            uuid::Uuid::new_v4()
+        ));
+        let origin_name = path.file_stem().unwrap().to_str().unwrap().to_owned();
+        tokio::fs::write(&path, b"original")
+            .await
+            .expect("create source");
+        let first = local_save_copy(
+            path.to_string_lossy().into_owned(),
+            "first".into(),
+            "original".into(),
+        )
+        .await
+        .expect("first copy");
+        let second = local_save_copy(first.path.clone(), "second".into(), "first".into())
+            .await
+            .expect("second copy");
+        let third = local_save_copy(second.path.clone(), "third".into(), "second".into())
+            .await
+            .expect("third copy");
+        let first_name = Path::new(&first.path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let second_name = Path::new(&second.path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let third_name = Path::new(&third.path)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let prefix = format!("{origin_name}.redterm-");
+        for name in [first_name, second_name, third_name] {
+            assert!(
+                name.starts_with(&prefix),
+                "origin must survive repeated saves: {name}"
+            );
+            assert!(name.ends_with(".md"));
+            assert_eq!(name.len(), prefix.len() + 36 + ".md".len());
+        }
+        assert_ne!(first.path, second.path);
+        assert_ne!(second.path, third.path);
+        assert_eq!(first_name.len(), second_name.len());
+        assert_eq!(second_name.len(), third_name.len());
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
+        assert_eq!(tokio::fs::read(&first.path).await.unwrap(), b"first");
+        assert_eq!(tokio::fs::read(&second.path).await.unwrap(), b"second");
+        assert_eq!(tokio::fs::read(&third.path).await.unwrap(), b"third");
+        for file in [&first.path, &second.path, &third.path] {
+            tokio::fs::remove_file(file).await.expect("remove revision");
+        }
+        tokio::fs::remove_file(&path).await.expect("remove source");
+    }
     #[test]
     fn local_entry_name_validation_rejects_separators_and_relative_names() {
         assert!(validate_local_entry_name("notes.txt").is_ok());
@@ -1438,5 +2507,135 @@ mod tests {
         assert_eq!(last.total, Some(expected_total));
         assert_eq!(last.deleted, expected_total);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_revision_tests {
+    use super::*;
+    use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+    use windows::Win32::Foundation::{FILETIME, HANDLE};
+    use windows::Win32::Storage::FileSystem::SetFileTime;
+
+    #[tokio::test]
+    async fn local_preview_revision_detects_in_place_rewrite_with_restored_mtime() {
+        let home = local_home_dir_path().expect("test home directory");
+        let path = home.join(format!(".redterm-revision-{}", uuid::Uuid::new_v4()));
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::write(&path, b"first").expect("create original");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(fixed_time)
+            .expect("set original mtime");
+        let path_text = path.to_string_lossy().to_string();
+        let original = local_read_file(path_text.clone())
+            .await
+            .expect("initial preview");
+        let original_metadata = std::fs::metadata(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"later").expect("rewrite same-size file in place");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(fixed_time)
+            .expect("restore original mtime");
+        let current_metadata = std::fs::metadata(&path).unwrap();
+        let current = local_file_version(path_text.clone())
+            .await
+            .expect("refresh preview version");
+        let refreshed = local_read_file(path_text).await.expect("updated preview");
+        std::fs::remove_file(path).expect("remove test file");
+        assert_eq!(original_metadata.len(), current_metadata.len());
+        assert_eq!(
+            original_metadata.modified().unwrap(),
+            current_metadata.modified().unwrap()
+        );
+        assert_eq!(
+            original_metadata.creation_time(),
+            current_metadata.creation_time()
+        );
+        assert_ne!(
+            original.version, current,
+            "in-place rewrite must invalidate Refresh"
+        );
+        assert_eq!(refreshed.version, current);
+        assert_eq!(refreshed.content_base64, "bGF0ZXI=");
+    }
+
+    #[tokio::test]
+    async fn local_preview_revision_detects_replacement_with_identical_legacy_metadata() {
+        let home = local_home_dir_path().expect("test home directory");
+        let path = home.join(format!(".redterm-revision-{}", uuid::Uuid::new_v4()));
+        let replacement = home.join(format!(".redterm-revision-{}", uuid::Uuid::new_v4()));
+        let fixed_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::write(&path, b"first").expect("create original");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(fixed_time)
+            .expect("set original mtime");
+        let original_metadata = std::fs::metadata(&path).unwrap();
+        let path_text = path.to_string_lossy().to_string();
+        let original = local_read_file(path_text.clone())
+            .await
+            .expect("original preview");
+
+        std::fs::write(&replacement, b"later").expect("stage replacement");
+        let staged = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap();
+        staged
+            .set_modified(fixed_time)
+            .expect("set replacement mtime");
+        let creation = original_metadata.creation_time();
+        let creation = FILETIME {
+            dwLowDateTime: creation as u32,
+            dwHighDateTime: (creation >> 32) as u32,
+        };
+        unsafe { SetFileTime(HANDLE(staged.as_raw_handle()), Some(&creation), None, None) }
+            .expect("preserve creation time");
+        drop(staged);
+        let staged_metadata = std::fs::metadata(&replacement).unwrap();
+        assert_eq!(original_metadata.len(), staged_metadata.len());
+        assert_eq!(
+            original_metadata.modified().unwrap(),
+            staged_metadata.modified().unwrap()
+        );
+        assert_eq!(
+            original_metadata.creation_time(),
+            staged_metadata.creation_time()
+        );
+
+        std::fs::rename(&replacement, &path).expect("atomically replace original");
+        let replaced = local_file_version(path_text.clone())
+            .await
+            .expect("replacement revision");
+        let preview = local_read_file(path_text.clone())
+            .await
+            .expect("replacement preview");
+        assert_ne!(original.version, replaced);
+        assert_eq!(preview.version, replaced);
+        assert_eq!(preview.content_base64, "bGF0ZXI=");
+
+        let saved = local_save_copy(path_text.clone(), "saved".into(), "later".into())
+            .await
+            .expect("save distinct revision");
+        assert_ne!(saved.path, path_text);
+        assert_ne!(saved.version, replaced);
+        assert_eq!(
+            saved.version,
+            local_file_version(saved.path.clone())
+                .await
+                .expect("saved revision")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"later");
+        assert_eq!(std::fs::read(&saved.path).unwrap(), b"saved");
+        std::fs::remove_file(&saved.path).expect("remove saved copy");
+        std::fs::remove_file(path).expect("remove original");
     }
 }

@@ -414,7 +414,13 @@ export interface SftpDirEntry {
 export interface SftpFileContent {
   path: string;
   content_base64: string;
+  version: string | null;
   size: number;
+}
+
+export interface SavedFileCopy {
+  path: string;
+  version: string | null;
 }
 
 export interface SftpDownloadedFile {
@@ -489,13 +495,13 @@ export async function sftpReadFile(
   return invoke<SftpFileContent>("sftp_read_file", { sessionId, path });
 }
 
-export async function sftpWriteFile(
+export async function sftpSaveCopy(
   sessionId: string,
   path: string,
   content: string,
   expectedContent: string
-): Promise<void> {
-  return invoke<void>("sftp_write_file", { sessionId, path, content, expectedContent });
+): Promise<SavedFileCopy> {
+  return invoke<SavedFileCopy>("sftp_save_copy", { sessionId, path, content, expectedContent });
 }
 export async function sftpDownloadFile(
   sessionId: string,
@@ -559,16 +565,20 @@ export async function localListDir(path: string): Promise<SftpDirEntry[]> {
   return invoke<SftpDirEntry[]>("local_list_dir", { path });
 }
 
+export async function localFileVersion(path: string): Promise<string | null> {
+  return invoke<string | null>("local_file_version", { path });
+}
+
 export async function localReadFile(path: string): Promise<SftpFileContent> {
   return invoke<SftpFileContent>("local_read_file", { path });
 }
 
-export async function localWriteFile(
+export async function localSaveCopy(
   path: string,
   content: string,
   expectedContent: string
-): Promise<void> {
-  return invoke<void>("local_write_file", { path, content, expectedContent });
+): Promise<SavedFileCopy> {
+  return invoke<SavedFileCopy>("local_save_copy", { path, content, expectedContent });
 }
 
 /** System clipboard plain text for terminal copy and paste shortcuts. */

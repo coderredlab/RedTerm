@@ -1251,9 +1251,15 @@
     contain-intrinsic-size: auto 22px;
   }
 
+  .entry:not(.dir) {
+    gap: 0;
+    padding: 0;
+  }
+
   .entry-main {
     flex: 1;
     min-width: 0;
+    min-height: 28px;
     display: grid;
     grid-template-columns: 18px minmax(0, 1fr) auto;
     align-items: center;
@@ -1265,7 +1271,7 @@
     font-size: 11px;
     text-align: left;
     cursor: pointer;
-    padding: 0;
+    padding: 4px 0 4px 8px;
   }
 
   .entry:hover {
@@ -1317,8 +1323,9 @@
   }
 
   .entry-download {
-    width: 22px;
-    height: 20px;
+    width: 30px;
+    height: 28px;
+    padding-right: 8px;
     display: grid;
     place-items: center;
     border: 0;

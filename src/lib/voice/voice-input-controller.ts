@@ -47,6 +47,7 @@ export interface VoiceInputController {
   readonly displayText: string;
   readonly activeLanguage: VoiceInputLanguage | null;
   readonly canSend: boolean;
+  readonly canRotateLanguage: boolean;
   onChange(listener: () => void): () => void;
   open(): Promise<void>;
   send(): Promise<void>;
@@ -57,6 +58,11 @@ export interface VoiceInputController {
 
 const encoder = new TextEncoder();
 const DEFAULT_LANGUAGE: VoiceInputLanguage = { tag: "", label: "Default language" };
+const PTY_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+
+function safeVoiceText(text: string): string {
+  return text.replace(PTY_CONTROL_CHARACTERS, " ");
+}
 
 function createInitialState(): VoiceInputState {
   return {
@@ -89,36 +95,53 @@ export function createVoiceInputController(deps: VoiceInputControllerDeps): Voic
   const listeners = new Set<() => void>();
   let unlisten: (() => void) | null = null;
   let sendCompleted = false;
+  let generation = 0;
+  let listenerGeneration = 0;
+  let nativeOperation: Promise<void> = Promise.resolve();
 
+  function isCurrent(epoch: number): boolean {
+    return generation === epoch && state.open;
+  }
+
+  function runNative(action: () => Promise<void>): Promise<void> {
+    const running = nativeOperation.then(action);
+    nativeOperation = running.catch(() => undefined);
+    return running;
+  }
   function notify() {
     listeners.forEach((listener) => listener());
   }
 
   async function cleanup(kind: "stop" | "cancel") {
-    if (kind === "stop") {
-      await deps.bridge.stop().catch(() => undefined);
-    } else {
-      await deps.bridge.cancel().catch(() => undefined);
-    }
-    if (unlisten) {
-      unlisten();
-      unlisten = null;
-    }
+    ++listenerGeneration;
+    const listener = unlisten;
+    unlisten = null;
+    await runNative(async () => {
+      if (kind === "stop") {
+        await deps.bridge.stop().catch(() => undefined);
+      } else {
+        await deps.bridge.cancel().catch(() => undefined);
+      }
+    });
+    listener?.();
   }
 
-  async function surfaceVoiceError(error: unknown) {
+  async function surfaceVoiceError(error: unknown, epoch: number) {
     await cleanup("cancel");
+    if (!isCurrent(epoch)) return;
     state.status = "error";
     state.partialTranscript = "";
     state.errorMessage = voiceErrorMessage(error);
     notify();
   }
 
-  async function ensurePermission(): Promise<boolean> {
+  async function ensurePermission(epoch: number): Promise<boolean> {
     const current = await deps.bridge.checkPermissions();
+    if (!isCurrent(epoch)) return false;
     if (current.microphone === "granted") return true;
 
     const requested = await deps.bridge.requestPermissions();
+    if (!isCurrent(epoch)) return false;
     if (requested.microphone === "granted") return true;
 
     state.status = "error";
@@ -127,14 +150,17 @@ export function createVoiceInputController(deps: VoiceInputControllerDeps): Voic
     return false;
   }
 
-  async function startCurrentLanguage() {
+  async function startCurrentLanguage(epoch: number) {
+    if (!isCurrent(epoch)) return;
     const language = currentLanguage(state) ?? DEFAULT_LANGUAGE;
     state.status = "listening";
     notify();
     try {
-      await deps.bridge.start(language.tag);
+      await runNative(async () => {
+        if (isCurrent(epoch)) await deps.bridge.start(language.tag);
+      });
     } catch (error) {
-      await surfaceVoiceError(error);
+      if (isCurrent(epoch)) await surfaceVoiceError(error, epoch);
     }
   }
 
@@ -151,6 +177,10 @@ export function createVoiceInputController(deps: VoiceInputControllerDeps): Voic
     get canSend() {
       return state.open && visibleText(state).length > 0 && Boolean(deps.getActiveSessionId());
     },
+    get canRotateLanguage() {
+      return state.open && state.status !== "preparing" && unlisten !== null
+        && !sendCompleted && state.languages.length > 1;
+    },
 
     onChange(listener: () => void) {
       listeners.add(listener);
@@ -158,36 +188,48 @@ export function createVoiceInputController(deps: VoiceInputControllerDeps): Voic
     },
 
     async open() {
+      if (state.open) return;
+      const epoch = ++generation;
+      const listenerEpoch = ++listenerGeneration;
       sendCompleted = false;
       state.open = true;
       state.status = "preparing";
+      state.languages = [];
+      state.activeLanguageIndex = 0;
       state.transcript = "";
       state.partialTranscript = "";
       state.errorMessage = null;
       notify();
 
       try {
-        unlisten?.();
-        unlisten = null;
-        unlisten = await deps.bridge.listen((event) => controller.handleVoiceEvent(event));
+        const listener = await deps.bridge.listen((event) => {
+          if (listenerGeneration === listenerEpoch && state.open) controller.handleVoiceEvent(event);
+        });
+        if (!isCurrent(epoch)) {
+          listener();
+          return;
+        }
+        unlisten = listener;
 
-        if (!(await ensurePermission())) {
-          await cleanup("cancel");
+        if (!(await ensurePermission(epoch))) {
+          if (isCurrent(epoch)) await cleanup("cancel");
           return;
         }
 
         const languages = await deps.bridge.listLanguages();
+        if (!isCurrent(epoch)) return;
         state.languages = languages.length > 0 ? languages : [DEFAULT_LANGUAGE];
         state.activeLanguageIndex = 0;
         notify();
-        await startCurrentLanguage();
+        await startCurrentLanguage(epoch);
       } catch (error) {
-        await surfaceVoiceError(error);
+        if (isCurrent(epoch)) await surfaceVoiceError(error, epoch);
       }
     },
 
     async send() {
-      if (sendCompleted) return;
+      if (!state.open || sendCompleted) return;
+      const epoch = generation;
       const sessionId = deps.getActiveSessionId();
       const text = visibleText(state);
       if (!sessionId) {
@@ -197,35 +239,60 @@ export function createVoiceInputController(deps: VoiceInputControllerDeps): Voic
         return;
       }
       if (!text) return;
+      if (text !== safeVoiceText(text)) {
+        state.status = "error";
+        state.errorMessage = "Voice text contains unsupported control characters";
+        notify();
+        return;
+      }
 
       sendCompleted = true;
-      await deps.writeSsh(sessionId, encoder.encode(text));
-      await cleanup("stop");
+      try {
+        await deps.writeSsh(sessionId, encoder.encode(text));
+      } catch (error) {
+        if (isCurrent(epoch)) {
+          sendCompleted = false;
+          state.status = "error";
+          state.errorMessage = `Unable to send voice text: ${voiceErrorMessage(error)}`;
+        }
+        return;
+      } finally {
+        if (isCurrent(epoch)) {
+          await cleanup("stop");
+          notify();
+        }
+      }
+      if (!isCurrent(epoch)) return;
+      ++generation;
       state.open = false;
       state.status = "idle";
       notify();
     },
 
     async cancel() {
-      await cleanup("cancel");
+      ++generation;
       state.open = false;
       state.status = "idle";
       state.transcript = "";
       state.partialTranscript = "";
       state.errorMessage = null;
       notify();
+      await cleanup("cancel");
     },
 
     async rotateLanguage() {
-      if (state.languages.length <= 1) return;
-      await deps.bridge.cancel().catch(() => undefined);
+      if (!controller.canRotateLanguage) return;
+      const epoch = ++generation;
+      await runNative(() => deps.bridge.cancel().catch(() => undefined));
+      if (!isCurrent(epoch)) return;
       state.partialTranscript = "";
       state.activeLanguageIndex = (state.activeLanguageIndex + 1) % state.languages.length;
       notify();
-      await startCurrentLanguage();
+      await startCurrentLanguage(epoch);
     },
 
     handleVoiceEvent(event: VoiceInputEvent) {
+      if (!state.open) return;
       if (event.kind === "started") {
         state.status = "listening";
         state.errorMessage = null;
@@ -234,13 +301,13 @@ export function createVoiceInputController(deps: VoiceInputControllerDeps): Voic
       }
       if (event.kind === "partial") {
         state.status = "partial";
-        state.partialTranscript = event.transcript ?? "";
+        state.partialTranscript = safeVoiceText(event.transcript ?? "");
         notify();
         return;
       }
       if (event.kind === "final") {
         state.status = "final";
-        state.transcript += event.transcript ?? state.partialTranscript;
+        state.transcript += safeVoiceText(event.transcript ?? state.partialTranscript);
         state.partialTranscript = "";
         notify();
         return;

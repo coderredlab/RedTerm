@@ -1,6 +1,6 @@
 /**
- * Session-scoped approval gate for remote OSC 52 clipboard writes.
- *
+ * Session-scoped approval gate for OSC 52 clipboard writes from all terminal
+ * output, including local PTYs that can relay untrusted nested SSH bytes.
  * Approvals are keyed to the connection generation: every re-connection bumps
  * the generation, which automatically invalidates the previous approval — no
  * explicit reset call sites to miss. A denial is never cached; the next
@@ -15,11 +15,9 @@ export class Osc52SessionGate {
 
   async resolve(
     text: string,
-    trusted: boolean,
     generation: number,
     confirm: () => Promise<boolean>
   ): Promise<string | null> {
-    if (trusted) return text;
     if (this.pending) return null;
     if (this.approvedGeneration === generation) {
       return text;

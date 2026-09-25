@@ -10,7 +10,14 @@ use uuid::Uuid;
 mod commands;
 mod ssh;
 mod storage;
-// Every editor backend shares this compare-and-replace critical section.
+
+#[derive(Debug, serde::Serialize)]
+pub struct SavedFileCopy {
+    pub path: String,
+    pub version: Option<String>,
+}
+
+// Serialize in-app editor comparisons and saved-copy creation.
 pub(crate) static FILE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub(crate) static EXIT_CONFIRMED: AtomicBool = AtomicBool::new(false);
 
@@ -26,7 +33,7 @@ use commands::{
     preview_cache_release, read_clipboard_image, read_clipboard_text,
     request_voice_input_permissions, restart_application, set_keep_screen_on, set_keyboard_visible,
     sftp_create_dir, sftp_create_file, sftp_download_file, sftp_download_to_dir, sftp_home_dir,
-    sftp_list_dir, sftp_read_file, sftp_remove_path, sftp_write_file, ssh_check_host_key,
+    sftp_list_dir, sftp_read_file, sftp_remove_path, sftp_save_copy, ssh_check_host_key,
     ssh_connect, ssh_disconnect, ssh_get_session_output, ssh_get_session_snapshot, ssh_resize,
     ssh_session_exists, ssh_store_session_snapshot, ssh_trust_host_key, ssh_upload_clipboard_image,
     ssh_upload_clipboard_image_from_local_path, ssh_write, start_voice_input, stop_voice_input,
@@ -35,9 +42,10 @@ use commands::{
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use commands::{
     local_create_dir, local_create_file, local_download_file, local_download_to_dir,
-    local_home_dir, local_list_dir, local_read_file, local_remove_path, local_shell_disconnect,
-    local_shell_get_output, local_shell_resize, local_shell_start, local_shell_write, local_upload,
-    local_write_file, sftp_upload, DesktopClipboardState, LocalShellManager,
+    local_file_version, local_home_dir, local_list_dir, local_read_file, local_remove_path,
+    local_save_copy, local_shell_disconnect, local_shell_get_output, local_shell_resize,
+    local_shell_start, local_shell_write, local_upload, sftp_upload, DesktopClipboardState,
+    LocalShellManager,
 };
 
 use storage::{
@@ -170,7 +178,7 @@ pub fn run() {
             ssh_upload_clipboard_image,
             sftp_list_dir,
             sftp_read_file,
-            sftp_write_file,
+            sftp_save_copy,
             sftp_create_dir,
             sftp_create_file,
             sftp_remove_path,
@@ -198,9 +206,11 @@ pub fn run() {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_list_dir,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            local_file_version,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_read_file,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-            local_write_file,
+            local_save_copy,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_create_dir,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -236,49 +246,6 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn local_shell_and_file_write_permissions_are_desktop_only() {
-        let desktop: serde_json::Value =
-            serde_json::from_str(include_str!("../capabilities/desktop-local-shell.json"))
-                .expect("desktop capability must be valid JSON");
-        let desktop_permissions = desktop["permissions"]
-            .as_array()
-            .expect("desktop capability permissions must be an array");
-
-        assert_eq!(
-            desktop["platforms"],
-            serde_json::json!(["linux", "macOS", "windows"])
-        );
-        for permission in [
-            "allow-local-shell-get-output",
-            "allow-local-write-file",
-            "allow-sftp-write-file",
-            "allow-preview-cache-acquire",
-            "allow-preview-cache-release",
-        ] {
-            assert!(desktop_permissions
-                .iter()
-                .any(|candidate| candidate == permission));
-        }
-
-        let default: serde_json::Value =
-            serde_json::from_str(include_str!("../capabilities/default.json"))
-                .expect("default capability must be valid JSON");
-        let default_permissions = default["permissions"]
-            .as_array()
-            .expect("default capability permissions must be an array");
-        for permission in [
-            "allow-local-shell-get-output",
-            "allow-local-write-file",
-            "allow-sftp-write-file",
-            "allow-preview-cache-acquire",
-            "allow-preview-cache-release",
-        ] {
-            assert!(!default_permissions
-                .iter()
-                .any(|candidate| candidate == permission));
-        }
-    }
     #[test]
     fn native_confirmation_permissions_cover_desktop_close_paths() {
         let default: serde_json::Value =

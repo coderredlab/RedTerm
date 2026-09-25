@@ -421,7 +421,7 @@ mod tests {
             let path = std::env::temp_dir()
                 .join(format!("redterm-local-copy-test-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&path).unwrap();
-            Self(path)
+            Self(std::fs::canonicalize(path).unwrap())
         }
     }
     impl Drop for Fixture {

@@ -210,6 +210,8 @@
   let cols = $state(80);
   let rows = $state(24);
   let statusMessage = $state("");
+  let pasteErrorMessage = $state("");
+  let pasteErrorTimeout: ReturnType<typeof setTimeout> | null = null;
   let debugInfo = $state("");
   let cursorVisible = $state(true);
   let parserCursorVisible = $state(true);
@@ -320,10 +322,8 @@
   let disconnectRequested = false;
   let connectionGeneration = 0;
 
-  // Remote servers must earn clipboard access (OSC 52) once per connection
-  // generation; local shells are trusted. The gate keys approval to the
-  // generation, so every reconnect requires fresh approval without any
-  // explicit reset call site.
+  // Local PTYs can relay remote SSH bytes, so output provenance cannot be
+  // inferred from the outer session kind. Every generation earns approval.
   const osc52SessionGate = new Osc52SessionGate();
   let lastProcessedSeq = 0;
   let startupScriptDispatcher: StartupScriptDispatcher | null = null;
@@ -862,10 +862,8 @@
   }
 
 
-  async function uploadClipboardImageBytes(bytes: Uint8Array) {
-    const targetSessionId = sessionId;
-    if (!targetSessionId || kind === "local") return;
-    const generation = connectionGeneration;
+  async function uploadClipboardImageBytes(bytes: Uint8Array, targetSessionId: string, generation: number) {
+    if (kind === "local" || !isConnectionAttemptActive(generation, targetSessionId)) return;
 
     const prevStatusMessage = statusMessage;
     statusMessage = "Uploading pasted image...";
@@ -874,25 +872,27 @@
       const uploadResult = await sshUploadClipboardImage(targetSessionId, bytes);
       if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       statusMessage = prevStatusMessage;
-      sendPastedText(uploadResult.remote_path);
+      sendPastedText(uploadResult.remote_path, targetSessionId, generation);
     } catch (error) {
       if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       const message = error instanceof Error ? error.message : String(error);
-      statusMessage = "Image upload failed: " + message;
+      statusMessage = prevStatusMessage;
+      showPasteError("Image upload failed: " + message);
       console.error("[SSH] image upload failed:", error);
     }
   }
 
   async function pasteClipboardImageFromLocalPath(
     localPath: string,
-    targetSessionId: string | null = sessionId
+    targetSessionId: string | null = sessionId,
+    generation = connectionGeneration
   ) {
-    if (!targetSessionId) return;
+    if (!targetSessionId || !isConnectionAttemptActive(generation, targetSessionId)) return;
     if (kind === "local") {
-      sendPastedText(await resolveTerminalClipboardImagePath(localPath, true));
+      const path = await resolveTerminalClipboardImagePath(localPath, true);
+      sendPastedText(path, targetSessionId, generation);
       return;
     }
-    const generation = connectionGeneration;
 
     const prevStatusMessage = statusMessage;
     statusMessage = "Uploading pasted image...";
@@ -906,20 +906,22 @@
       );
       if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       statusMessage = prevStatusMessage;
-      sendPastedText(pastedPath);
+      sendPastedText(pastedPath, targetSessionId, generation);
     } catch (error) {
       if (!isConnectionAttemptActive(generation, targetSessionId)) return;
       const message = error instanceof Error ? error.message : String(error);
-      statusMessage = "Image upload failed: " + message;
+      statusMessage = prevStatusMessage;
+      showPasteError("Image upload failed: " + message);
       console.error("[SSH] local image upload failed:", error);
     }
   }
 
-  async function pasteNativeClipboardImage(targetSessionId: string): Promise<boolean> {
+  async function pasteNativeClipboardImage(targetSessionId: string, generation: number): Promise<boolean> {
     try {
       const result = await readClipboardImage();
+      if (!isConnectionAttemptActive(generation, targetSessionId)) return true;
       if (!result.found || !result.localPath) return false;
-      await pasteClipboardImageFromLocalPath(result.localPath, targetSessionId);
+      await pasteClipboardImageFromLocalPath(result.localPath, targetSessionId, generation);
       return true;
     } catch (error) {
       console.error("[Terminal] clipboard image read failed:", error);
@@ -927,19 +929,40 @@
     }
   }
 
-  function sendPastedText(text: string) {
+  function dismissPasteError() {
+    if (pasteErrorTimeout !== null) clearTimeout(pasteErrorTimeout);
+    pasteErrorTimeout = null;
+    pasteErrorMessage = "";
+  }
+
+  function showPasteError(message: string) {
+    dismissPasteError();
+    pasteErrorMessage = message;
+    pasteErrorTimeout = setTimeout(() => {
+      pasteErrorTimeout = null;
+      pasteErrorMessage = "";
+    }, 5000);
+  }
+
+  function sendPastedText(
+    text: string,
+    targetSessionId: string | null = sessionId,
+    generation = connectionGeneration
+  ) {
+    if (!targetSessionId || !isConnectionAttemptActive(generation, targetSessionId)) return;
     try {
       const payload = formatTerminalPaste(text, parser?.isBracketedPasteMode() ?? false);
       if (payload) queueWrite(payload);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      statusMessage = `Paste failed: ${message}`;
+      showPasteError(`Paste failed: ${message}`);
     }
   }
 
   async function handlePaste(e: ClipboardEvent) {
     if (!sessionId) return;
     const targetSessionId = sessionId;
+    const generation = connectionGeneration;
     const clipboardData = e.clipboardData;
 
     // 웹 클립보드 API에서 이미지 확인 (데스크톱)
@@ -952,15 +975,15 @@
         if (imageFile) {
           e.preventDefault();
           if (kind === "local") {
-            await pasteNativeClipboardImage(targetSessionId);
+            await pasteNativeClipboardImage(targetSessionId, generation);
             return;
           }
           if (imageFile.size > MAX_CLIPBOARD_IMAGE_BYTES) {
-            statusMessage = "Image upload failed: Clipboard image exceeds 10 MiB";
+            showPasteError("Image upload failed: Clipboard image exceeds 10 MiB");
             return;
           }
           const bytes = new Uint8Array(await imageFile.arrayBuffer());
-          await uploadClipboardImageBytes(bytes);
+          await uploadClipboardImageBytes(bytes, targetSessionId, generation);
           return;
         }
       }
@@ -968,13 +991,13 @@
       const text = clipboardData.getData("text/plain");
       if (text) {
         e.preventDefault();
-        sendPastedText(text);
+        sendPastedText(text, targetSessionId, generation);
         return;
       }
     }
 
     // Native clipboard fallback for desktop/mobile WebViews that omit image items.
-    if (await pasteNativeClipboardImage(targetSessionId)) {
+    if (await pasteNativeClipboardImage(targetSessionId, generation)) {
       e.preventDefault();
     }
   }
@@ -1188,12 +1211,13 @@
       const customEvent = event as CustomEvent<{ localPath?: string }>;
 
       const targetSessionId = sessionId;
+      const generation = connectionGeneration;
       if (!targetSessionId || tabsStore.activeTab?.sessionId !== targetSessionId) return;
 
       const localPath = customEvent.detail?.localPath;
       if (!localPath) return;
 
-      void pasteClipboardImageFromLocalPath(localPath, targetSessionId);
+      void pasteClipboardImageFromLocalPath(localPath, targetSessionId, generation);
     };
     window.addEventListener("redterm:android-image-paste", androidImagePasteHandler);
 
@@ -2564,7 +2588,6 @@
       void osc52SessionGate
         .resolve(
           event.text,
-          kind === "local",
           generation,
           requestOsc52Approval
         )
@@ -2614,6 +2637,7 @@
     if (reconnecting || disconnectRequested || destroyed) return;
     reconnecting = true;
     const generation = ++connectionGeneration;
+    dismissPasteError();
     resumingSshData = false;
     replayBufferedChunks = null;
     replayBufferedBytes = 0;
@@ -3397,12 +3421,13 @@
     if (inputEvent.inputType === "insertFromPaste") {
       target.value = "";
       const targetSessionId = sessionId;
+      const generation = connectionGeneration;
       // Try reading image from clipboard via Android plugin
       void (async () => {
         try {
           const result = await readClipboardImage();
           if (result.found && result.localPath) {
-            await pasteClipboardImageFromLocalPath(result.localPath, targetSessionId);
+            await pasteClipboardImageFromLocalPath(result.localPath, targetSessionId, generation);
             return;
           }
         } catch {
@@ -3411,7 +3436,7 @@
         // If no image found, treat as text paste
         const clipText = inputEvent.data;
         if (clipText) {
-          sendPastedText(clipText);
+          sendPastedText(clipText, targetSessionId, generation);
         }
       })();
       return;
@@ -3766,6 +3791,7 @@
   }
 
   onDestroy(() => {
+    if (pasteErrorTimeout !== null) clearTimeout(pasteErrorTimeout);
     connectionGeneration++;
     if (hostKeyPromptResolver) resolveHostKeyPrompt("cancel");
     if (keyPassphrasePromptResolver) resolveKeyPassphrasePrompt(null);
@@ -3966,13 +3992,16 @@
   export async function pasteFromClipboard() {
     if (!sessionId) return;
     const targetSessionId = sessionId;
+    const generation = connectionGeneration;
 
-    if (await pasteNativeClipboardImage(targetSessionId)) return;
+    if (await pasteNativeClipboardImage(targetSessionId, generation)) return;
 
     try {
       const text = await readClipboardText();
-      if (text) sendPastedText(text);
+      if (text) sendPastedText(text, targetSessionId, generation);
     } catch (error) {
+      if (!isConnectionAttemptActive(generation, targetSessionId)) return;
+      showPasteError(`Paste failed: ${error instanceof Error ? error.message : String(error)}`);
       console.error("[Terminal] clipboard text read failed:", error);
     }
   }
@@ -4046,9 +4075,7 @@
     return (
       lower.startsWith("connection lost") ||
       lower.startsWith("connection failed") ||
-      lower.startsWith("failed to ") ||
-      lower.startsWith("image upload failed") ||
-      lower.startsWith("paste failed")
+      lower.startsWith("failed to ")
     );
   }
 
@@ -4145,6 +4172,16 @@
           </div>
         {/if}
       </div>
+    </div>
+  {/if}
+
+  {#if pasteErrorMessage}
+    <div class="paste-error-toast" role="alert">
+      <div class="paste-error-content">
+        <strong>{getStatusTitle(pasteErrorMessage)}</strong>
+        <span>{pasteErrorMessage}</span>
+      </div>
+      <button type="button" class="paste-error-dismiss" aria-label="Dismiss paste error" onclick={dismissPasteError}>×</button>
     </div>
   {/if}
 
@@ -4382,8 +4419,8 @@
   <CloseConfirmationModal
     open={osc52ApprovalOpen}
     title="Clipboard access requested"
-    message="The remote server requested to write to your clipboard (OSC 52)."
-    detail="Allow clipboard writes from this server while this session is open?"
+    message="Terminal output requested to write to your clipboard (OSC 52)."
+    detail="Allow clipboard writes from this terminal session while it is open?"
     confirmLabel="Allow"
     destructive={false}
     onCancel={() => settleOsc52Approval(false)}
@@ -4455,6 +4492,61 @@
     margin-left: 1px;
     vertical-align: -0.15em;
     background: var(--terminal-cursor, #f5f5f5);
+  }
+
+  .paste-error-toast {
+    position: absolute;
+    right: 16px;
+    bottom: max(16px, env(safe-area-inset-bottom));
+    z-index: 12;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    width: min(420px, calc(100% - 32px));
+    box-sizing: border-box;
+    padding: 12px 14px;
+    border: 1px solid rgba(255, 144, 144, 0.35);
+    border-radius: 10px;
+    color: #ffdada;
+    background: rgba(48, 18, 18, 0.96);
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.38);
+  }
+
+  .paste-error-content {
+    flex: 1;
+    display: grid;
+    gap: 4px;
+    min-width: 0;
+    font-size: 13px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+
+  .paste-error-content strong {
+    font-size: 14px;
+  }
+
+  .paste-error-dismiss {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border: 0;
+    border-radius: 6px;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font-size: 20px;
+    line-height: 1;
+    /* Align the hit area with the heading and the X inset with the text inset. */
+    transform: translate(10px, -6px);
+    cursor: pointer;
+  }
+
+  .paste-error-dismiss:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
   }
 
   .status-overlay {

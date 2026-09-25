@@ -527,10 +527,9 @@
   }
 
   async function confirmCloseDocuments(tabId: string, sourcePaneId?: string): Promise<boolean> {
-    const documents = (tabsStore.getTab(tabId)?.documents ?? []).filter(
-      (document) =>
-        sourcePaneId === undefined || document.sourcePaneId === sourcePaneId
-    );
+    const documents = sourcePaneId === undefined
+      ? tabsStore.getTab(tabId)?.documents ?? []
+      : tabsStore.documentsClosedWithPane(tabId, sourcePaneId);
     const savingDocuments = documents.filter(
       (document) => document.saveState === "saving"
     );
@@ -773,6 +772,12 @@
       if (tabIsClosing(sourceTabId) || tabIsClosing(targetTabId)) return;
       await tick();
       const result = await tabsStore.mergeTab(sourceTabId, targetTabId, dir, side);
+      if (result.status === "saving") {
+        await showWarning(
+          "These tabs cannot be merged while a copy of the same file is being saved. Wait for the save to finish and try again."
+        );
+        return;
+      }
       if (result.status === "conflict") {
         await showWarning(
           "These tabs cannot be merged because the same file has different unsaved changes in both tabs. Save or close one copy and try again."
@@ -827,6 +832,30 @@
       }
     });
   }
+
+  async function commitDocumentMove(tabId: string, documentId: string, targetPaneId: string,
+    dir: "row" | "col" | "merge", side: "before" | "after", insertIndex: number | null = null) {
+    if (tabIsClosing(tabId) || tabsStore.activeTabId !== tabId || paneIsClosing(tabId, targetPaneId)) return;
+    await serializeLayoutSnapshotOperation(async () => {
+      await storeTabSnapshots([tabId]);
+      await tick();
+      const document = tabsStore.getDocument(tabId, documentId);
+      if (!document || document.saveState === "saving" || tabIsClosing(tabId) || paneIsClosing(tabId, targetPaneId)) return;
+      await tabsStore.moveDocumentWithinTab(tabId, documentId, targetPaneId, dir, side, insertIndex);
+      for (const pane of tabsStore.getTab(tabId)?.panes ?? []) terminals.get(pane.id)?.syncSize();
+    });
+  }
+
+  async function handleDocumentDrop(tabId: string, documentId: string) {
+    if (tabIsClosing(tabId) || tabsStore.activeTabId !== tabId) return;
+    const target = tabDrag.paneTarget ? { ...tabDrag.paneTarget } : null;
+    if (!target || target.tabId !== tabId || paneIsClosing(tabId, target.paneId)) return;
+    const zone = target.zone;
+    const dir = zone === "merge" ? "merge" : zone === "left" || zone === "right" ? "row" : "col";
+    const side = zone === "left" || zone === "top" ? "before" : "after";
+    await commitDocumentMove(tabId, documentId, target.paneId, dir, side, target.insertIndex);
+  }
+
 
   const workspaceApi: WorkspaceApi = {
     revealPath(tabId, paneId, path) {
@@ -909,6 +938,12 @@
     },
     paneDragDropped(tabId, paneId) {
       void handlePaneDrop(tabId, paneId);
+    },
+    documentDragDropped(tabId, documentId) {
+      void handleDocumentDrop(tabId, documentId);
+    },
+    moveDocument(tabId, documentId, targetPaneId, dir, side, insertIndex) {
+      return commitDocumentMove(tabId, documentId, targetPaneId, dir, side, insertIndex);
     },
   };
   setWorkspaceApi(workspaceApi);
