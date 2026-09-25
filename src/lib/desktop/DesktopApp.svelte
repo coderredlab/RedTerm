@@ -942,9 +942,6 @@
     documentDragDropped(tabId, documentId) {
       void handleDocumentDrop(tabId, documentId);
     },
-    moveDocument(tabId, documentId, targetPaneId, dir, side, insertIndex) {
-      return commitDocumentMove(tabId, documentId, targetPaneId, dir, side, insertIndex);
-    },
   };
   setWorkspaceApi(workspaceApi);
 

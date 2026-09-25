@@ -7,7 +7,7 @@
 </script>
 
 <script lang="ts">
-  import { onDestroy, tick } from "svelte";
+  import { onDestroy } from "svelte";
   import Terminal from "$lib/terminal/Terminal.svelte";
   import { tabsStore, type PaneNode } from "$lib/stores/tabs.svelte";
   import {
@@ -39,36 +39,6 @@
   let cancelPaneDrag: (() => void) | null = null;
   let suppressPaneClick = false;
   onDestroy(() => cancelPaneDrag?.());
-
-  function otherDocumentPanes(currentPaneId: string) {
-    const tab = tabsStore.getTab(tabId);
-    if (!tab) return [];
-    const ids: string[] = [];
-    const visit = (item: PaneNode) => {
-      if (item.type === "leaf") ids.push(item.paneId);
-      else item.children.forEach(visit);
-    };
-    visit(tab.layout);
-    return ids.flatMap((id, index) => id === currentPaneId ? [] : [{
-      id,
-      label: `Pane ${index + 1} · ${tab.panes.find((pane) => pane.id === id)?.title ?? "Terminal"}`,
-    }]);
-  }
-
-  async function moveActiveDocument(event: Event, documentId: string, currentPaneId: string) {
-    const select = event.currentTarget as HTMLSelectElement;
-    const choice = select.value;
-    select.value = "";
-    if (!choice) return;
-    const dir = choice === "left" || choice === "right" ? "row"
-      : choice === "up" || choice === "down" ? "col" : "merge";
-    const side = choice === "left" || choice === "up" ? "before" : "after";
-    const targetPaneId = choice.startsWith("pane:") ? choice.slice(5) : currentPaneId;
-    const insertIndex = choice === "start" ? 0 : undefined;
-    await workspace.moveDocument(tabId, documentId, targetPaneId, dir, side, insertIndex);
-    await tick();
-    document.querySelector<HTMLButtonElement>(`[data-document-tab-id="${CSS.escape(documentId)}"] .terminal-tab-main`)?.focus();
-  }
 
   $effect(() => {
     if (node.type === "split") {
@@ -354,29 +324,6 @@
             {/each}
           </div>
           <div class="pane-tools">
-            {#if node.activeItem.kind === "document"}
-              {@const activeDocument = tabsStore.getDocument(tabId, node.activeItem.id)}
-              {#if activeDocument}
-                <select
-                  class="document-move-select"
-                  aria-label={`Move ${activeDocument.name}`}
-                  title="Move or split active document"
-                  disabled={activeDocument.saveState === "saving"}
-                  onchange={(event) => void moveActiveDocument(event, activeDocument.id, node.paneId)}
-                >
-                  <option value="">Move…</option>
-                  <option value="start">Move to first tab</option>
-                  <option value="end">Move to last tab</option>
-                  {#each otherDocumentPanes(node.paneId) as destination (destination.id)}
-                    <option value={`pane:${destination.id}`}>Move to {destination.label}</option>
-                  {/each}
-                  <option value="left">Split left</option>
-                  <option value="right">Split right</option>
-                  <option value="up">Split above</option>
-                  <option value="down">Split below</option>
-                </select>
-              {/if}
-            {/if}
             <button
               class="pane-action"
               title="New terminal tab"
@@ -713,23 +660,6 @@
     background: var(--bg-tertiary);
     color: var(--text-primary);
   }
-
-  .document-move-select {
-    width: 74px;
-    height: 26px;
-    border: 0;
-    border-radius: 3px;
-    background: transparent;
-    color: var(--text-muted);
-    font: inherit;
-    font-size: 11px;
-    cursor: pointer;
-  }
-  .document-move-select:hover, .document-move-select:focus-visible {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-  }
-  .document-move-select:disabled { opacity: 0.5; cursor: default; }
 
   .pane-action svg {
     width: 13px;
