@@ -48,7 +48,7 @@ struct Created {
 
 /// Handles are held only for the destination root and the active traversal.
 /// The rollback manifest stores identities, not one descriptor per entry.
-struct Destination {
+pub(crate) struct Destination {
     root: LocalSource,
     #[cfg(windows)]
     path: PathBuf,
@@ -57,7 +57,7 @@ struct Destination {
 }
 
 impl Destination {
-    fn new(path: &Path) -> io::Result<Self> {
+    pub(crate) fn new(path: &Path) -> io::Result<Self> {
         Ok(Self {
             root: LocalSource::new(path, true)?,
             #[cfg(windows)]
@@ -77,12 +77,12 @@ impl Destination {
         Ok(file)
     }
 
-    fn create(&mut self, relative: &Path, is_dir: bool) -> io::Result<File> {
+    pub(crate) fn create(&mut self, relative: &Path, is_dir: bool) -> io::Result<File> {
         let name = validate_name(relative.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "Invalid copy destination name")
         })?)?;
         #[cfg(windows)]
-        if name.contains(':') || name.ends_with(['.', ' ']) {
+        if name.contains([':', '\\']) || name.ends_with(['.', ' ']) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Unsupported Windows copy destination name",
@@ -112,7 +112,15 @@ impl Destination {
         Ok(file)
     }
 
-    fn claim(&mut self, name: &str, is_dir: bool) -> io::Result<(PathBuf, File)> {
+    pub(crate) fn claim(&mut self, name: &str, is_dir: bool) -> io::Result<(PathBuf, File)> {
+        validate_name(std::ffi::OsStr::new(name))?;
+        #[cfg(windows)]
+        if name.contains('\\') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unsupported Windows copy destination name",
+            ));
+        }
         for candidate in unique_destination_names(name) {
             let relative = PathBuf::from(candidate);
             match self.create(&relative, is_dir) {
@@ -126,7 +134,7 @@ impl Destination {
         ))
     }
 
-    fn rollback(&self, error: io::Error) -> String {
+    pub(crate) fn rollback(&self, error: io::Error) -> String {
         let mut message = error.to_string();
         for entry in self.created.iter().rev() {
             let removed = (|| {
@@ -428,6 +436,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn filesystem_root_can_be_selected_without_following_a_linked_destination() {
+        let selected = Destination::new(Path::new("/")).unwrap();
+        let pinned = selected.parent(Path::new("new-folder")).unwrap();
+        assert!(identity(&pinned).unwrap() == identity(&File::open("/").unwrap()).unwrap());
+
+        let fixture = Fixture::new();
+        let link = fixture.0.join("linked-root");
+        symlink("/", &link).unwrap();
+        assert!(Destination::new(&link).is_err());
+        std::fs::create_dir_all(fixture.0.join("real/destination")).unwrap();
+        let ancestor = fixture.0.join("linked-parent");
+        symlink(fixture.0.join("real"), &ancestor).unwrap();
+        assert!(Destination::new(&ancestor.join("destination")).is_err());
+    }
+
+    #[test]
+    fn over_depth_folder_copy_fails_without_creating_a_partial_folder() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("source");
+        let destination = fixture.0.join("destination");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let mut nested = source.clone();
+        for _ in 0..65 {
+            nested = nested.join("d");
+            std::fs::create_dir(&nested).unwrap();
+        }
+        let copied = copy_upload_paths(
+            &destination,
+            vec![source],
+            UploadSelectionKind::Folder,
+            &|_| {},
+        )
+        .unwrap();
+        assert!(copied.uploaded.is_empty());
+        assert_eq!(copied.failed.len(), 1);
+        assert!(copied.failed[0].error.contains("depth limit"));
+        assert!(!destination.join("source").exists());
     }
 
     #[test]

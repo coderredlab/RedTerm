@@ -1205,6 +1205,7 @@ pub(crate) fn make_download_progress_emitter(
     app: AppHandle,
     path: String,
     total: Option<u64>,
+    origin_id: Option<String>,
 ) -> impl Fn(u64) + Send + Sync {
     let last_emitted = std::sync::Mutex::new(0_u64);
     move |transferred: u64| {
@@ -1227,6 +1228,7 @@ pub(crate) fn make_download_progress_emitter(
                 "sftp-download-progress",
                 serde_json::json!({
                     "path": path,
+                    "originId": origin_id,
                     "transferred": transferred,
                     "total": total,
                 }),
@@ -1663,7 +1665,7 @@ pub async fn sftp_download_file(
         .file_size_via_sftp(&remote_path)
         .await
         .unwrap_or(None);
-    let on_progress = make_download_progress_emitter(app.clone(), remote_path.clone(), total);
+    let on_progress = make_download_progress_emitter(app.clone(), remote_path.clone(), total, None);
     let mut part_file = create_private_preview_file(&part_path).await?;
     let size = match connection
         .download_file_via_sftp(
@@ -2152,7 +2154,7 @@ pub async fn sftp_download_to_dir(
         .file_size_via_sftp(&remote_path)
         .await
         .unwrap_or(None);
-    let on_progress = make_download_progress_emitter(app.clone(), remote_path.clone(), total);
+    let on_progress = make_download_progress_emitter(app.clone(), remote_path.clone(), total, None);
     let size = match connection
         .download_file_via_sftp(
             &remote_path,
@@ -2176,6 +2178,47 @@ pub async fn sftp_download_to_dir(
         size,
     })
 }
+/// Explicit folder download into a user-selected parent, without overwriting
+/// anything already there. The native destination owns rollback on failure.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[tauri::command]
+pub async fn sftp_download_folder(
+    app: AppHandle,
+    session_manager: State<'_, Arc<SessionManager>>,
+    session_id: String,
+    remote_path: String,
+    destination_path: String,
+    origin_id: String,
+) -> Result<SftpDownloadedFile, String> {
+    let connection = sftp_connection_for_session(&session_manager, &session_id).await?;
+    if destination_path.trim().is_empty() {
+        return Err("Select a destination folder".to_string());
+    }
+    let progress_app = app.clone();
+    let progress_path = remote_path.clone();
+    let progress_origin = origin_id;
+    let progress_factory = move |total| -> Box<dyn Fn(u64) + Send + Sync> {
+        Box::new(make_download_progress_emitter(
+            progress_app.clone(),
+            progress_path.clone(),
+            total,
+            Some(progress_origin.clone()),
+        ))
+    };
+    let (local_path, size) = connection
+        .download_folder_via_sftp(
+            &remote_path,
+            Path::new(&destination_path),
+            &progress_factory,
+        )
+        .await?;
+    Ok(SftpDownloadedFile {
+        remote_path,
+        local_path: local_path.to_string_lossy().into_owned(),
+        size,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

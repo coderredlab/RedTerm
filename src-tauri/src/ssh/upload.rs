@@ -14,7 +14,8 @@ use tokio::io::AsyncReadExt;
 use super::client::BoundedSftpStream;
 use super::{SshConnection, SshError};
 use crate::storage::unique_destination_names;
-
+const MAX_LOCAL_COPY_ENTRIES: usize = 10_000;
+const MAX_LOCAL_COPY_DEPTH: usize = 64;
 // SFTPv3 servers must support 32 KiB writes. Only one owned packet is in flight;
 // the raw API consumes its Vec, so no file-sized allocation or copy is needed.
 const UPLOAD_CHUNK_BYTES: usize = 32 * 1024;
@@ -155,7 +156,7 @@ fn open_local_at(parent: &File, name: &std::ffi::OsStr, directory: bool) -> io::
 fn open_local(path: &Path) -> io::Result<(File, Vec<File>)> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut components = path.components().peekable();
-    if path.file_name().is_none() {
+    if path.as_os_str().is_empty() {
         return Err(invalid_source("Select a named file or folder"));
     }
     let base = if matches!(components.peek(), Some(Component::RootDir)) {
@@ -186,7 +187,7 @@ fn open_local(path: &Path) -> io::Result<(File, Vec<File>)> {
         ancestors.push(parent);
         parent = child;
     }
-    Err(invalid_source("Select a named file or folder"))
+    Ok((parent, ancestors))
 }
 
 #[cfg(windows)]
@@ -208,11 +209,20 @@ fn open_local(path: &Path) -> io::Result<File> {
 impl LocalSource {
     pub(crate) fn new(path: &Path, folder: bool) -> io::Result<Self> {
         #[cfg(windows)]
-        let (canonical_path, ancestors) = {
-            let name = path
-                .file_name()
-                .ok_or_else(|| invalid_source("Select a named file or folder"))?;
-            let path = std::fs::canonicalize(path.parent().unwrap_or(Path::new(".")))?.join(name);
+        let (absolute_path, ancestors) = {
+            // Canonicalizing before opening would follow an ancestor junction
+            // before FILE_FLAG_OPEN_REPARSE_POINT can reject it. Keep the
+            // picker path intact and pin each original ancestor in order.
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir))
+            {
+                return Err(invalid_source(
+                    "Select an absolute path without parent-directory components",
+                ));
+            }
+            let path = path.to_path_buf();
             let mut parents = path.ancestors().skip(1).collect::<Vec<_>>();
             parents.reverse();
             let mut handles = Vec::with_capacity(parents.len());
@@ -222,7 +232,7 @@ impl LocalSource {
             (path, handles)
         };
         #[cfg(windows)]
-        let path = canonical_path.as_path();
+        let path = absolute_path.as_path();
         #[cfg(unix)]
         let (root, ancestors) = open_local(path)?;
         #[cfg(windows)]
@@ -239,7 +249,7 @@ impl LocalSource {
             _ancestors: ancestors,
             root,
             #[cfg(windows)]
-            path: canonical_path,
+            path: absolute_path,
             #[cfg(windows)]
             _ancestors: ancestors,
         })
@@ -276,20 +286,38 @@ impl LocalSource {
 
     pub(crate) fn entries(&self, name: &str) -> io::Result<Vec<LocalEntry>> {
         let mut entries = Vec::new();
-        let mut pending = vec![(PathBuf::new(), name.to_string())];
-        while let Some((relative, name)) = pending.pop() {
+        let mut pending = vec![(PathBuf::new(), name.to_string(), 0usize)];
+        while let Some((relative, name, depth)) = pending.pop() {
+            if entries.len() + pending.len() >= MAX_LOCAL_COPY_ENTRIES {
+                return Err(invalid_source("Selected folder contains too many entries"));
+            }
             let file = self.open(&relative)?;
             let is_dir = validate_type(&file)?;
             if is_dir {
+                let remaining = MAX_LOCAL_COPY_ENTRIES - entries.len() - pending.len() - 1;
                 #[cfg(unix)]
-                let names = directory_names(&file)?;
+                let names = directory_names(&file, remaining)?;
                 #[cfg(windows)]
                 let names = std::fs::read_dir(self.path.join(&relative))?
+                    .take(remaining + 1)
                     .map(|entry| entry.map(|entry| entry.file_name()))
                     .collect::<io::Result<Vec<_>>>()?;
+                #[cfg(windows)]
+                if names.len() > remaining {
+                    return Err(invalid_source("Selected folder contains too many entries"));
+                }
+                if depth >= MAX_LOCAL_COPY_DEPTH && !names.is_empty() {
+                    return Err(invalid_source(
+                        "Selected folder exceeds the copy depth limit",
+                    ));
+                }
                 for child in names {
                     let child_name = validate_name(&child)?;
-                    pending.push((relative.join(&child), format!("{name}/{child_name}")));
+                    pending.push((
+                        relative.join(&child),
+                        format!("{name}/{child_name}"),
+                        depth + 1,
+                    ));
                 }
             }
             entries.push(LocalEntry {
@@ -303,7 +331,7 @@ impl LocalSource {
 }
 
 #[cfg(unix)]
-fn directory_names(file: &File) -> io::Result<Vec<OsString>> {
+fn directory_names(file: &File, limit: usize) -> io::Result<Vec<OsString>> {
     use std::os::fd::IntoRawFd;
     use std::os::unix::ffi::OsStringExt;
     let fd = file.try_clone()?.into_raw_fd();
@@ -334,6 +362,9 @@ fn directory_names(file: &File) -> io::Result<Vec<OsString>> {
         }
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
         if name != b"." && name != b".." {
+            if names.len() == limit {
+                break Err(invalid_source("Selected folder contains too many entries"));
+            }
             names.push(OsString::from_vec(name.to_vec()));
         }
     };

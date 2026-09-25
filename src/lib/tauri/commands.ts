@@ -545,6 +545,12 @@ export async function sftpDownloadToDir(
   });
 }
 
+export async function sftpDownloadFolder(
+  sessionId: string, remotePath: string, destinationPath: string, originId: string
+): Promise<SftpDownloadedFile> {
+  return invoke<SftpDownloadedFile>("sftp_download_folder", { sessionId, remotePath, destinationPath, originId });
+}
+
 export async function localHomeDir(): Promise<string> {
   return invoke<string>("local_home_dir");
 }
@@ -604,6 +610,10 @@ export async function localDownloadToDir(
   });
 }
 
+export async function localDownloadFolder(path: string, destinationPath: string, originId: string): Promise<SftpDownloadedFile> {
+  return invoke<SftpDownloadedFile>("local_download_folder", { path, destinationPath, originId });
+}
+
 /** Open a native save dialog pre-filled with the download file name. */
 export async function chooseDownloadSavePath(
   defaultFileName: string
@@ -612,6 +622,12 @@ export async function chooseDownloadSavePath(
     defaultPath: defaultFileName,
     title: "Save download as",
   });
+  return result ?? null;
+}
+
+/** Choose the parent directory; the backend creates a unique folder inside it. */
+export async function chooseDownloadDirectory(): Promise<string | null> {
+  const result = await open({ directory: true, multiple: false, title: "Choose where to save folder" });
   return result ?? null;
 }
 
@@ -637,6 +653,7 @@ export interface DownloadProgressEvent {
   path: string;
   transferred: number;
   total: number | null;
+  originId: string | null;
 }
 
 export interface UploadProgressEvent {

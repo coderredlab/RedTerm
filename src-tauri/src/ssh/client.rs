@@ -6,6 +6,8 @@ use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
 use serde::Serialize;
 use std::io;
 use std::path::Path;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -22,6 +24,10 @@ const SSH_COMMAND_CHANNEL_CAPACITY: usize = 256;
 const MAX_EXEC_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_SFTP_LIST_ENTRIES: usize = 10_000;
 const MAX_SFTP_LIST_NAME_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const MAX_SFTP_DOWNLOAD_DEPTH: usize = 64;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const MAX_SFTP_DOWNLOAD_PATH_BYTES: usize = 4096;
 const EXEC_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_COMMAND_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_CHANNEL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -282,6 +288,24 @@ fn last_path_segment(path: &str) -> String {
         .find(|segment| !segment.is_empty())
         .unwrap_or(path)
         .to_string()
+}
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+struct FolderDownloadEntry {
+    remote: String,
+    relative: PathBuf,
+    is_dir: bool,
+    size: Option<u64>,
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn safe_remote_segment(name: &str) -> Result<(), String> {
+    crate::ssh::upload::validate_name(std::ffi::OsStr::new(name))
+        .map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    if name.contains('\\') || name.contains(':') || name.ends_with(['.', ' ']) {
+        return Err(format!("Unsupported download entry name: {name}"));
+    }
+    Ok(())
 }
 
 impl SshConnection {
@@ -1171,6 +1195,218 @@ finally:
         }
         result
     }
+    /// Scan before creating output, then copy only entries from that bounded scan.
+    /// SFTP v3 has no directory-relative handles or no-follow OPEN: remote rename
+    /// races cannot be eliminated, so recheck each pathname immediately before use.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub async fn download_folder_via_sftp(
+        &self,
+        remote_path: &str,
+        destination_parent: &Path,
+        progress_factory: &(dyn Fn(Option<u64>) -> Box<dyn Fn(u64) + Send + Sync> + Send + Sync),
+    ) -> Result<(PathBuf, u64), String> {
+        use crate::storage::local_upload::Destination;
+
+        let root_path = remote_path.trim_end_matches('/');
+        let root_name = root_path.rsplit('/').next().unwrap_or("");
+        if root_path.is_empty() || root_path.len() > MAX_SFTP_DOWNLOAD_PATH_BYTES {
+            return Err("Invalid remote folder path".to_string());
+        }
+        let mut ancestor = if root_path.starts_with('/') {
+            "/".to_string()
+        } else {
+            String::new()
+        };
+        let segments = root_path
+            .split('/')
+            .skip(usize::from(root_path.starts_with('/')));
+        if segments.clone().any(str::is_empty) {
+            return Err("Invalid remote folder path".to_string());
+        }
+        let mut segments = segments.peekable();
+        let sftp = self.open_sftp().await.map_err(|error| error.to_string())?;
+        while let Some(segment) = segments.next() {
+            crate::ssh::upload::validate_name(std::ffi::OsStr::new(segment))
+                .map_err(|error| error.to_string())?;
+            if !ancestor.is_empty() && !ancestor.ends_with('/') {
+                ancestor.push('/');
+            }
+            ancestor.push_str(segment);
+            let metadata = sftp
+                .symlink_metadata(&ancestor)
+                .await
+                .map_err(|error| error.to_string())?;
+            if segments.peek().is_some() && !metadata.file_type().is_dir() {
+                return Err(format!(
+                    "Remote folder path contains a symbolic link or non-directory: {ancestor}"
+                ));
+            }
+        }
+        safe_remote_segment(root_name)?;
+        let root_metadata = sftp
+            .symlink_metadata(root_path)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !root_metadata.file_type().is_dir() {
+            return Err("The remote download source is not a regular folder".to_string());
+        }
+
+        let mut entries = Vec::new();
+        let mut pending = vec![(root_path.to_string(), PathBuf::new(), 0usize)];
+        let mut total = Some(0u64);
+        while let Some((directory, relative, depth)) = pending.pop() {
+            if depth >= MAX_SFTP_DOWNLOAD_DEPTH {
+                return Err("Remote folder exceeds the download depth limit".to_string());
+            }
+            let metadata = sftp
+                .symlink_metadata(&directory)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !metadata.file_type().is_dir() {
+                return Err(format!(
+                    "Remote folder changed during download scan: {directory}"
+                ));
+            }
+            let children = self
+                .list_dir_via_sftp(&directory)
+                .await
+                .map_err(|error| error.to_string())?;
+            for child in children {
+                safe_remote_segment(&child.name)?;
+                if entries.len() >= MAX_SFTP_LIST_ENTRIES {
+                    return Err("Remote folder contains more than 10,000 entries".to_string());
+                }
+                if directory
+                    .len()
+                    .checked_add(child.name.len() + 1)
+                    .is_none_or(|length| length > MAX_SFTP_DOWNLOAD_PATH_BYTES)
+                {
+                    return Err("Remote download path exceeds 4096 bytes".to_string());
+                }
+                let remote = format!("{directory}/{}", child.name);
+                let child_relative = relative.join(&child.name);
+                let metadata = sftp
+                    .symlink_metadata(&remote)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let file_type = metadata.file_type();
+                if !file_type.is_dir() && !file_type.is_file() {
+                    return Err(format!(
+                        "Symbolic links and special files cannot be downloaded: {remote}"
+                    ));
+                }
+                if file_type.is_dir() {
+                    pending.push((remote.clone(), child_relative.clone(), depth + 1));
+                } else {
+                    total = total
+                        .and_then(|bytes| metadata.size.and_then(|size| bytes.checked_add(size)));
+                }
+                entries.push(FolderDownloadEntry {
+                    remote,
+                    relative: child_relative,
+                    is_dir: file_type.is_dir(),
+                    size: metadata.size,
+                });
+            }
+        }
+
+        let on_progress = progress_factory(total);
+        let mut destination = Destination::new(destination_parent)
+            .map_err(|error| format!("Failed to open download directory: {error}"))?;
+        let (root_relative, root_handle) = destination
+            .claim(root_name, true)
+            .map_err(|error| format!("Failed to create download folder: {error}"))?;
+        drop(root_handle);
+        let result: Result<u64, String> = async {
+            let mut transferred = 0u64;
+            for entry in entries {
+                let relative = root_relative.join(&entry.relative);
+                let metadata = sftp
+                    .symlink_metadata(&entry.remote)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if (entry.is_dir && !metadata.file_type().is_dir())
+                    || (!entry.is_dir && !metadata.file_type().is_file())
+                    || (!entry.is_dir && metadata.size != entry.size)
+                {
+                    return Err(format!(
+                        "Remote entry changed during download: {}",
+                        entry.remote
+                    ));
+                }
+                let output = destination
+                    .create(&relative, entry.is_dir)
+                    .map_err(|error| format!("Failed to create {}: {error}", relative.display()))?;
+                if entry.is_dir {
+                    drop(output);
+                    continue;
+                }
+                let mut input = sftp
+                    .open(&entry.remote)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let opened = input.metadata().await.map_err(|error| error.to_string())?;
+                let current = sftp
+                    .symlink_metadata(&entry.remote)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !opened.file_type().is_file()
+                    || !current.file_type().is_file()
+                    || opened.size != entry.size
+                    || current.size != entry.size
+                {
+                    return Err(format!(
+                        "Remote file changed during download: {}",
+                        entry.remote
+                    ));
+                }
+                let mut output = tokio::fs::File::from_std(output);
+                let mut buffer = [0u8; 32 * 1024];
+                let mut file_bytes = 0u64;
+                loop {
+                    let read = input
+                        .read(&mut buffer)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    if read == 0 {
+                        break;
+                    }
+                    file_bytes = file_bytes
+                        .checked_add(read as u64)
+                        .ok_or("Remote folder exceeds the supported download size")?;
+                    if entry.size.is_some_and(|size| file_bytes > size) {
+                        return Err(format!(
+                            "Remote file grew during download: {}",
+                            entry.remote
+                        ));
+                    }
+                    output
+                        .write_all(&buffer[..read])
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    transferred = transferred
+                        .checked_add(read as u64)
+                        .ok_or("Remote folder exceeds the supported download size")?;
+                    on_progress(transferred);
+                }
+                if entry.size.is_some_and(|size| file_bytes != size) {
+                    return Err(format!(
+                        "Remote file shrank during download: {}",
+                        entry.remote
+                    ));
+                }
+                output.flush().await.map_err(|error| error.to_string())?;
+            }
+            on_progress(transferred);
+            Ok(transferred)
+        }
+        .await;
+        match result {
+            Ok(size) => Ok((destination_parent.join(root_relative), size)),
+            Err(error) => Err(destination.rollback(io::Error::other(error))),
+        }
+    }
+
     pub async fn download_file_via_sftp(
         &self,
         remote_path: &str,
@@ -1848,5 +2084,83 @@ MIIBnotavalidderpayload
         assert_eq!(fs::read(&source).unwrap(), b"external");
         assert_eq!(fs::read(&first.path).unwrap(), b"first");
         assert_eq!(fs::read(&second.path).unwrap(), b"second");
+        let remote_folder = fixture.root.join("source-tree");
+        fs::create_dir(&remote_folder).unwrap();
+        fs::create_dir(remote_folder.join("nested")).unwrap();
+        fs::create_dir(remote_folder.join("empty")).unwrap();
+        fs::write(remote_folder.join("nested/a.txt"), b"hello").unwrap();
+        fs::write(remote_folder.join("nested/a:b.txt"), b"colon").unwrap();
+        fs::write(remote_folder.join("b.txt"), b"four").unwrap();
+        let destination_parent = fixture.root.join("downloads");
+        fs::create_dir(&destination_parent).unwrap();
+        fs::create_dir(destination_parent.join("source-tree")).unwrap();
+        fs::write(destination_parent.join("source-tree/keep"), b"untouched").unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress = {
+            let seen = seen.clone();
+            move |total| -> Box<dyn Fn(u64) + Send + Sync> {
+                assert_eq!(total, Some(14));
+                let seen = seen.clone();
+                Box::new(move |bytes| seen.lock().unwrap().push(bytes))
+            }
+        };
+        let (downloaded, bytes) = connection
+            .download_folder_via_sftp(
+                remote_folder.to_str().unwrap(),
+                &destination_parent,
+                &progress,
+            )
+            .await
+            .expect("download nested regular files and empty folders");
+        assert_eq!(downloaded, destination_parent.join("source-tree (1)"));
+        assert_eq!(bytes, 14);
+        assert_eq!(fs::read(downloaded.join("nested/a.txt")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read(downloaded.join("nested/a:b.txt")).unwrap(),
+            b"colon"
+        );
+        assert_eq!(fs::read(downloaded.join("b.txt")).unwrap(), b"four");
+        assert!(downloaded.join("empty").is_dir());
+        assert_eq!(
+            fs::read(destination_parent.join("source-tree/keep")).unwrap(),
+            b"untouched"
+        );
+        assert_eq!(seen.lock().unwrap().last(), Some(&14));
+
+        let disappear = remote_folder.join("nested/a.txt");
+        let interrupt = move |_| -> Box<dyn Fn(u64) + Send + Sync> {
+            let disappear = disappear.clone();
+            Box::new(move |bytes| {
+                if bytes > 0 && disappear.exists() {
+                    fs::remove_file(&disappear).unwrap();
+                }
+            })
+        };
+        connection
+            .download_folder_via_sftp(
+                remote_folder.to_str().unwrap(),
+                &destination_parent,
+                &interrupt,
+            )
+            .await
+            .expect_err("failed remote read must rollback only the new output folder");
+        assert!(!destination_parent.join("source-tree (2)").exists());
+        assert_eq!(
+            fs::read(destination_parent.join("source-tree/keep")).unwrap(),
+            b"untouched"
+        );
+        fs::write(remote_folder.join("nested/a.txt"), b"hello").unwrap();
+
+        std::os::unix::fs::symlink(&source, remote_folder.join("linked.txt")).unwrap();
+        let error = connection
+            .download_folder_via_sftp(
+                remote_folder.to_str().unwrap(),
+                &destination_parent,
+                &progress,
+            )
+            .await
+            .expect_err("symlink in tree must reject before claiming output");
+        assert!(error.contains("Symbolic links"), "{error}");
+        assert!(!destination_parent.join("source-tree (2)").exists());
     }
 }

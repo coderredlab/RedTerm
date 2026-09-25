@@ -5,10 +5,12 @@
     listenRemoveProgress,
     listenUploadProgress,
     chooseDownloadSavePath,
+    chooseDownloadDirectory,
     sanitizeDownloadDialogFileName,
     localCreateDir,
     localCreateFile,
     localDownloadToDir,
+    localDownloadFolder,
     localHomeDir,
     localListDir,
     localRemovePath,
@@ -18,6 +20,7 @@
     sftpCreateDir,
     sftpCreateFile,
     sftpDownloadToDir,
+    sftpDownloadFolder,
     sftpHomeDir,
     sftpListDir,
     sftpRemovePath,
@@ -85,6 +88,7 @@
     >
 
   >({});
+  const downloadOriginId = crypto.randomUUID();
   // Identifies this explorer instance in delete progress events so a long
   // delete in one pane can never leak into another pane's progress UI.
   const removeOriginId = crypto.randomUUID();
@@ -323,6 +327,7 @@
     let unlisten: (() => void) | null = null;
     let cancelled = false;
     listenDownloadProgress((event) => {
+      if (event.originId !== null && event.originId !== downloadOriginId) return;
       downloads[event.path] = {
         transferred: event.transferred,
         total: event.total,
@@ -595,6 +600,32 @@
     }
   }
 
+  async function downloadFolder(entry: SftpDirEntry) {
+    const target = joinPath(path, entry.name);
+    if (!canBrowse || downloadingPaths.includes(target)) return;
+    let destination: string | null;
+    try {
+      destination = await chooseDownloadDirectory();
+    } catch (error) {
+      showStatus(`Download failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    if (!destination || downloadingPaths.includes(target)) return;
+    downloadingPaths = [...downloadingPaths, target];
+    downloads[target] = { transferred: 0, total: null };
+    try {
+      const saved = kind === "local"
+        ? await localDownloadFolder(target, destination, downloadOriginId)
+        : await sftpDownloadFolder(sessionId!, target, destination, downloadOriginId);
+      showStatus(`Saved to ${saved.local_path}`);
+    } catch (error) {
+      showStatus(`Download failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      downloadingPaths = downloadingPaths.filter((candidate) => candidate !== target);
+      setTimeout(() => { delete downloads[target]; }, 1500);
+    }
+  }
+
   function fileIconOf(name: string, isDir: boolean): string {
     if (isDir) return "▸";
     const kind = previewKindOf(name);
@@ -848,19 +879,18 @@
               </span>
             </span>
           </button>
-          {#if !entry.is_dir}
             <button
               class="entry-download"
               class:busy={downloadingPaths.includes(joinPath(path, entry.name))}
               title={
                 downloadingPaths.includes(joinPath(path, entry.name))
                   ? "Downloading…"
-                  : "Choose a folder and download"
+                  : entry.is_dir ? "Choose a destination and download folder" : "Choose a folder and download"
               }
-              aria-label={`Download ${entry.name}`}
+              aria-label={entry.is_dir ? `Download folder ${entry.name}` : `Download ${entry.name}`}
               onclick={(event) => {
                 event.stopPropagation();
-                void downloadEntry(entry);
+                void (entry.is_dir ? downloadFolder(entry) : downloadEntry(entry));
               }}
             >
               <svg
@@ -877,7 +907,6 @@
                 <path d="M10 3v9m-3-3 3 3 3-3M4 13v3h12v-3" />
               </svg>
             </button>
-          {/if}
         </div>
       {:else}
         <div class="explorer-status">Empty directory.</div>
@@ -901,16 +930,16 @@
         <button type="button" role="menuitem" disabled={loading || uploadBusy} onclick={() => void upload("folder")}>{uploadLabel} folder…</button>
       {/if}
       {#if !contextMenu.uploadOnly}
-      {#if contextMenu.entry !== null && !contextMenu.entry.is_dir && !downloadingPaths.includes(joinPath(path, contextMenu.entry.name))}
+      {#if contextMenu.entry !== null && !downloadingPaths.includes(joinPath(path, contextMenu.entry.name))}
         <button
           type="button"
           role="menuitem"
           onclick={() => {
             const entry = contextMenu?.entry ?? null;
             closeContextMenu();
-            if (entry) void downloadEntry(entry);
+            if (entry) void (entry.is_dir ? downloadFolder(entry) : downloadEntry(entry));
           }}
-        >Download</button>
+        >{contextMenu.entry.is_dir ? "Download folder" : "Download"}</button>
       {/if}
       <button type="button" role="menuitem" onclick={() => startCreate("file")}>New file</button>
       <button type="button" role="menuitem" onclick={() => startCreate("folder")}>New folder</button>
@@ -1236,8 +1265,8 @@
     width: 100%;
     display: flex;
     align-items: center;
-    gap: 4px;
-    padding: 4px 8px;
+    gap: 0;
+    padding: 0;
     border: 0;
     border-radius: 3px;
     background: transparent;
@@ -1248,12 +1277,13 @@
     cursor: pointer;
     transition: background-color 120ms ease;
     content-visibility: auto;
-    contain-intrinsic-size: auto 22px;
+    contain-intrinsic-size: auto 28px;
   }
 
-  .entry:not(.dir) {
-    gap: 0;
-    padding: 0;
+  .entry-list > button.entry {
+    gap: 4px;
+    min-height: 28px;
+    padding: 0 8px;
   }
 
   .entry-main {
@@ -1270,13 +1300,10 @@
     font-size: 11px;
     text-align: left;
     cursor: pointer;
-    padding: 0;
-  }
-
-  .entry:not(.dir) .entry-main {
     min-height: 28px;
     padding: 4px 0 4px 8px;
   }
+
 
   .entry:hover {
     background: var(--bg-tertiary);

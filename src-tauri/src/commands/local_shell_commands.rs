@@ -1501,7 +1501,8 @@ async fn local_download(
         .await
         .ok()
         .map(|metadata| metadata.len());
-    let on_progress = make_download_progress_emitter(app.clone(), remote_path_label.clone(), total);
+    let on_progress =
+        make_download_progress_emitter(app.clone(), remote_path_label.clone(), total, None);
     let size = copy_with_progress(source, destination_file, max_bytes, &on_progress).await?;
     Ok(SftpDownloadedFile {
         remote_path: remote_path_label,
@@ -1647,6 +1648,93 @@ pub async fn local_download_to_dir(
     }
 }
 
+/// Copy a home-scoped folder into a user-selected parent directory. The copy
+/// engine claims a new root rather than merging with an existing folder and
+/// rolls back only the entries it created if any source entry cannot be copied.
+#[derive(Default)]
+struct FolderCopyProgress {
+    file_index: usize,
+    completed: u64,
+    current: u64,
+}
+
+impl FolderCopyProgress {
+    fn update(&mut self, progress: &crate::ssh::UploadProgress) -> u64 {
+        if progress.file_index != self.file_index {
+            self.completed = self.completed.saturating_add(self.current);
+            self.file_index = progress.file_index;
+        }
+        self.current = progress.transferred;
+        self.completed.saturating_add(self.current)
+    }
+}
+
+#[tauri::command]
+pub async fn local_download_folder(
+    app: AppHandle,
+    path: String,
+    destination_path: String,
+    origin_id: String,
+) -> Result<SftpDownloadedFile, String> {
+    let on_progress =
+        make_download_progress_emitter(app.clone(), path.clone(), None, Some(origin_id.clone()));
+    let state = Mutex::new(FolderCopyProgress::default());
+    let result = copy_home_folder(path.clone(), destination_path, move |progress| {
+        let transferred = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .update(&progress);
+        on_progress(transferred);
+    })
+    .await?;
+    make_download_progress_emitter(app, path, Some(result.size), Some(origin_id))(result.size);
+    Ok(result)
+}
+
+async fn copy_home_folder(
+    path: String,
+    destination_path: String,
+    on_progress: impl Fn(crate::ssh::UploadProgress) + Send + Sync + 'static,
+) -> Result<SftpDownloadedFile, String> {
+    use crate::ssh::UploadSelectionKind;
+
+    let source = std::path::PathBuf::from(&path);
+    let scoped = ensure_within_home(&source)?;
+    if !scoped.is_dir() {
+        return Err("Folder not found".to_string());
+    }
+    if destination_path.trim().is_empty() {
+        return Err("Copy destination is required".to_string());
+    }
+    let destination = std::path::PathBuf::from(destination_path);
+    tauri::async_runtime::spawn_blocking(move || {
+        // Recheck the home boundary after scheduling. The source leaf's no-follow
+        // open rejects a symlinked folder even if the picker path changed.
+        ensure_within_home(&source)?;
+        let copied = crate::storage::local_upload::copy_upload_paths(
+            &destination,
+            vec![source],
+            UploadSelectionKind::Folder,
+            &on_progress,
+        )?;
+        if let Some(failure) = copied.failed.into_iter().next() {
+            return Err(failure.error);
+        }
+        let folder = copied
+            .uploaded
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Folder was not copied".to_string())?;
+        Ok(SftpDownloadedFile {
+            remote_path: path,
+            local_path: folder.remote_path,
+            size: folder.size,
+        })
+    })
+    .await
+    .map_err(|error| format!("Failed to copy folder: {error}"))?
+}
+
 #[tauri::command]
 pub async fn local_upload(
     app: AppHandle,
@@ -1662,8 +1750,9 @@ pub async fn local_upload(
     if origin_id.is_empty() {
         return Err("Copy origin is required".to_string());
     }
-    let destination = ensure_within_home(Path::new(&path))?;
-    if !destination.is_dir() {
+    let destination = std::path::PathBuf::from(path);
+    let scoped = ensure_within_home(&destination)?;
+    if !scoped.is_dir() {
         return Err("Copy destination is not a directory".to_string());
     }
     let title = match kind {
@@ -1675,8 +1764,8 @@ pub async fn local_upload(
     };
     tauri::async_runtime::spawn_blocking(move || {
         // The picker can remain open while the filesystem changes. Recheck
-        // the home boundary before the copy engine pins the destination.
-        let destination = ensure_within_home(&destination)?;
+        // the home boundary, but pin the original path through the no-follow copy engine.
+        ensure_within_home(&destination)?;
         crate::storage::local_upload::copy_upload_paths(&destination, paths, kind, &|progress| {
             emit_upload_progress(&app, &origin_id, &session_id, progress);
         })
@@ -1689,6 +1778,95 @@ pub async fn local_upload(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_folder_download_keeps_existing_data_and_rejects_links() {
+        use std::os::unix::fs::symlink;
+
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let home = local_home_dir_path().expect("test home directory");
+        let root = home.join(format!(
+            ".redterm-folder-download-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let fixture = Fixture(root);
+        let source = fixture.0.join("source");
+        let downloads = fixture.0.join("downloads");
+        std::fs::create_dir_all(source.join("inner/empty")).unwrap();
+        std::fs::create_dir_all(downloads.join("source")).unwrap();
+        std::fs::write(source.join("payload"), b"folder bytes").unwrap();
+        std::fs::write(source.join("inner/second"), b"more").unwrap();
+        std::fs::write(downloads.join("source/keep"), b"old bytes").unwrap();
+        let label = source.to_string_lossy().into_owned();
+        let parent = downloads.to_string_lossy().into_owned();
+        let progress = Arc::new(Mutex::new((FolderCopyProgress::default(), Vec::new())));
+        let seen = Arc::clone(&progress);
+        let copied = copy_home_folder(label.clone(), parent.clone(), move |event| {
+            let mut state = seen.lock().unwrap();
+            let transferred = state.0.update(&event);
+            state.1.push(transferred);
+        })
+        .await
+        .unwrap();
+        assert_eq!(copied.remote_path, label);
+        assert_eq!(
+            copied.local_path,
+            downloads.join("source (1)").to_string_lossy()
+        );
+        assert_eq!(copied.size, 16);
+        let samples = progress.lock().unwrap();
+        assert_eq!(samples.1.last(), Some(&16));
+        assert!(samples.1.windows(2).all(|pair| pair[1] >= pair[0]));
+        assert_eq!(
+            std::fs::read(downloads.join("source/keep")).unwrap(),
+            b"old bytes"
+        );
+        assert_eq!(
+            std::fs::read(downloads.join("source (1)/payload")).unwrap(),
+            b"folder bytes"
+        );
+        assert!(downloads.join("source (1)/inner/empty").is_dir());
+
+        symlink(&downloads, source.join("inner/link")).unwrap();
+        assert!(
+            copy_home_folder(label.clone(), parent.clone(), |_| {})
+                .await
+                .is_err(),
+            "a linked descendant cannot be copied"
+        );
+        assert!(!downloads.join("source (2)").exists());
+        std::fs::remove_file(source.join("inner/link")).unwrap();
+        let source_link = fixture.0.join("linked-source");
+        symlink(&source, &source_link).unwrap();
+        assert!(
+            copy_home_folder(source_link.to_string_lossy().into_owned(), parent, |_| {})
+                .await
+                .is_err(),
+            "a linked source cannot be copied"
+        );
+        assert!(!downloads.join("linked-source").exists());
+
+        let nested = source.join("inner");
+        let into_self = copy_home_folder(label, nested.to_string_lossy().into_owned(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            into_self.local_path,
+            nested.join("source").to_string_lossy()
+        );
+        assert!(nested.join("source/inner/empty").is_dir());
+        assert_eq!(
+            std::fs::read(nested.join("source/payload")).unwrap(),
+            b"folder bytes"
+        );
+        assert!(!nested.join("source/inner/source").exists());
+    }
 
     #[tokio::test]
     async fn local_directory_over_limit_fails_instead_of_hiding_unlisted_files() {
@@ -1714,6 +1892,11 @@ mod tests {
         local_list_dir(path)
             .await
             .expect_err("over-limit entries must not be reported as a complete listing");
+        let scanner = crate::ssh::upload::LocalSource::new(&fixture.0, true).unwrap();
+        assert!(
+            scanner.entries("selected").is_err(),
+            "folder copy must fail before output on excessive entries"
+        );
     }
 
     #[test]
