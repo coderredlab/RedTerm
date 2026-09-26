@@ -980,7 +980,7 @@ finally:
             ));
         }
         if remote_os == "macos" {
-            super::upload::verify_macos_stage_parent(self, parent, false)
+            super::upload_security::verify_macos_stage_parent(self, parent, false)
                 .await
                 .map_err(|error| {
                     SshError::SessionError(format!(
@@ -1016,7 +1016,7 @@ finally:
                     .uid
                     .zip(attrs.permissions)
                     .is_some_and(|(owner, mode)| {
-                        super::upload::safe_stage_component(owner, uid, mode, false)
+                        super::upload_security::safe_stage_component(owner, uid, mode, false)
                     })
             {
                 return Err(SshError::SessionError(

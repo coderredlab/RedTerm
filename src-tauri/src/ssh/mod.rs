@@ -4,6 +4,7 @@ pub mod known_hosts;
 pub mod session;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub mod upload;
+mod upload_security;
 
 #[cfg(test)]
 mod known_hosts_tests;

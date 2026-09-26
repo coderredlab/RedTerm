@@ -693,8 +693,31 @@ pub fn load_connections(app: AppHandle) -> Result<Vec<SavedConnection>, String> 
     Ok(ConnectionsStore::load(&app)?.connections)
 }
 
+#[cfg(target_os = "ios")]
+#[tauri::command]
+pub async fn save_connection(
+    app: AppHandle,
+    connection: SavedConnection,
+    password: Option<String>,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        save_connection_blocking(app, connection, password)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[cfg(not(target_os = "ios"))]
 #[tauri::command]
 pub fn save_connection(
+    app: AppHandle,
+    connection: SavedConnection,
+    password: Option<String>,
+) -> Result<(), String> {
+    save_connection_blocking(app, connection, password)
+}
+
+fn save_connection_blocking(
     app: AppHandle,
     mut connection: SavedConnection,
     password: Option<String>,
@@ -831,8 +854,21 @@ pub(crate) fn resolve_uploaded_key_for_auth(
     )
 }
 
+#[cfg(target_os = "ios")]
+#[tauri::command]
+pub async fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || delete_connection_blocking(app, id))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[cfg(not(target_os = "ios"))]
 #[tauri::command]
 pub fn delete_connection(app: AppHandle, id: String) -> Result<(), String> {
+    delete_connection_blocking(app, id)
+}
+
+fn delete_connection_blocking(app: AppHandle, id: String) -> Result<(), String> {
     let _guard = CONNECTION_STORE_LOCK
         .lock()
         .map_err(|_| "Connection store lock was poisoned".to_string())?;

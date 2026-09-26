@@ -942,6 +942,16 @@
     box-sizing: border-box;
   }
 
+  /* iOS WebKit zooms the whole page when a focused field is smaller than 16px. */
+  @supports (-webkit-touch-callout: none) {
+    input[type="text"],
+    input[type="password"],
+    input[type="number"],
+    textarea {
+      font-size: 16px;
+    }
+  }
+
   input:focus {
     outline: none;
     border-color: var(--accent-primary);

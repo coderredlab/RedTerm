@@ -405,6 +405,12 @@
     padding-right: env(safe-area-inset-right);
   }
 
+  @supports (-webkit-touch-callout: none) {
+    .app {
+      touch-action: manipulation;
+    }
+  }
+
   .main-content {
     flex: 1;
     min-height: 0;
