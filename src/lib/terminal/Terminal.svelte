@@ -1084,7 +1084,6 @@
         defaultFg: theme.colors.terminalFg,
         defaultBg: theme.colors.terminalBg,
         cursorColor: theme.colors.terminalCursor,
-        directDraw: isDesktopTarget,
         onImageLoad: requestRedraw,
       });
     }

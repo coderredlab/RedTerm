@@ -9,11 +9,6 @@ export interface CanvasRendererConfig {
   cursorColor: string;
   horizontalPadding: number;
   onImageLoad?: () => void;
-  /**
-   * true면 오프스크린 버퍼 없이 visible canvas에 바로 그린다(프레임마다 전체 복사 비용 제거).
-   * false(기본)는 Android WebView 잔상 방지용 더블 버퍼링을 유지한다.
-   */
-  directDraw?: boolean;
 }
 
 const DEFAULT_CONFIG: CanvasRendererConfig = {
@@ -24,7 +19,6 @@ const DEFAULT_CONFIG: CanvasRendererConfig = {
   defaultBg: '#1a0f0f',
   cursorColor: '#ff6b6b',
   horizontalPadding: 8,
-  directDraw: false,
 };
 
 const MAX_IMAGE_CACHE_ENTRIES = 64;
@@ -78,19 +72,10 @@ export class CanvasRenderer {
     const visibleCtx = canvas.getContext('2d', { alpha: false });
     if (!visibleCtx) throw new Error('Failed to get 2d context');
     this.visibleCtx = visibleCtx;
-
-    if (this.config.directDraw) {
-      // visible canvas에 곧장 그린다 — 프레임마다 전체 복사(blit)가 없다.
-      this.offscreen = document.createElement('canvas');
-      this.ctx = visibleCtx;
-    } else {
-      // 오프스크린 캔버스 (더블 버퍼링)
-      this.offscreen = document.createElement('canvas');
-      const offCtx = this.offscreen.getContext('2d', { alpha: false });
-      if (!offCtx) throw new Error('Failed to get offscreen 2d context');
-      this.ctx = offCtx;
-    }
-
+    this.offscreen = document.createElement('canvas');
+    const offCtx = this.offscreen.getContext('2d', { alpha: false });
+    if (!offCtx) throw new Error('Failed to get offscreen 2d context');
+    this.ctx = offCtx;
     this.dpr = window.devicePixelRatio || 1;
   }
   measureFont() {
@@ -163,11 +148,8 @@ export class CanvasRenderer {
     this.canvas.width = this.savedWidth;
     this.canvas.height = this.savedHeight;
 
-    // 더블 버퍼링 모드에서만 오프스크린을 같은 크기로 유지한다.
-    if (!this.config.directDraw) {
-      this.offscreen.width = this.savedWidth;
-      this.offscreen.height = this.savedHeight;
-    }
+    this.offscreen.width = this.savedWidth;
+    this.offscreen.height = this.savedHeight;
     this.cursorSnapshot = null;
 
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
@@ -201,16 +183,14 @@ export class CanvasRenderer {
     this.ctx.translate(0, -scrollFracY);
   }
 
-  /** beginDraw 후 draw 완료 시 호출 — 더블 버퍼링 모드에서는 오프스크린을 visible canvas로 복사 */
+  /** Copy the completed offscreen frame to the visible canvas in one operation. */
   endDraw() {
     // beginDraw가 스킵된 suspend 상태에서는 restore·drawImage 모두 건너뛴다.
     if (this.suspended) return;
     this.ctx.restore();
     this.ctx.font = `${this.config.fontSize}px ${this.config.fontFamily}`;
     this.ctx.textBaseline = 'top';
-    if (!this.config.directDraw) {
-      this.visibleCtx.drawImage(this.offscreen, 0, 0);
-    }
+    this.visibleCtx.drawImage(this.offscreen, 0, 0);
     this.updateAnimatedImageTimer();
   }
   drawRow(screenY: number, cells: Cell[]) {
@@ -346,9 +326,7 @@ export class CanvasRenderer {
     const snapshot = this.cursorSnapshot;
     if (!snapshot) return;
     this.ctx.putImageData(snapshot.pixels, snapshot.x, snapshot.y);
-    if (this.ctx !== this.visibleCtx) {
-      this.visibleCtx.putImageData(snapshot.pixels, snapshot.x, snapshot.y);
-    }
+    this.visibleCtx.putImageData(snapshot.pixels, snapshot.x, snapshot.y);
     this.cursorSnapshot = null;
   }
   drawSelection(startRow: number, startCol: number, endRow: number, endCol: number, viewStartRow: number) {
