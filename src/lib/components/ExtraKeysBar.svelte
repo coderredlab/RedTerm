@@ -425,7 +425,7 @@
   }
 
   .key-btn {
-    flex: 1;
+    flex: 1 0 auto;
     min-width: 0;
     padding: var(--extrakeys-btn-padding, 10px 4px);
     background: var(--bg-secondary);
@@ -434,6 +434,7 @@
     color: var(--text-primary);
     font-size: 12px;
     font-weight: 500;
+    white-space: nowrap;
     cursor: pointer;
     touch-action: manipulation;
     transition: background-color 0.1s;
@@ -454,7 +455,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    flex: 1;
+    flex: 1 0 auto;
     min-width: 0;
     font-weight: 600;
     letter-spacing: 0.02em;
