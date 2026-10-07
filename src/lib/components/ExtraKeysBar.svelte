@@ -425,7 +425,10 @@
   }
 
   .key-btn {
-    flex: 1 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 1 1 0;
     min-width: 0;
     padding: var(--extrakeys-btn-padding, 10px 4px);
     background: var(--bg-secondary);
@@ -455,7 +458,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    flex: 1 0 auto;
+    flex: 1 1 0;
     min-width: 0;
     font-weight: 600;
     letter-spacing: 0.02em;
@@ -492,6 +495,12 @@
     .utility-icon {
       width: 16px;
       height: 16px;
+    }
+  }
+
+  @media (max-width: 360px) {
+    .key-btn {
+      font-size: 9px;
     }
   }
 </style>

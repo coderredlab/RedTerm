@@ -1,2 +1,2 @@
-v1.7.7
-- Fix mobile extra-key sizing so long labels such as ENTER stay inside their buttons
+v1.7.8
+- Restore equal-width extra keys and keep labels centered inside their buttons
