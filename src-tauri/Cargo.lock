@@ -4561,7 +4561,7 @@ dependencies = [
 
 [[package]]
 name = "redterm"
-version = "1.7.8"
+version = "1.7.9"
 dependencies = [
  "arboard",
  "async-trait",

@@ -354,6 +354,7 @@
   let touchPointerId: number | null = null;
   let touchPointerStart: { x: number; y: number } | null = null;
   let touchPointerMoved = false;
+  let remoteTouchScroll = $state(false);
   let longPressTriggered = false;
   let terminalMousePointerId: number | null = null;
   let terminalMouseButton: number | null = null;
@@ -1229,6 +1230,7 @@
       updateImageAnimationVisibility();
       if (document.visibilityState === "visible") {
         if (!parser || !renderer) { void probeAndReconnect(); return; }
+        remoteTouchScroll = parser.isAlternateScreen() && parser.isMouseEnabled();
         parser.markAllDirty();
 
         // Android WebView resume 시 DOM 레이아웃 복원 타이밍이 불확실해서
@@ -1661,6 +1663,9 @@
           );
         }
       }
+      // The browser decides gesture ownership before touchmove. Remote TUI
+      // scrolling must disable native panning before the finger goes down.
+      remoteTouchScroll = parser.isAlternateScreen() && parser.isMouseEnabled();
 
       const retainedImageCacheIds = parser.consumeImageCachePruneRequest();
       if (retainedImageCacheIds) renderer.pruneImageCache(retainedImageCacheIds);
@@ -1859,7 +1864,6 @@
       sendMouseWheel(up, lines, pointerToViewportCell(e.touches[0]));
       // accum을 0 방향으로 줄여야 소비됨
       touchScrollAccum -= Math.sign(touchScrollAccum) * lines * lineThreshold;
-      e.preventDefault(); // 네이티브 스크롤 방지
     }
   }
 
@@ -2610,6 +2614,7 @@
     currentDirectoryUri = null;
     if (notifyTitleReset) onTitleChange?.("");
     parser = new AnsiParser(cols, rows);
+    remoteTouchScroll = false;
     parser.setCellSize(charWidth, charHeight);
     parser.setMaxScrollback(settingsStore.scrollbackLines);
     parser.setBellHandler(notifyBell);
@@ -4364,6 +4369,7 @@
   <div
     class="terminal-screen"
     class:selection-mode={selectionMode}
+    class:remote-scroll={remoteTouchScroll}
     class:path-link={hoveredPath !== null}
     title={hoveredPath ? `Show in Files: ${hoveredPath}` : undefined}
     onpointerleave={() => { hoveredPath = null; }}
@@ -4924,6 +4930,10 @@
   }
 
   .terminal-screen.path-link { cursor: pointer; }
+
+  .terminal-screen.remote-scroll {
+    touch-action: none;
+  }
 
   .terminal-screen.selection-mode {
     cursor: text;
