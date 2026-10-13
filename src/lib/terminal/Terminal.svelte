@@ -1,3 +1,27 @@
+<script module lang="ts">
+  // A terminal pane can remount without closing its backend session. Keep
+  // writes ordered by session, not by the lifetime of one Terminal instance.
+  const desktopWriteTails = new Map<string, Promise<void>>();
+
+  function enqueueDesktopWrite(
+    sessionId: string,
+    send: () => Promise<void>,
+    onError: (error: unknown) => void,
+  ) {
+    const previous = desktopWriteTails.get(sessionId) ?? Promise.resolve();
+    const tail = previous.then(send, send).catch(onError);
+    desktopWriteTails.set(sessionId, tail);
+    const forget = () => {
+      if (desktopWriteTails.get(sessionId) === tail) desktopWriteTails.delete(sessionId);
+    };
+    void tail.then(forget, forget);
+  }
+
+  function drainDesktopWrites(sessionId: string): Promise<void> {
+    return desktopWriteTails.get(sessionId) ?? Promise.resolve();
+  }
+</script>
+
 <script lang="ts">
   import { onMount, onDestroy, tick, untrack } from "svelte";
   import { openUrl } from "@tauri-apps/plugin-opener";
@@ -69,7 +93,10 @@
     takeRuntimeSessionSnapshot,
   } from "./session-runtime-snapshot";
   import { composeJamoSequence, HangulComposer } from "./hangul-compose";
+  import { AndroidRemoteTextOrigins, AndroidTextDelta, isCanceledAndroidCompositionValue, type AndroidTextChange } from "./android-text-delta";
   import {
+    baseLayoutCharacter,
+    KITTY_KEYBOARD_FLAGS,
     encodeKittyInputText,
     encodeKittyKeyboardEvent,
     encodeTerminalKeyboardEvent,
@@ -961,6 +988,7 @@
   }
 
   async function handlePaste(e: ClipboardEvent) {
+    resetAndroidInput();
     if (!sessionId) return;
     const targetSessionId = sessionId;
     const generation = connectionGeneration;
@@ -1007,6 +1035,7 @@
   // Selection drag handles are a touch UX (mobile); the desktop build
   // selects by mouse drag directly.
   const isDesktopTarget = import.meta.env.VITE_REDTERM_TARGET === "desktop";
+  const isAndroidTarget = !isDesktopTarget && /Android/i.test(navigator.userAgent);
 
   function redrawCanvas(force = false) {
     if (!renderer || !parser) return;
@@ -1160,6 +1189,7 @@
     await tick();
     if (destroyed) return;
     if (hiddenInput) {
+      if (isAndroidTarget) hiddenInput.addEventListener('beforeinput', handleAndroidBeforeInput);
       hiddenInput.addEventListener('input', handleInput);
       hiddenInput.addEventListener('keydown', handleKeyDown);
       hiddenInput.addEventListener('keyup', handleKeyUp);
@@ -1172,6 +1202,27 @@
       hiddenInput.addEventListener('paste', pasteHandler);
 
       blurHandler = (event: FocusEvent) => {
+        if (isDesktopTarget) closeDesktopKittyPresses();
+        if (isAndroidTarget) {
+          androidRemoteOrigins.retirePendingKeys();
+          const closedDeferredCodes = discardAndroidDeferredKittyPress();
+          for (const [code, held] of androidKittyImmediatePresses) {
+            if (!closedDeferredCodes?.has(code)) {
+              const release = held.event.key === "Backspace" && (held.flags & KITTY_KEYBOARD_FLAGS.REPORT_ALL_KEYS)
+                ? encodeKittyKeyboardEvent(held.event, held.flags, "release")
+                : encodeTerminalKeyboardEvent(held.event, navigator.platform, held.flags, "release");
+              if (sessionId && release) queueWrite(release);
+            }
+            suppressedAndroidCompositionKeyups.set(code, held.event.key);
+          }
+          androidKittyImmediatePresses.clear();
+          androidHardwareEcho = null;
+          androidEditBeforeStart = -1;
+          androidEditBeforeEnd = -1;
+          androidEditBeforeValue = "";
+          androidEditSelectedKey = "";
+          androidEditSelectedInsert = false;
+        }
         if (suppressBlurRefocus) {
           suppressBlurRefocus = false;
           return;
@@ -1287,6 +1338,7 @@
 
         void resumeAfterBackground();
       } else if (document.visibilityState === "hidden") {
+        closeDesktopKittyPresses();
         cancelPointerInteraction();
         clearImageAnimationTimer();
         pauseSshDataForBackground();
@@ -1418,6 +1470,30 @@
   let compositionTimeout: number | null = null;
   let pendingHangulEchoCells = 0;
   const hangulComposer = new HangulComposer();
+  const androidTextDelta = new AndroidTextDelta();
+  const androidRemoteOrigins = new AndroidRemoteTextOrigins();
+  let androidEditBeforeValue = "";
+  let androidEditBeforeStart = -1;
+  let androidEditBeforeEnd = -1;
+  let androidEditSelectedKey = "";
+  let androidEditSelectedInsert = false;
+  type AndroidDeferredKittyPress = {
+    code: string; key: string; press: string; release: string | null;
+    beforeValue: string; selectionStart: number; selectionEnd: number;
+    released: boolean; reported: boolean; releaseSent: boolean;
+    pressOrder: number; releaseOrder: number; keydownEvent: KittyKeyboardEvent;
+    repeatEvent: KittyKeyboardEvent | null; reportedImmediatePress: boolean; kittyFlags: number;
+  };
+  const androidDeferredKittyPresses: AndroidDeferredKittyPress[] = [];
+  const androidKittyImmediatePresses = new Map<string, { event: KittyKeyboardEvent; flags: number }>();
+  const desktopKittyHeldPresses = new Map<string, { event: KittyKeyboardEvent; flags: number }>();
+  let androidDeferredKittyEventOrder = 0;
+  let androidCompositionTimedOut = false;
+  let discardAndroidCompositionEnd = false;
+  let canceledAndroidCompositionCommit: { marked: string; full: string; reportedKeys: string } | null = null;
+  const suppressedAndroidCompositionKeyups = new Map<string, string>();
+  let androidHardwareEcho: { Backspace: number; Enter: number } | null = null;
+  let androidRejectingMiddleComposition = false;
   let pendingCommitKey: { data: string; suppressPlainSpace: boolean } | null = null;
   let suppressPlainSpace = false;
   let pendingWrite = "";
@@ -2194,7 +2270,12 @@
       : (error: unknown) => {
           if (isConnectionAttemptActive(generation, targetSessionId)) handleWriteError(error);
         };
-    if (kind === "local") {
+    if (isDesktopTarget) {
+      // Preserve press/release order even if a live pane moves to a new component.
+      enqueueDesktopWrite(targetSessionId,
+        () => kind === "local" ? localShellWrite(targetSessionId, bytes) : sshWrite(targetSessionId, bytes),
+        onWriteError);
+    } else if (kind === "local") {
       localShellWrite(targetSessionId, bytes).catch(onWriteError);
     } else {
       sshWrite(targetSessionId, bytes).catch(onWriteError);
@@ -2607,6 +2688,16 @@
 
   function resetParser(notifyTitleReset = true) {
     if (destroyed) return;
+    desktopKittyHeldPresses.clear();
+    resetAndroidInput();
+    if (isAndroidTarget) {
+      // Parser reset starts another remote key state, not another editor edit.
+      // A release from the old session must not reach the new connection.
+      for (const [code, held] of androidKittyImmediatePresses) {
+        suppressedAndroidCompositionKeyups.set(code, held.event.key);
+      }
+      androidKittyImmediatePresses.clear();
+    }
     clearSynchronizedOutputTimer();
     parserGeneration++;
     clearImageAnimationTimer();
@@ -3288,24 +3379,275 @@
     pendingHangulEchoCells = Math.max(0, pendingHangulEchoCells - advancedCells);
   }
 
+  function kittyPhysicalOnly(flags: number): boolean {
+    return (flags & KITTY_KEYBOARD_FLAGS.REPORT_ALL_KEYS) !== 0 &&
+      (flags & KITTY_KEYBOARD_FLAGS.REPORT_ASSOCIATED_TEXT) === 0;
+  }
+  function kittyReportedImeKey(e: KeyboardEvent, flags: number): boolean {
+    return (flags & KITTY_KEYBOARD_FLAGS.REPORT_ALL_KEYS) !== 0 &&
+      !e.ctrlKey && !e.altKey && !e.metaKey &&
+      isSinglePrintableKeyboardKey(e.key);
+  }
+  function applyAndroidTextChange(
+    change: AndroidTextChange | null, selectionStart = -1, selectionEnd = -1, beforeValue = "",
+    nativeDelete = false, correction = 0, literalCorrection = false,
+    physicalPresses: AndroidDeferredKittyPress[] | null = null
+  ) {
+    const next = isComposing && hiddenInput ? hiddenInput.value : androidTextDelta.editorValue;
+    // A PTY DEL edits only the remote tail. Reject an IME change that keeps
+    // previously transmitted text after the edited range; appending the
+    // replacement would corrupt the remote command, not edit that range.
+    if (change?.erase && androidRemoteOrigins.hasReportedSuffixAfterEdit(next)) {
+      androidTextDelta.restoreEditor(androidRemoteOrigins.editorValue);
+      if (hiddenInput) hiddenInput.value = androidTextDelta.editorValue;
+      androidRejectingMiddleComposition = isComposing;
+      return 0;
+    }
+    // Ownership is established when bytes are sent, not by whichever Kitty
+    // flags happen to be active when the IME later corrects the editor.
+    const removed = !nativeDelete && change?.erase
+      ? Math.max(
+        androidRemoteOrigins.reportedDeletes(next, selectionStart, selectionEnd, beforeValue),
+        isComposing ? 0 : androidRemoteOrigins.reportedCompositionDeletes(next)
+      ) : 0;
+    const reportedText = change?.text ?? "";
+    const matchedPhysical = androidRemoteOrigins.sync(next, selectionStart, selectionEnd, beforeValue, nativeDelete, reportedText);
+    if (matchedPhysical) androidTextDelta.noteIndependentKey(matchedPhysical);
+    const erased = Math.max(removed, correction);
+    if (erased) queueWrite(getBackspaceInputCode().repeat(erased));
+    if (!change?.text) return erased;
+    let text = androidRemoteOrigins.unreportedCompositionText(change.text, next);
+    if (matchedPhysical && !isComposing) {
+      let end = text.length;
+      for (let i = matchedPhysical.length; i > 0;) {
+        const last = matchedPhysical.charCodeAt(i - 1);
+        const width = last >= 0xdc00 && last <= 0xdfff ? 2 : 1;
+        i -= width;
+        const index = text.lastIndexOf(matchedPhysical.slice(i, i + width), end - 1);
+        if (index >= 0) {
+          text = text.slice(0, index) + text.slice(index + width);
+          end = index;
+        }
+      }
+    }
+    if (!text) return erased;
+    if (physicalPresses && !isComposing && text === change.text) {
+      for (const press of physicalPresses) {
+        flushAndroidDeferredKittyReleasesBefore(physicalPresses, press.pressOrder);
+        let encoded = press.press;
+        if (press.repeatEvent && !press.reportedImmediatePress &&
+          !androidKittyImmediatePresses.has(press.code) &&
+          !androidDeferredKittyPresses.some((earlier) => earlier.code === press.code &&
+            earlier.pressOrder < press.pressOrder && earlier.reported && !earlier.releaseSent)) {
+          // Only a repeat without a prior reported press can reopen as press.
+          encoded = encodeTerminalKeyboardEvent(press.repeatEvent, navigator.platform, press.kittyFlags, "press") ?? encoded;
+        }
+        queueWrite(encoded);
+        press.reported = true;
+      }
+      return erased;
+    }
+    if (!/[\r\n]/.test(text)) {
+      sendText(text, true, literalCorrection);
+      return erased;
+    }
+    const parts = text.split(/[\r\n]/);
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i]) sendText(parts[i], true);
+      if (i < parts.length - 1) queueWrite("\r");
+    }
+    return erased;
+  }
+  function queueAndroidNativeBackspace(
+    change: AndroidTextChange | null, inputType: string,
+    selectionStart: number, selectionEnd: number, beforeValue: string
+  ) {
+    if (isComposing || inputType !== "deleteContentBackward") return;
+    if (!change) {
+      queueWrite(getBackspaceInputCode());
+      return;
+    }
+    if (change.erase) {
+      const removed = androidRemoteOrigins.reportedDeletes(
+        androidTextDelta.editorValue, selectionStart, selectionEnd, beforeValue
+      );
+      if (removed) queueWrite(getBackspaceInputCode().repeat(removed));
+    }
+  }
+
+  function compactAndroidInput() {
+    const compacted = androidTextDelta.compact();
+    if (compacted !== null) {
+      androidRemoteOrigins.compact(compacted);
+      if (hiddenInput) hiddenInput.value = compacted;
+    }
+  }
+
+  function discardAndroidDeferredKittyPress() {
+    if (!androidDeferredKittyPresses.length) return null;
+    const closedCodes = new Set<string>();
+    for (let i = androidDeferredKittyPresses.length - 1; i >= 0; i--) {
+      const deferred = androidDeferredKittyPresses[i];
+      if (!deferred.released && !androidKittyImmediatePresses.has(deferred.code)) {
+        suppressedAndroidCompositionKeyups.set(deferred.code, deferred.key);
+      }
+      if ((deferred.reported || (deferred.reportedImmediatePress && deferred.released)) &&
+        !deferred.releaseSent && !closedCodes.has(deferred.code)) {
+        // A focus/IME boundary can swallow keyup. Close only a press already
+        // sent to the PTY; unreported native edits must not own later soft text.
+        const release = deferred.release ?? encodeTerminalKeyboardEvent(
+          deferred.keydownEvent, navigator.platform, deferred.kittyFlags, "release"
+        );
+        if (sessionId && release) {
+          queueWrite(release);
+          closedCodes.add(deferred.code);
+        }
+      }
+    }
+    for (const code of closedCodes) {
+      const held = androidKittyImmediatePresses.get(code);
+      if (held) {
+        androidKittyImmediatePresses.delete(code);
+        suppressedAndroidCompositionKeyups.set(code, held.event.key);
+      }
+    }
+    androidDeferredKittyPresses.length = 0;
+    return closedCodes;
+  }
+
+  function flushAndroidDeferredKittyRelease(released: AndroidDeferredKittyPress) {
+    if (!released.released || !released.reported || released.releaseSent) return;
+    for (const deferred of androidDeferredKittyPresses) {
+      if (deferred === released) break;
+      if (deferred.code === released.code && deferred.key === released.key &&
+        !deferred.reported && !deferred.released) return;
+    }
+    if (sessionId && released.release) queueWrite(released.release);
+    for (const deferred of androidDeferredKittyPresses) {
+      if (deferred.code === released.code && deferred.reported) {
+        deferred.released = true;
+        deferred.releaseSent = true;
+      }
+      if (deferred === released) break;
+    }
+    if (androidDeferredKittyPresses.every((deferred) => deferred.releaseSent && deferred.reported)) {
+      androidDeferredKittyPresses.length = 0;
+    }
+  }
+
+  function flushAndroidDeferredKittyReleasesBefore(presses: AndroidDeferredKittyPress[], order: number) {
+    while (true) {
+      let next: AndroidDeferredKittyPress | null = null;
+      for (const deferred of presses) {
+        if (deferred.reported && deferred.releaseOrder && deferred.releaseOrder < order && !deferred.releaseSent &&
+          (!next || deferred.releaseOrder <= next.releaseOrder)) next = deferred;
+      }
+      if (!next) return;
+      flushAndroidDeferredKittyRelease(next);
+      if (!next.releaseSent) return;
+    }
+  }
+
+  function resetAndroidInput() {
+    if (!isAndroidTarget) return;
+    androidRejectingMiddleComposition = false;
+    discardAndroidDeferredKittyPress();
+    androidHardwareEcho = null;
+    discardAndroidCompositionEnd ||= isComposing;
+    isComposing = false;
+    compositionText = "";
+    if (compositionTimeout) {
+      clearTimeout(compositionTimeout);
+      compositionTimeout = null;
+    }
+    androidCompositionTimedOut = false;
+    androidTextDelta.reset();
+    androidRemoteOrigins.reset();
+    androidEditBeforeStart = -1;
+    androidEditBeforeValue = "";
+    androidEditSelectedKey = "";
+    androidEditSelectedInsert = false;
+    if (hiddenInput) hiddenInput.value = "";
+  }
+
+  function finishRejectedAndroidComposition(awaitNativeTail = false) {
+    // The native IME may still carry its rejected candidate across a timeout
+    // or compositionend. Retain one boundary for its next real append.
+    androidRejectingMiddleComposition = awaitNativeTail;
+    isComposing = false;
+    compositionText = "";
+    androidCompositionTimedOut = false;
+    if (compositionTimeout) {
+      clearTimeout(compositionTimeout);
+      compositionTimeout = null;
+    }
+    androidTextDelta.restoreEditor(androidRemoteOrigins.editorValue);
+    androidRemoteOrigins.endComposition(false);
+    if (hiddenInput) hiddenInput.value = androidTextDelta.editorValue;
+    androidEditBeforeStart = -1;
+    androidEditBeforeEnd = -1;
+    androidEditBeforeValue = "";
+    androidEditSelectedInsert = false;
+    discardAndroidCompositionEnd = true;
+  }
+
   // Composition handlers for Korean/CJK input
   function handleCompositionStart() {
+    // A new composition is an observable boundary if the previous one ended
+    // without compositionend; elapsed time alone must not send marked text.
+    if (isAndroidTarget && androidRejectingMiddleComposition) finishRejectedAndroidComposition();
+    if (isAndroidTarget && androidCompositionTimedOut && hiddenInput && sessionId) {
+      applyAndroidTextChange(androidTextDelta.compositionEnd(hiddenInput.value));
+      androidRemoteOrigins.endComposition(false);
+      compactAndroidInput();
+    }
+    androidHardwareEcho = null;
+    canceledAndroidCompositionCommit = null;
+    discardAndroidCompositionEnd = false;
+    androidCompositionTimedOut = false;
     compositionAnchor = { ...cursorPos };
     compositionAnchorAlternateScreen = parser?.isAlternateScreen() ?? false;
     compositionAnchorLost = false;
     isComposing = true;
     compositionText = "";
     immediateCompositionText = "";
+    if (isAndroidTarget) {
+      if (androidTextDelta.hasPendingCommit && hiddenInput) hiddenInput.value = androidTextDelta.editorValue;
+      androidEditBeforeStart = -1;
+      androidEditSelectedKey = "";
+      androidEditSelectedInsert = false;
+      discardAndroidDeferredKittyPress();
+      if (hiddenInput && hiddenInput.selectionEnd > hiddenInput.selectionStart) {
+        androidEditBeforeValue = hiddenInput.value;
+        androidEditBeforeStart = hiddenInput.selectionStart;
+        androidEditBeforeEnd = hiddenInput.selectionEnd;
+      }
+      androidRemoteOrigins.startComposition(hiddenInput?.selectionStart, hiddenInput?.selectionEnd);
+      androidTextDelta.compositionStart(hiddenInput?.selectionStart, hiddenInput?.selectionEnd);
+      // Kitty can report a physical key before the IME places an earlier
+      // candidate in front of it. Hold the whole marked word until commit.
+      if ((parser?.getKittyKeyboardFlags() ?? 0) & KITTY_KEYBOARD_FLAGS.REPORT_ALL_KEYS) {
+        androidTextDelta.deferComposingText();
+      }
+      if (hiddenInput && androidRemoteOrigins.hasReportedTextAfter(hiddenInput.selectionEnd)) {
+        androidRejectingMiddleComposition = true;
+      }
+    }
     compositionUpdateStarted = false;
     if (isDesktopTarget) renderer?.hideCursor();
-    // 3초 stuck 타이머는 모바일(안드로이드 WebView)용 — compositionend가
-    // 없을 때 플래그를 풀어 입력 막힘을 방지한다. 데스크탑 IME는
-    // compositionend를 확실히 주므로 플래그를 임의로 끄지 않는다.
+    // Android cannot commit marked text just because the IME paused for 3s.
+    // Keep its editor until compositionend or an observable non-composing edit.
+    // Other mobile views retain the existing stuck-flag recovery.
     if (!isDesktopTarget) {
       if (compositionTimeout) clearTimeout(compositionTimeout);
       compositionTimeout = window.setTimeout(() => {
-        isComposing = false;
-        compositionText = "";
+        if (isAndroidTarget) {
+          androidCompositionTimedOut = true;
+          if (androidRejectingMiddleComposition) finishRejectedAndroidComposition(true);
+        } else {
+          isComposing = false;
+          compositionText = "";
+        }
         compositionTimeout = null;
       }, 3000);
     } else {
@@ -3324,6 +3666,7 @@
   }
   function handleCompositionUpdate(e: CompositionEvent) {
     const text = e.data ?? hiddenInput?.value ?? "";
+    if (isAndroidTarget && hiddenInput) androidTextDelta.compositionUpdate(text, hiddenInput.value);
     compositionText = trackCompositionText(text);
   }
 
@@ -3338,12 +3681,39 @@
   }
 
   function handleCompositionEnd(e: CompositionEvent) {
+    if (isAndroidTarget && androidRejectingMiddleComposition) {
+      finishRejectedAndroidComposition(true);
+      discardAndroidCompositionEnd = false;
+      return;
+    }
+    if (isAndroidTarget && discardAndroidCompositionEnd) {
+      discardAndroidCompositionEnd = false;
+      return;
+    }
     if (compositionTimeout) {
       clearTimeout(compositionTimeout);
       compositionTimeout = null;
     }
+    androidCompositionTimedOut = false;
     isComposing = false;
     compositionText = "";
+    if (isAndroidTarget) {
+      if (sessionId && hiddenInput) {
+        const change = androidTextDelta.compositionEnd(hiddenInput.value, e.data ?? undefined);
+        const correction = androidRemoteOrigins.compositionCorrection(androidTextDelta.editorValue);
+        const unsent = change?.text
+          ? androidRemoteOrigins.unreportedCompositionText(change.text, androidTextDelta.editorValue) : change?.text;
+        const outgoing = change && unsent !== change.text ? { ...change, text: unsent ?? "" } : change;
+        applyAndroidTextChange(outgoing, -1, -1, "", false, correction, !!outgoing?.text && (!!outgoing.erase || !!correction));
+        androidRemoteOrigins.endComposition(e.data === "");
+        compactAndroidInput();
+      } else {
+        resetAndroidInput();
+      }
+      immediateCompositionText = "";
+      redrawDesktopCursorAfterComposition();
+      return;
+    }
     if (sessionId) {
       const data = e.data ?? "";
       if (isDesktopTarget) {
@@ -3381,7 +3751,9 @@
         suppressPlainSpace = pending?.suppressPlainSpace ?? false;
       } else if (data.startsWith(immediateCompositionText)) {
         const remainingText = data.slice(immediateCompositionText.length);
-        if (remainingText) sendText(remainingText);
+        if (remainingText) {
+          sendText(remainingText);
+        }
       } else if (immediateCompositionText.startsWith(data)) {
         // Composition shrank or was canceled: erase already-sent chars.
         queueWrite(getBackspaceInputCode().repeat(immediateCompositionText.length - data.length));
@@ -3398,17 +3770,75 @@
     redrawDesktopCursorAfterComposition();
   }
 
+  function handleAndroidBeforeInput(e: InputEvent) {
+    if (e.inputType === "deleteContentBackward" || e.inputType.startsWith("insert") || e.inputType === "") {
+      const target = e.target as HTMLTextAreaElement;
+      if ((e.inputType === "insertCompositionText" || e.inputType === "insertText" ||
+        e.inputType === "insertReplacementText") &&
+        target.selectionStart === target.selectionEnd &&
+        androidEditBeforeStart >= 0 && androidEditBeforeEnd > androidEditBeforeStart &&
+        androidEditBeforeValue === target.value) return;
+      if (androidEditBeforeValue !== target.value || androidEditBeforeStart !== target.selectionStart ||
+        androidEditBeforeEnd !== target.selectionEnd) androidEditSelectedKey = "";
+      androidEditBeforeValue = target.value;
+      androidEditBeforeStart = target.selectionStart;
+      androidEditBeforeEnd = target.selectionEnd;
+      androidEditSelectedInsert = (e.inputType === "insertText" || e.inputType === "insertReplacementText" ||
+        (e.inputType === "" && !e.data)) &&
+        target.selectionEnd > target.selectionStart &&
+        (!e.data || e.data === target.value.slice(target.selectionStart, target.selectionEnd));
+    } else {
+      androidEditBeforeStart = -1;
+      androidEditSelectedKey = "";
+      androidEditSelectedInsert = false;
+    }
+  }
+
   // Handle textarea input (main input method for mobile)
   function handleInput(e: Event) {
     const target = e.target as HTMLTextAreaElement;
     const inputEvent = e as InputEvent;
+    let editStart = androidEditBeforeStart;
+    let editEnd = androidEditBeforeEnd;
+    let editBeforeValue = androidEditBeforeValue;
+    let selectedPhysicalKey = androidEditSelectedKey;
+    const selectedInsert = androidEditSelectedInsert;
+    for (const deferred of androidDeferredKittyPresses) {
+      if (!deferred.reported && deferred.beforeValue === editBeforeValue &&
+        deferred.selectionStart === editStart && deferred.selectionEnd === editEnd &&
+        deferred.key === editBeforeValue.slice(editStart, editEnd)) {
+        selectedPhysicalKey = deferred.key;
+        break;
+      }
+    }
+    androidEditBeforeStart = -1;
+    androidEditSelectedKey = "";
+    androidEditSelectedInsert = false;
 
     if (!sessionId) return;
 
-    const value = target.value;
+    let value = target.value;
+    if (isAndroidTarget && canceledAndroidCompositionCommit && !isComposing) {
+      // The canceled InputConnection candidate can arrive after compositionend.
+      if (inputEvent.inputType === "insertFromComposition" ||
+        inputEvent.inputType === "insertCompositionText" || inputEvent.inputType === "") {
+        const canceled = canceledAndroidCompositionCommit;
+        const editor = androidTextDelta.editorValue;
+        // A late canceled candidate may include only some of the physical
+        // keys already reported to the PTY, even when their native echoes lag.
+        const candidateValue = isCanceledAndroidCompositionValue(
+          value, editor, canceled.marked, canceled.full, canceled.reportedKeys
+        );
+        if (candidateValue && (!inputEvent.data ||
+          inputEvent.data === canceled.marked || inputEvent.data === canceled.full)) {
+          target.value = editor;
+          return;
+        }
+      }
+    }
     // Backspace must edit already-sent terminal text, but should not leak
     // remote DELs while CJK composition is still local-only.
-    if (inputEvent.inputType === "deleteContentBackward") {
+    if (inputEvent.inputType === "deleteContentBackward" && !isAndroidTarget) {
       if (!isComposing) {
         queueWrite(getBackspaceInputCode());
         target.value = "";
@@ -3423,6 +3853,7 @@
 
     // Samsung keyboard clipboard panel image paste: comes as insertFromPaste input event
     if (inputEvent.inputType === "insertFromPaste") {
+      resetAndroidInput();
       target.value = "";
       const targetSessionId = sessionId;
       const generation = connectionGeneration;
@@ -3446,9 +3877,246 @@
       return;
     }
 
-    // Samsung Keyboard composes even English letters on some devices. Terminal
-    // input should receive printable ASCII immediately; keep CJK composition
-    // deferred until compositionend.
+    // Some IMEs move a collapsed caret after compositionstart. Reject the
+    // provisional edit before origin.sync can replace the reported suffix.
+    if (isAndroidTarget && isComposing && !androidRejectingMiddleComposition && (
+      (editBeforeValue === androidRemoteOrigins.editorValue && editStart >= 0 &&
+        editEnd >= editStart && androidRemoteOrigins.hasReportedTextAfter(editEnd)) ||
+      (editStart < 0 && target.selectionStart === target.selectionEnd &&
+        androidRemoteOrigins.hasReportedTextAfter(target.selectionStart))
+    )) androidRejectingMiddleComposition = true;
+
+    if (isAndroidTarget && androidRejectingMiddleComposition) {
+      // The IME may keep its rejected candidate internally even after we
+      // restored the textarea. Preserve a new, non-composing tail edit only.
+      const editor = androidTextDelta.editorValue;
+      const appended = inputEvent.data || (value.startsWith(editor) ? value.slice(editor.length) : "");
+      const previous = appended && value.endsWith(appended) ? value.slice(0, -appended.length) : "";
+      const tailAppend = (inputEvent.inputType === "insertText" || inputEvent.inputType === "") &&
+        appended && (previous === editor || androidRemoteOrigins.hasReportedSuffixAfterEdit(previous)) &&
+        (editBeforeValue === editor && editStart >= 0
+          ? editStart === editor.length && editEnd === editor.length
+          : target.selectionStart === value.length && target.selectionEnd === value.length);
+      const lastCodeUnit = editor.charCodeAt(editor.length - 1);
+      const lastWidth = lastCodeUnit >= 0xdc00 && lastCodeUnit <= 0xdfff ? 2 : 1;
+      const recordedTail = editBeforeValue === editor && editStart >= 0 &&
+        editEnd === editor.length && (editStart === editEnd || editStart === editor.length - lastWidth);
+      const noRecordedSelection = editStart < 0 && target.selectionStart === value.length &&
+        target.selectionEnd === value.length;
+      const tailDelete = inputEvent.inputType === "deleteContentBackward" &&
+        editor.length > 0 && value === editor.slice(0, -lastWidth) && (recordedTail || noRecordedSelection);
+      const tailNewline = (inputEvent.inputType === "insertLineBreak" || inputEvent.inputType === "insertParagraph") &&
+        (value === editor + "\n" || value === editor + "\r");
+      if (!inputEvent.isComposing && (tailAppend || tailDelete || tailNewline)) {
+        const retained = tailAppend ? editor + appended : value;
+        finishRejectedAndroidComposition();
+        value = retained;
+        target.value = retained;
+      } else {
+        target.value = editor;
+        return;
+      }
+    }
+    // A terminal cannot insert/delete before previously sent suffix bytes.
+    // Equal adjacent glyphs make a string diff appear to be a tail edit, so
+    // use beforeinput's edit range, or the post-edit caret when it is absent.
+    if (isAndroidTarget && !isComposing && (
+      (editBeforeValue === androidRemoteOrigins.editorValue && editStart >= 0 &&
+        editEnd >= editStart && editEnd < editBeforeValue.length &&
+        androidRemoteOrigins.hasReportedTextAfter(editEnd)) ||
+      (editStart < 0 && value !== androidRemoteOrigins.editorValue &&
+        target.selectionStart === target.selectionEnd && target.selectionStart < value.length &&
+        androidRemoteOrigins.hasReportedTextAfter(target.selectionStart))
+    )) {
+      target.value = androidTextDelta.editorValue;
+      return;
+    }
+    // An input-only tail delete can be ambiguous by text (aaa -> aa). The
+    // post-edit tail caret supplies the missing range for origin accounting.
+    if (isAndroidTarget && !isComposing && inputEvent.inputType === "deleteContentBackward" &&
+      editStart < 0 && target.selectionStart === value.length && target.selectionEnd === value.length) {
+      const editor = androidRemoteOrigins.editorValue;
+      const last = editor.charCodeAt(editor.length - 1);
+      const width = last >= 0xdc00 && last <= 0xdfff ? 2 : 1;
+      if (editor.length && value === editor.slice(0, -width)) {
+        editBeforeValue = editor;
+        editStart = editor.length;
+        editEnd = editor.length;
+      }
+    }
+
+    if (isAndroidTarget) {
+      const echo = androidHardwareEcho;
+      if (echo && !isComposing) {
+        const nativeBackspace = inputEvent.inputType === "deleteContentBackward";
+        const nativeEnter = inputEvent.inputType === "insertLineBreak" || inputEvent.inputType === "insertParagraph" ||
+          (inputEvent.inputType === "insertText" && /[\r\n]/.test(inputEvent.data ?? ""));
+        const duplicateBackspace = echo.Backspace > 0 && nativeBackspace && value === "";
+        const duplicateEnter = echo.Enter > 0 && nativeEnter && /^[\r\n]*$/.test(value);
+        if (duplicateBackspace || duplicateEnter) {
+          if (duplicateBackspace) echo.Backspace--;
+          else echo.Enter--;
+          if (!echo.Backspace && !echo.Enter) androidHardwareEcho = null;
+          // Do not reset the next physical key's origin while its native echo
+          // is still outstanding behind this control-key echo.
+          if (target.value !== androidTextDelta.editorValue) target.value = androidTextDelta.editorValue;
+          return;
+        }
+        if (nativeBackspace) echo.Backspace = 0;
+        if (nativeEnter) echo.Enter = 0;
+        if (!echo.Backspace && !echo.Enter) androidHardwareEcho = null;
+      }
+      if (androidCompositionTimedOut && !inputEvent.isComposing && inputEvent.inputType !== "insertCompositionText") {
+        // The IME has produced an actual edit after the lost compositionend.
+        // Resolve the DOM it supplied, including cancellation, before normal input.
+        androidCompositionTimedOut = false;
+        isComposing = false;
+        compositionText = "";
+        discardAndroidCompositionEnd = true;
+        const hadProvisionalEdit = androidTextDelta.hasProvisionalEdit;
+        const change = androidTextDelta.compositionEnd(value);
+        if (!hadProvisionalEdit || change) {
+          queueAndroidNativeBackspace(change, inputEvent.inputType, editStart, editEnd, editBeforeValue);
+        }
+        applyAndroidTextChange(change, editStart, editEnd, editBeforeValue, inputEvent.inputType === "deleteContentBackward");
+        androidRemoteOrigins.endComposition(false);
+        if (change && /[\r\n]/.test(change.text)) resetAndroidInput();
+        else {
+          if (!androidTextDelta.hasPendingCommit && target.value !== androidTextDelta.editorValue) {
+            target.value = androidTextDelta.editorValue;
+          }
+          compactAndroidInput();
+        }
+        return;
+      }
+      // Preserve the editor so InputConnection can replace its marked range.
+      // A physical key may leave a selected range pending across keyup. A
+      // later independent append must not borrow that stale selection and
+      // revoke ownership of the previously reported glyph.
+      const plainInsert = inputEvent.inputType === "insertText" ||
+        inputEvent.inputType === "insertReplacementText" || inputEvent.inputType === "";
+      if (!isComposing && plainInsert &&
+        editBeforeValue === androidRemoteOrigins.editorValue && editStart >= 0 && editEnd > editStart &&
+        (inputEvent.data
+          ? value !== editBeforeValue.slice(0, editStart) + inputEvent.data + editBeforeValue.slice(editEnd)
+          : value.startsWith(editBeforeValue) && value.length > editBeforeValue.length)) {
+        editStart = -1;
+        editEnd = -1;
+      }
+      const normalizedTail = !isComposing && inputEvent.inputType === "deleteContentBackward"
+        ? androidRemoteOrigins.normalizedTailReplacement(value) : null;
+      const selectedPendingChange = !isComposing && androidTextDelta.hasPendingCommit && plainInsert &&
+        (inputEvent.inputType !== "" || selectedInsert) && !selectedPhysicalKey &&
+        !androidDeferredKittyPresses.some((press) => !press.reported &&
+          press.beforeValue === editBeforeValue && press.selectionStart === editStart &&
+          press.selectionEnd === editEnd)
+        ? androidTextDelta.replaceSelectedPending(value, editBeforeValue, editStart, editEnd,
+            inputEvent.data || (selectedInsert && editStart >= 0 ? value.slice(editStart) : ""))
+        : null;
+      let change = selectedPendingChange ?? androidTextDelta.input(value, inputEvent.inputType, inputEvent.data ?? "");
+      if (!change && !isComposing && plainInsert &&
+        editBeforeValue === androidRemoteOrigins.editorValue && editStart >= 0 &&
+        editEnd > editStart && editEnd <= editBeforeValue.length) {
+        // An InputConnection can omit data for an unchanged selected edit.
+        // The selected range in beforeinput is sufficient evidence of a soft
+        // replacement even without a physical key; otherwise require the
+        // matching physical key to avoid inventing a no-op input.
+        const selected = editBeforeValue.slice(editStart, editEnd);
+        const inserted = inputEvent.data || (selectedPhysicalKey === selected ||
+          (selectedInsert && !inputEvent.data && value === editBeforeValue) ? selected : "");
+        if (inserted && value === editBeforeValue.slice(0, editStart) + inserted + editBeforeValue.slice(editEnd)) {
+          let erase = 0;
+          for (let i = editStart; i < editEnd; i += editBeforeValue.codePointAt(i)! > 0xffff ? 2 : 1) erase++;
+          change = { erase, text: inserted };
+        }
+      }
+      if (!isComposing && plainInsert && change?.text && !change.erase && inputEvent.data &&
+        editBeforeValue === androidRemoteOrigins.editorValue && editStart >= 0 &&
+        editEnd > editStart && editEnd <= editBeforeValue.length &&
+        value === editBeforeValue.slice(0, editStart) + inputEvent.data + editBeforeValue.slice(editEnd)) {
+        // A string diff sees a -> aa as an append, but the native editor
+        // explicitly replaced the selected a with the complete data aa.
+        let erase = 0;
+        for (let i = editStart; i < editEnd; i += editBeforeValue.codePointAt(i)! > 0xffff ? 2 : 1) erase++;
+        change = { erase, text: inputEvent.data };
+      }
+      let physicalReplacement: AndroidDeferredKittyPress[] | null = null;
+      if (!isComposing && plainInsert && change?.text) {
+        const editor = androidRemoteOrigins.editorValue;
+        // An equal prefix hides a real selected replacement in a string diff:
+        // b -> bc looks like an append until the queued physical b,c are matched.
+        const selectedInsertion = editBeforeValue === editor && editStart >= 0 &&
+          editEnd > editStart && editEnd <= editor.length &&
+          value.startsWith(editor.slice(0, editStart)) && value.endsWith(editor.slice(editEnd))
+          ? value.slice(editStart, value.length - (editor.length - editEnd)) : "";
+        const keysToMatch = selectedInsertion.length > change.text.length &&
+          (!inputEvent.data || inputEvent.data === selectedInsertion)
+          ? selectedInsertion : change.text;
+        let earlierReported = false;
+        for (let i = 0; i < androidDeferredKittyPresses.length; i++) {
+          const first = androidDeferredKittyPresses[i];
+          if (first.reported) {
+            earlierReported = true;
+            continue;
+          }
+          let keys = "";
+          for (let j = i; j < androidDeferredKittyPresses.length; j++) {
+            const deferred = androidDeferredKittyPresses[j];
+            if (deferred.reported || deferred.beforeValue !== first.beforeValue ||
+              deferred.selectionStart !== first.selectionStart || deferred.selectionEnd !== first.selectionEnd) break;
+            keys += deferred.key;
+            if (!keysToMatch.startsWith(keys)) break;
+            if (keys !== keysToMatch) continue;
+            const selected = first.beforeValue === editor &&
+              first.selectionStart >= 0 && first.selectionEnd > first.selectionStart &&
+              value === editor.slice(0, first.selectionStart) + keys + editor.slice(first.selectionEnd) &&
+              (!!change.erase || keysToMatch !== change.text);
+            const appended = !change.erase && keysToMatch === change.text && earlierReported && value === editor + keys;
+            if (selected || appended) {
+              physicalReplacement = androidDeferredKittyPresses.slice(i, j + 1);
+              if (selected) {
+                editStart = first.selectionStart;
+                editEnd = first.selectionEnd;
+                editBeforeValue = first.beforeValue;
+                if (!change.erase) {
+                  let erase = 0;
+                  for (let k = editStart; k < editEnd; k += editor.codePointAt(k)! > 0xffff ? 2 : 1) erase++;
+                  change = { erase, text: keys };
+                }
+              }
+              break;
+            }
+          }
+          if (physicalReplacement) break;
+        }
+      }
+      if (normalizedTail && change?.erase && !change.text) {
+        queueWrite(getBackspaceInputCode().repeat(normalizedTail.erase));
+        applyAndroidTextChange({ erase: 0, text: normalizedTail.text }, editStart, editEnd, editBeforeValue, true, 0, true);
+      } else {
+        queueAndroidNativeBackspace(change, inputEvent.inputType, editStart, editEnd, editBeforeValue);
+        applyAndroidTextChange(change, editStart, editEnd, editBeforeValue,
+          inputEvent.inputType === "deleteContentBackward", selectedPendingChange?.erase ?? 0,
+          !!change?.erase && !!change.text &&
+          (inputEvent.inputType === "insertReplacementText" || inputEvent.inputType === "insertFromComposition"),
+          physicalReplacement);
+        if (physicalReplacement) {
+          flushAndroidDeferredKittyReleasesBefore(androidDeferredKittyPresses, Number.POSITIVE_INFINITY);
+        }
+      }
+      if (!isComposing) {
+        if (change && /[\r\n]/.test(change.text)) resetAndroidInput();
+        else {
+          if (!androidTextDelta.hasPendingCommit && target.value !== androidTextDelta.editorValue) {
+            target.value = androidTextDelta.editorValue;
+          }
+          compactAndroidInput();
+        }
+      }
+      return;
+    }
+
+    // Other IMEs may compose ASCII immediately while CJK remains local until commit.
     if (isComposing) {
       const text = value || inputEvent.data || "";
       compositionText = trackCompositionText(text);
@@ -3459,7 +4127,9 @@
       ) {
         if (text.startsWith(immediateCompositionText)) {
           const nextText = text.slice(immediateCompositionText.length);
-          if (nextText) sendText(nextText);
+          if (nextText) {
+            sendText(nextText);
+          }
         } else if (immediateCompositionText.startsWith(text)) {
           // IME deleted composed chars (backspace reported as composition update).
           queueWrite(getBackspaceInputCode().repeat(immediateCompositionText.length - text.length));
@@ -3504,23 +4174,24 @@
 
   function isSinglePrintableKeyboardKey(value: string): boolean {
     const codePoint = value.codePointAt(0);
-    return codePoint !== undefined && codePoint >= 0x20 && String.fromCodePoint(codePoint) === value;
+    return codePoint !== undefined && codePoint >= 0x20 && codePoint !== 0x7f &&
+      !(codePoint >= 0x80 && codePoint <= 0x9f) && String.fromCodePoint(codePoint) === value;
   }
 
-  function nativeLayoutKey(event: KeyboardEvent) {
-    return resolveKittyLayoutKey(event, nativeKeyboardLayoutMap[event.code] ?? []);
+  function nativeLayoutKey(event: KeyboardEvent, code = event.code) {
+    return resolveKittyLayoutKey(event, nativeKeyboardLayoutMap[code] ?? []);
   }
 
-  function toKittyKeyboardEvent(event: KeyboardEvent): KittyKeyboardEvent {
-    const nativeLayout = event.code ? nativeLayoutKey(event) : undefined;
-    let unshiftedKey = event.code
-      ? observedUnshiftedKeys.get(event.code)
+  function toKittyKeyboardEvent(event: KeyboardEvent, physicalCode = event.code): KittyKeyboardEvent {
+    const nativeLayout = physicalCode ? nativeLayoutKey(event, physicalCode) : undefined;
+    let unshiftedKey = physicalCode
+      ? observedUnshiftedKeys.get(physicalCode)
         ?? nativeLayout?.unshifted
-        ?? browserKeyboardLayoutMap?.get(event.code)
+        ?? browserKeyboardLayoutMap?.get(physicalCode)
       : undefined;
     const shiftedKey = event.shiftKey ? nativeLayout?.shifted ?? undefined : undefined;
     if (
-      event.code &&
+      physicalCode &&
       !event.shiftKey &&
       !event.altKey &&
       !event.metaKey &&
@@ -3529,13 +4200,13 @@
       isSinglePrintableKeyboardKey(event.key)
     ) {
       unshiftedKey = event.key;
-      observedUnshiftedKeys.set(event.code, event.key);
+      observedUnshiftedKeys.set(physicalCode, event.key);
     }
-    if ((!unshiftedKey || unshiftedKey === event.key) && !shiftedKey) return event;
+    if ((!unshiftedKey || unshiftedKey === event.key) && !shiftedKey && physicalCode === event.code) return event;
 
     return {
       key: event.key,
-      code: event.code,
+      code: physicalCode,
       shiftKey: event.shiftKey,
       altKey: event.altKey,
       ctrlKey: event.ctrlKey,
@@ -3546,10 +4217,163 @@
       shiftedKey,
     };
   }
+  function androidPhysicalCode(e: KeyboardEvent): string {
+    if (e.code) return e.code;
+    if (e.key === "Shift" || e.key === "Control" || e.key === "Alt" || e.key === "Meta") {
+      if (e.location === KeyboardEvent.DOM_KEY_LOCATION_LEFT) return e.key + "Left";
+      if (e.location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT) return e.key + "Right";
+    }
+    if (e.location === KeyboardEvent.DOM_KEY_LOCATION_NUMPAD) {
+      if (e.key.length === 1 && e.key >= "0" && e.key <= "9") return "Numpad" + e.key;
+      switch (e.key) {
+        case "Enter": return "NumpadEnter";
+        case ".": case "Delete": return "NumpadDecimal";
+        case ",": return "NumpadComma";
+        case "/": return "NumpadDivide";
+        case "*": return "NumpadMultiply";
+        case "-": return "NumpadSubtract";
+        case "+": return "NumpadAdd";
+        case "=": return "NumpadEqual";
+        case "Insert": return "Numpad0";
+        case "End": return "Numpad1";
+        case "ArrowDown": return "Numpad2";
+        case "PageDown": return "Numpad3";
+        case "ArrowLeft": return "Numpad4";
+        case "Clear": return "Numpad5";
+        case "ArrowRight": return "Numpad6";
+        case "Home": return "Numpad7";
+        case "ArrowUp": return "Numpad8";
+        case "PageUp": return "Numpad9";
+      }
+    }
+    return e.key;
+  }
+
+  function closeDesktopKittyPresses(immediate = false) {
+    if (!desktopKittyHeldPresses.size) return;
+    let releases = "";
+    for (const held of desktopKittyHeldPresses.values()) {
+      releases += encodeTerminalKeyboardEvent(held.event, navigator.platform, held.flags, "release") ?? "";
+    }
+    desktopKittyHeldPresses.clear();
+    if (!sessionId || !releases) return;
+    if (immediate) {
+      const payload = pendingWrite + releases;
+      pendingWrite = "";
+      sendSessionData(encoder.encode(payload));
+    } else queueWrite(releases);
+  }
 
   // Handle keydown for special keys
   function handleKeyDown(e: KeyboardEvent) {
     if (!sessionId) return;
+    // A native edit may arrive after another printable keydown, not just keyup.
+    // Native control-key echoes may follow later printable or control keydowns.
+    const kittyFlags = parser?.getKittyKeyboardFlags() ?? 0;
+    const code = isAndroidTarget && !e.code && e.repeat
+      ? findAndroidHeldCode(e.key, e.location, androidPhysicalCode(e)) ??
+        findAndroidHeldCode(e.key, e.location, "", true) ?? androidPhysicalCode(e)
+      : isAndroidTarget ? androidPhysicalCode(e) : e.code || e.key;
+    if (isAndroidTarget) suppressedAndroidCompositionKeyups.delete(code);
+    // Blur closes the previous Kitty hold, but Android can continue sending
+    // native repeat keydowns after focus returns without a new first keydown.
+    const reopenedAndroidRepeat = isAndroidTarget && e.repeat &&
+      (kittyFlags & KITTY_KEYBOARD_FLAGS.REPORT_EVENTS) !== 0 &&
+      !androidKittyImmediatePresses.has(code) &&
+      !androidDeferredKittyPresses.some((press) => press.code === code && !press.released);
+    const reopenedDesktopRepeat = isDesktopTarget && e.repeat &&
+      (kittyFlags & KITTY_KEYBOARD_FLAGS.REPORT_EVENTS) !== 0 &&
+      !desktopKittyHeldPresses.has(code);
+    const composingControlKey = e.key === "Backspace" || e.key === "Escape" || e.key === "Enter" || e.key === " ";
+    // Only cancel marked text when this modified key actually has an SSH
+    // encoding. Legacy Alt and Ctrl+Shift printable chords remain IME-owned.
+    const legacyControlLetter = e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey &&
+      e.key.length === 1 && e.key.toLowerCase() >= "a" && e.key.toLowerCase() <= "z";
+    const composingShortcut = isAndroidTarget && isComposing &&
+      (e.ctrlKey || e.altKey || e.metaKey) && !(e.ctrlKey && e.altKey) &&
+      isSinglePrintableKeyboardKey(e.key) &&
+      (legacyControlLetter || !!encodeTerminalKeyboardEvent(toKittyKeyboardEvent(e), navigator.platform, kittyFlags));
+    if (composingShortcut) {
+      const full = hiddenInput?.value ?? "";
+      const marked = androidTextDelta.markedCompositionText;
+      resetAndroidInput();
+      canceledAndroidCompositionCommit = full ? { marked, full, reportedKeys: "" } : null;
+    }
+    // After an unrepresentable IME middle edit, this is a new physical
+    // control, not an edit of the discarded candidate. Process it now.
+    if (isAndroidTarget && androidRejectingMiddleComposition && !e.isComposing &&
+      (composingControlKey || e.key === "Tab" || e.key.startsWith("Arrow") || e.ctrlKey)) {
+      finishRejectedAndroidComposition();
+    }
+    if (isAndroidTarget && isComposing && androidCompositionTimedOut && !e.isComposing &&
+      composingControlKey && hiddenInput?.value === androidTextDelta.editorValue) {
+      // The previous marked text is already gone; this is a new physical key.
+      isComposing = false;
+      androidCompositionTimedOut = false;
+      compositionText = "";
+      discardAndroidCompositionEnd = true;
+      applyAndroidTextChange(androidTextDelta.compositionEnd(hiddenInput.value));
+      androidRemoteOrigins.endComposition(false);
+    }
+    const nativePrintableKey = isAndroidTarget && !isComposing && !e.isComposing &&
+      isSinglePrintableKeyboardKey(e.key) && !e.ctrlKey && !e.altKey && !e.metaKey;
+    const reportedSuffix = nativePrintableKey && hiddenInput
+      ? androidRemoteOrigins.hasReportedTextAfter(hiddenInput.selectionEnd) : false;
+    if (nativePrintableKey && hiddenInput && hiddenInput.selectionEnd > hiddenInput.selectionStart && !reportedSuffix) {
+      // InputConnection may omit beforeinput, or report a collapsed selection
+      // for a genuine selected edit. Keep the last confirmed native range.
+      androidEditBeforeValue = hiddenInput.value;
+      androidEditBeforeStart = hiddenInput.selectionStart;
+      androidEditBeforeEnd = hiddenInput.selectionEnd;
+      androidEditSelectedKey = e.key;
+      androidEditSelectedInsert = false;
+    }
+    const kittyReportedImeKeydown = kittyReportedImeKey(e, kittyFlags);
+    if (nativePrintableKey && kittyReportedImeKeydown && hiddenInput &&
+      (hiddenInput.selectionEnd > hiddenInput.selectionStart || reportedSuffix)) {
+      // A middle edit cannot be represented by an append-only PTY. A selected
+      // tail is representable, but send the physical press only after the
+      // native edit confirms replacement and the remote tail is erased.
+      if (reportedSuffix) {
+        e.preventDefault();
+        suppressedAndroidCompositionKeyups.set(code, e.key);
+      } else {
+        const kittyEvent = toKittyKeyboardEvent(e, code);
+        const press = encodeTerminalKeyboardEvent(kittyEvent, navigator.platform, kittyFlags,
+          reopenedAndroidRepeat ? "press" : undefined);
+        if (press) {
+          if (androidDeferredKittyPresses.length >= 512) discardAndroidDeferredKittyPress();
+          androidDeferredKittyPresses.push({
+            code, key: e.key, press,
+            release: null,
+            beforeValue: hiddenInput.value, selectionStart: hiddenInput.selectionStart,
+            selectionEnd: hiddenInput.selectionEnd, released: false, reported: false, releaseSent: false,
+            pressOrder: ++androidDeferredKittyEventOrder, releaseOrder: 0, keydownEvent: kittyEvent,
+            repeatEvent: e.repeat && !reopenedAndroidRepeat ? kittyEvent : null,
+            reportedImmediatePress: e.repeat && androidKittyImmediatePresses.has(code), kittyFlags
+          });
+        }
+      }
+      return;
+    }
+    // A later IME candidate can be inserted before a physical key even when
+    // the marked editor was empty on keydown. Only its committed text has a
+    // stable order; let the IME own composing printable keys.
+    if (isAndroidTarget && isComposing && kittyReportedImeKeydown) {
+      androidTextDelta.noteDeferredPhysicalKey(e.key);
+      suppressedAndroidCompositionKeyups.set(code, e.key);
+      return;
+    }
+    // Keep unresolved printable origins across Kitty mode changes and
+    // intermediate IME candidates; editing boundaries reset them below.
+    // Space can choose a candidate or become native text. While composing,
+    // let the IME own it rather than send a Kitty press before its native edit.
+    if (isAndroidTarget && (((isComposing || e.isComposing) && composingControlKey) ||
+      (e.isComposing && !kittyReportedImeKeydown && !composingShortcut))) {
+      // Other reported physical keys still need native editor provenance.
+      suppressedAndroidCompositionKeyups.set(code, e.key);
+      return;
+    }
 
     if (isDesktopTarget && e.isComposing) {
       // The IME owns this keystroke. Backspace and Escape edit or cancel
@@ -3596,27 +4420,85 @@
       e.key === "ArrowDown" ||
       e.key === "ArrowLeft" ||
       e.key === "ArrowRight" ||
+      e.key === "Home" || e.key === "End" ||
+      e.key === "PageUp" || e.key === "PageDown" ||
+      e.key === "Insert" || e.key === "Delete" ||
       (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey)
     ) {
       hangulComposer.breakWord();
       pendingCommitKey = null;
       suppressPlainSpace = false;
     }
+    if (isAndroidTarget && !isComposing && !e.isComposing &&
+      e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey
+    ) androidTextDelta.noteIndependentKey(e.key);
 
-    const terminalKey = encodeTerminalKeyboardEvent(
-      toKittyKeyboardEvent(e),
-      navigator.platform,
-      parser?.getKittyKeyboardFlags() ?? 0,
-    );
+    const kittyEvent = toKittyKeyboardEvent(e, code);
+    const terminalKey = isAndroidTarget && e.key === "Backspace" && (kittyFlags & KITTY_KEYBOARD_FLAGS.REPORT_ALL_KEYS)
+      ? encodeKittyKeyboardEvent(kittyEvent, kittyFlags, e.repeat && !reopenedAndroidRepeat ? "repeat" : "press")
+      : encodeTerminalKeyboardEvent(kittyEvent, navigator.platform, kittyFlags,
+          reopenedAndroidRepeat || reopenedDesktopRepeat ? "press" : undefined, parser?.isApplicationCursorKeys() ?? false);
     if (terminalKey) {
-      e.preventDefault();
+      const pendingEcho = androidHardwareEcho;
+      // A modifier has no native editor edit of its own. A pending selected
+      // printable key can still receive its InputConnection edit after Shift.
+      const modifierOnly = e.key === "Shift" || e.key === "Control" || e.key === "Alt" ||
+        e.key === "Meta" || e.key === "AltGraph" || e.key === "CapsLock" ||
+        e.key === "NumLock" || e.key === "ScrollLock";
+      if (isAndroidTarget && !isComposing && !kittyReportedImeKeydown && !modifierOnly) resetAndroidInput();
+      // Keep the Android editor's native echo for printable Kitty keys: it
+      // establishes which reported physical press the IME actually observed.
+      if (!isAndroidTarget || !kittyReportedImeKeydown) e.preventDefault();
       queueWrite(terminalKey);
+      if (isDesktopTarget && (kittyFlags & KITTY_KEYBOARD_FLAGS.REPORT_EVENTS) &&
+        !desktopKittyHeldPresses.has(code)) {
+        desktopKittyHeldPresses.set(code, { event: kittyEvent, flags: kittyFlags });
+      }
+      if (isAndroidTarget && (kittyFlags & (KITTY_KEYBOARD_FLAGS.REPORT_ALL_KEYS | KITTY_KEYBOARD_FLAGS.REPORT_EVENTS))) {
+        // Event-reporting keys need their matching release if focus steals
+        // keyup; all-keys modes also retain the native edit identity.
+        // Unreported native edits still need the physical identity until keyup.
+        const held = androidKittyImmediatePresses.get(code);
+        // A repeat under another Kitty mode must not replace the original
+        // event-reporting press whose release still belongs to this hold.
+        if (!e.repeat || !held || !(held.flags & KITTY_KEYBOARD_FLAGS.REPORT_EVENTS)) {
+          androidKittyImmediatePresses.set(code, { event: kittyEvent, flags: kittyFlags });
+        }
+      }
+      if (isAndroidTarget && kittyReportedImeKeydown) {
+        androidRemoteOrigins.noteKey(e.key, e.repeat && !reopenedAndroidRepeat, code);
+        if (canceledAndroidCompositionCommit && !isComposing) {
+          // The terminal editor compacts at 512 UTF-16 units; do not retain
+          // an unbounded physical tail for an old canceled composition.
+          if (canceledAndroidCompositionCommit.reportedKeys.length + e.key.length > 512) {
+            canceledAndroidCompositionCommit = null;
+          } else {
+            canceledAndroidCompositionCommit.reportedKeys += e.key;
+          }
+        }
+      }
+      if (isAndroidTarget && !isComposing && (e.key === "Backspace" || e.key === "Enter")) {
+        const echo = pendingEcho ?? { Backspace: 0, Enter: 0 };
+        echo[e.key]++;
+        androidHardwareEcho = echo;
+      }
       return;
     }
+    if (isAndroidTarget && !isComposing && (
+      e.key === "Tab" || e.key === "Escape" ||
+      e.key.startsWith("Arrow") || (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey)
+    )) resetAndroidInput();
     // Enter key
     if (e.key === "Enter") {
+      const pendingEcho = androidHardwareEcho;
+      if (isAndroidTarget && !isComposing) resetAndroidInput();
       e.preventDefault();
       queueWrite("\r");
+      if (isAndroidTarget && !isComposing) {
+        const echo = pendingEcho ?? { Backspace: 0, Enter: 0 };
+        echo.Enter++;
+        androidHardwareEcho = echo;
+      }
       return;
     }
     // Tab
@@ -3669,17 +4551,176 @@
       }
     }
   }
+  function matchesAndroidKeyup(code: string, heldKey: string, releasedKey: string): boolean {
+    if (heldKey === releasedKey) return true;
+    if (heldKey.length !== 1 || releasedKey.length !== 1) return false;
+    if (heldKey.toLowerCase() === releasedKey.toLowerCase() ||
+      observedUnshiftedKeys.get(code) === releasedKey ||
+      browserKeyboardLayoutMap?.get(code) === releasedKey) return true;
+    for (const entry of nativeKeyboardLayoutMap[code] ?? []) {
+      if (entry.unshifted === releasedKey || entry.shifted === releasedKey ||
+        entry.alt_gr === releasedKey || entry.shifted_alt_gr === releasedKey ||
+        entry.other.includes(releasedKey)) return true;
+    }
+    return code === "Digit" + releasedKey || code === "Key" + releasedKey.toUpperCase();
+  }
+  function matchesAndroidKeyLocation(code: string, location: number): boolean {
+    if (location === KeyboardEvent.DOM_KEY_LOCATION_LEFT) return code.endsWith("Left");
+    if (location === KeyboardEvent.DOM_KEY_LOCATION_RIGHT) return code.endsWith("Right");
+    if (location === KeyboardEvent.DOM_KEY_LOCATION_NUMPAD) return code.startsWith("Numpad");
+    return !code.startsWith("Numpad") && !code.endsWith("Left") && !code.endsWith("Right");
+  }
+  function findAndroidHeldCode(key: string, location: number, physicalCode = "", locationOnly = false): string | null {
+    let candidate: string | null = null;
+    let ambiguous = false;
+    for (const [code, held] of androidKittyImmediatePresses) {
+      const atLocation = matchesAndroidKeyLocation(code, location) ||
+        (locationOnly && location === KeyboardEvent.DOM_KEY_LOCATION_STANDARD &&
+          held.event.key === key && (code.endsWith("Left") || code.endsWith("Right")));
+      if (!atLocation) continue;
+      if (!locationOnly) {
+        if (code === physicalCode || matchesAndroidKeyup(code, held.event.key, key)) return code;
+      } else if ((key.length === 1 && held.event.key.length === 1) || held.event.key === key) {
+        if (candidate !== null && candidate !== code) ambiguous = true;
+        else candidate = code;
+      }
+    }
+    for (let i = androidDeferredKittyPresses.length - 1; i >= 0; i--) {
+      const deferred = androidDeferredKittyPresses[i];
+      if (deferred.released || !matchesAndroidKeyLocation(deferred.code, location)) continue;
+      if (!locationOnly) {
+        if (deferred.code === physicalCode || matchesAndroidKeyup(deferred.code, deferred.key, key)) return deferred.code;
+      } else if ((key.length === 1 && deferred.key.length === 1) || deferred.key === key) {
+        if (candidate !== null && candidate !== deferred.code) ambiguous = true;
+        else candidate = deferred.code;
+      }
+    }
+    return ambiguous ? null : candidate;
+  }
+  function findAndroidSuppressedCode(key: string, location: number, physicalCode = "", locationOnly = false): string | null {
+    let candidate: string | null = null;
+    let ambiguous = false;
+    for (const [code, heldKey] of suppressedAndroidCompositionKeyups) {
+      if (!matchesAndroidKeyLocation(code, location)) continue;
+      if (!locationOnly) {
+        if (code === physicalCode || matchesAndroidKeyup(code, heldKey, key)) return code;
+      } else if ((key.length === 1 && heldKey.length === 1) || heldKey === key) {
+        if (candidate !== null && candidate !== code) ambiguous = true;
+        else candidate = code;
+      }
+    }
+    return ambiguous ? null : candidate;
+  }
   function handleKeyUp(e: KeyboardEvent) {
-    if (!sessionId || e.isComposing) return;
-    const terminalKey = encodeTerminalKeyboardEvent(
-      toKittyKeyboardEvent(e),
-      navigator.platform,
-      parser?.getKittyKeyboardFlags() ?? 0,
-      "release",
-    );
-    if (!terminalKey) return;
+    // When Android omits keyup.code, the still-held press (including a
+    // no-event Kitty press) identifies the physical key. Location separates
+    // the keypad from the top row even when both produce the same glyph.
+    const physicalCode = isAndroidTarget && !e.code ? androidPhysicalCode(e) : "";
+    const code = e.code || (isAndroidTarget
+      ? findAndroidHeldCode(e.key, e.location, physicalCode) ??
+        findAndroidSuppressedCode(e.key, e.location, physicalCode) ??
+        findAndroidHeldCode(e.key, e.location, "", true) ??
+        findAndroidSuppressedCode(e.key, e.location, "", true) ?? e.key
+      : e.key);
+    // A press with no native edit by keyup must not own a later soft edit.
+    if (isAndroidTarget && (e.key === "Backspace" || e.key === "Enter") && androidHardwareEcho) {
+      // preventDefault usually prevents a native echo. Once this press ends,
+      // an identical soft control must be treated as a new user action.
+      androidHardwareEcho[e.key] = 0;
+      if (!androidHardwareEcho.Backspace && !androidHardwareEcho.Enter) androidHardwareEcho = null;
+    }
+    if (isAndroidTarget && suppressedAndroidCompositionKeyups.delete(code) &&
+      !androidKittyImmediatePresses.has(code)) return;
+    if (isDesktopTarget) {
+      const held = desktopKittyHeldPresses.get(code);
+      if (!held) return;
+      desktopKittyHeldPresses.delete(code);
+      const current = toKittyKeyboardEvent(e, code);
+      const release = encodeTerminalKeyboardEvent({
+        key: held.event.key,
+        code: held.event.code ?? code,
+        unshiftedKey: held.event.unshiftedKey ?? current.unshiftedKey,
+        shiftedKey: held.event.shiftedKey ?? current.shiftedKey,
+        shiftKey: e.shiftKey,
+        altKey: e.altKey,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        getModifierState: (modifier) => e.getModifierState(modifier),
+      }, navigator.platform, held.flags, "release");
+      if (sessionId && release) {
+        e.preventDefault();
+        queueWrite(release);
+      }
+      return;
+    }
+    const heldKittyPress = isAndroidTarget ? androidKittyImmediatePresses.get(code) : undefined;
+    if (heldKittyPress) androidKittyImmediatePresses.delete(code);
+    if (isAndroidTarget) {
+      for (let i = androidDeferredKittyPresses.length - 1; i >= 0; i--) {
+        const latest = androidDeferredKittyPresses[i];
+        if (latest.code !== code || latest.released) continue;
+        // Auto-repeat produces several keydowns but only one physical keyup.
+        // Release the last press the native editor actually confirmed; keep
+        // unmatched presses available if their native edit arrives afterward.
+        const keyupEvent = toKittyKeyboardEvent(e, code);
+        const matchedReleaseEvent = latest.keydownEvent.key !== e.key
+          ? { ...keyupEvent, key: latest.keydownEvent.key,
+              unshiftedKey: latest.keydownEvent.unshiftedKey ??
+                (latest.keydownEvent.shiftKey ? baseLayoutCharacter(latest.keydownEvent.code) ?? undefined : undefined),
+              shiftedKey: latest.keydownEvent.shiftedKey }
+          : keyupEvent;
+        latest.release = encodeTerminalKeyboardEvent(
+          matchedReleaseEvent, navigator.platform, latest.kittyFlags, "release"
+        ) ?? encodeTerminalKeyboardEvent(
+          latest.keydownEvent, navigator.platform, latest.kittyFlags, "release"
+        );
+        const releaseOrder = ++androidDeferredKittyEventOrder;
+        let reported: AndroidDeferredKittyPress | null = null;
+        for (let j = i; j >= 0; j--) {
+          const deferred = androidDeferredKittyPresses[j];
+          if (deferred.code !== code) continue;
+          if (deferred.released) break;
+          deferred.released = true;
+          deferred.releaseOrder = releaseOrder;
+          deferred.release = latest.release;
+          if (deferred.reported && !reported) reported = deferred;
+        }
+        if (reported) {
+          reported.release = latest.release;
+          flushAndroidDeferredKittyRelease(reported);
+        }
+        if (!reported && heldKittyPress) {
+          // The already-sent immediate press still owns this repeat. Defer
+          // its release until the native replacement confirms the repeat; a
+          // focus/edit boundary closes it if that native edit never arrives.
+          return;
+        }
+        return;
+      }
+    }
+    if (isAndroidTarget) androidRemoteOrigins.clearUnobservedKeys(e.key, code);
+    if (!sessionId) return;
+    const kittyFlags = heldKittyPress?.flags ?? parser?.getKittyKeyboardFlags() ?? 0;
+    if (e.isComposing && !heldKittyPress && !(isAndroidTarget && (kittyReportedImeKey(e, kittyFlags) ||
+      ((e.ctrlKey || e.altKey || e.metaKey) && !(e.ctrlKey && e.altKey) && isSinglePrintableKeyboardKey(e.key))))) return;
+    const kittyEvent = toKittyKeyboardEvent(e, code);
+    const releaseEvent = heldKittyPress && heldKittyPress.event.key !== e.key
+      ? { ...kittyEvent, key: heldKittyPress.event.key,
+          unshiftedKey: heldKittyPress.event.unshiftedKey ??
+            (heldKittyPress.event.shiftKey ? baseLayoutCharacter(heldKittyPress.event.code) ?? undefined : undefined),
+          shiftedKey: heldKittyPress.event.shiftedKey }
+      : kittyEvent;
+    const terminalKey = isAndroidTarget && e.key === "Backspace" && (kittyFlags & KITTY_KEYBOARD_FLAGS.REPORT_ALL_KEYS)
+      ? encodeKittyKeyboardEvent(releaseEvent, kittyFlags, "release")
+      : encodeTerminalKeyboardEvent(releaseEvent, navigator.platform, kittyFlags, "release");
+    const fallbackRelease = !terminalKey && heldKittyPress
+      ? heldKittyPress.event.key === "Backspace" && (kittyFlags & KITTY_KEYBOARD_FLAGS.REPORT_ALL_KEYS)
+        ? encodeKittyKeyboardEvent(heldKittyPress.event, kittyFlags, "release")
+        : encodeTerminalKeyboardEvent(heldKittyPress.event, navigator.platform, kittyFlags, "release")
+      : null;
+    if (!terminalKey && !fallbackRelease) return;
     e.preventDefault();
-    queueWrite(terminalKey);
+    queueWrite(terminalKey ?? fallbackRelease!);
   }
   function handleWriteError(e: unknown) {
     console.error('[SSH] write failed:', e);
@@ -3778,7 +4819,7 @@
     writeInputText(result.send);
   }
 
-  function sendText(text: string) {
+  function sendText(text: string, nativeUnreported = false, literalCorrection = false) {
     if (!sessionId) return;
 
     if (isDesktopTarget) {
@@ -3791,10 +4832,33 @@
 
     // Mobile IMEs deliver composed text; only NFC + one-shot Jamo
     // composition is needed.
-    writeInputText(composeJamoSequence(text.normalize("NFC")));
+    const normalized = composeJamoSequence(text.normalize("NFC"));
+    // A normalization repair is not a new keypress: preserve the on-screen
+    // Ctrl/Alt latch for the next deliberate key while honoring Kitty text.
+    if (literalCorrection) {
+      const flags = parser?.getKittyKeyboardFlags() ?? 0;
+      const encoded = kittyPhysicalOnly(flags) ? normalized : encodeKittyInputText(normalized, flags);
+      if (encoded) queueWrite(encoded);
+      return;
+    }
+    // The native editor's text was filtered against physical keys already
+    // reported; in physical-only mode the remaining text has no key event.
+    if (nativeUnreported && kittyPhysicalOnly(parser?.getKittyKeyboardFlags() ?? 0) &&
+      !modifiersStore.ctrlActive && !modifiersStore.altActive) {
+      queueWrite(normalized);
+    } else {
+      writeInputText(normalized);
+    }
   }
 
   onDestroy(() => {
+    closeDesktopKittyPresses(true);
+    // Unmount can blur the textarea first, leaving its Kitty releases queued.
+    if (isDesktopTarget && pendingWrite && sessionId) {
+      const payload = pendingWrite;
+      pendingWrite = "";
+      sendSessionData(encoder.encode(payload));
+    }
     if (pasteErrorTimeout !== null) clearTimeout(pasteErrorTimeout);
     connectionGeneration++;
     if (hostKeyPromptResolver) resolveHostKeyPrompt("cancel");
@@ -3846,7 +4910,10 @@
     // re-attach with existingSessionId.
     if (activeSessionId && !isBackgroundTeardown && shouldDisconnect) {
       disconnectRequested = true;
-      void disconnectSessionRemote(activeSessionId).catch((e) => {
+      const pendingWrites = isDesktopTarget ? drainDesktopWrites(activeSessionId) : null;
+      void (pendingWrites
+        ? pendingWrites.then(() => disconnectSessionRemote(activeSessionId))
+        : disconnectSessionRemote(activeSessionId)).catch((e) => {
         console.error("Disconnect on destroy error:", e);
       });
     }
@@ -3897,6 +4964,7 @@
     writeFlushScheduled = false;
     clearAutomaticResponses();
     if (hiddenInput) {
+      if (isAndroidTarget) hiddenInput.removeEventListener('beforeinput', handleAndroidBeforeInput);
       hiddenInput.removeEventListener('input', handleInput);
       hiddenInput.removeEventListener('keydown', handleKeyDown);
       hiddenInput.removeEventListener('keyup', handleKeyUp);
@@ -3922,19 +4990,6 @@
       unlistenExit = null;
     }
 
-    if (
-      activeSessionId &&
-      !disconnectRequested &&
-      !isBackgroundTeardown &&
-      shouldDisconnect
-    ) {
-      terminalModesStore.clearSession(activeSessionId);
-      clearSessionSnapshot(activeSessionId);
-      void disconnectSessionRemote(activeSessionId).catch((e) => {
-        console.error("Unmount disconnect error:", e);
-      });
-      onDisconnected?.();
-    }
   });
 
   // Export functions for external use (ExtraKeysBar)
@@ -3949,12 +5004,21 @@
   }
 
   export async function disconnect(fallbackSessionId?: string) {
+    const activeSessionId = sessionId ?? fallbackSessionId ?? null;
+    if (isDesktopTarget && sessionId) {
+      closeDesktopKittyPresses(true);
+      if (pendingWrite) {
+        const payload = pendingWrite;
+        pendingWrite = "";
+        sendSessionData(encoder.encode(payload));
+      }
+    }
+    const pendingWrites = isDesktopTarget && activeSessionId ? drainDesktopWrites(activeSessionId) : null;
     connectionGeneration++;
     if (hostKeyPromptResolver) resolveHostKeyPrompt("cancel");
     if (keyPassphrasePromptResolver) resolveKeyPassphrasePrompt(null);
     disconnectRequested = true;
 
-    const activeSessionId = sessionId ?? fallbackSessionId ?? null;
     sessionId = null;
     connected = false;
     pendingWrite = "";
@@ -3974,6 +5038,7 @@
       terminalModesStore.clearSession(activeSessionId);
       clearSessionSnapshot(activeSessionId);
       try {
+        if (pendingWrites) await pendingWrites;
         await disconnectSessionRemote(activeSessionId);
       } catch (e) {
         console.error("Disconnect error:", e);

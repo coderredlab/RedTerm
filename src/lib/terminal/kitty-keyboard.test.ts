@@ -98,6 +98,29 @@ describe("Kitty keyboard event encoding", () => {
       .toBeNull();
   });
 
+  test("sends legacy navigation keys once even when the keypad has no DOM code", () => {
+    const navigation = [
+      ["Home", "\x1b[H"], ["End", "\x1b[F"],
+      ["PageUp", "\x1b[5~"], ["PageDown", "\x1b[6~"],
+      ["Insert", "\x1b[2~"], ["Delete", "\x1b[3~"],
+    ] as const;
+    for (const [key, expected] of navigation) {
+      expect(encodeTerminalKeyboardEvent(plainKey(key), "Linux", 0)).toBe(expected);
+      expect(encodeTerminalKeyboardEvent(plainKey(key), "Linux", 0, "release")).toBeNull();
+    }
+    expect(encodeTerminalKeyboardEvent({ ...plainKey("End"), ctrlKey: true }, "Linux", 0))
+      .toBe("\x1b[1;5F");
+  });
+
+  test("Home and End follow xterm application cursor mode in a desktop TUI", () => {
+    for (const [key, final] of [["Home", "H"], ["End", "F"]] as const) {
+      expect(encodeTerminalKeyboardEvent(plainKey(key), "MacIntel", 0, undefined, true))
+        .toBe("\x1bO" + final);
+      expect(encodeTerminalKeyboardEvent(plainKey(key), "MacIntel", 0, undefined, false))
+        .toBe("\x1b[" + final);
+    }
+  });
+
   test("keeps modified legacy F2 and negotiated Kitty F2 distinct", () => {
     const key = { ...plainKey("F2", "F2"), shiftKey: true, ctrlKey: true };
     expect(encodeTerminalKeyboardEvent(key, "MacIntel", 0)).toBe("\x1b[1;6Q");

@@ -208,7 +208,7 @@ function isSinglePrintableCodePoint(value: string): boolean {
   );
 }
 
-function baseLayoutCharacter(code: string | undefined): string | null {
+export function baseLayoutCharacter(code: string | undefined): string | null {
   if (!code) return null;
   if (code.startsWith("Key") && code.length === 4) return code[3].toLowerCase();
   if (code.startsWith("Digit") && code.length === 6) return code[5];
@@ -423,19 +423,32 @@ function encodeLegacyControl(event: KittyKeyboardEvent): string {
   return "";
 }
 
-function encodeLegacyFunctionKey(
+function encodeLegacyNonTextKey(
   event: KittyKeyboardEvent,
   eventType: KittyKeyboardEventType,
+  applicationCursorMode: boolean,
 ): string | null {
-  const match = /^F([1-9]|1[0-2])$/.exec(event.key);
-  if (!match || eventType === "release") return null;
+  if (eventType === "release") return null;
+  const navigation = event.key === "Home" || event.key === "End" ||
+    event.key === "PageUp" || event.key === "PageDown" ||
+    event.key === "Insert" || event.key === "Delete";
+  const match = navigation ? null : /^F([1-9]|1[0-2])$/.exec(event.key);
+  if (!navigation && !match) return null;
 
-  const number = Number(match[1]);
+  const number = match ? Number(match[1]) : 0;
   const modifiers = 1 +
     (event.shiftKey ? 1 : 0) +
     (event.altKey ? 2 : 0) +
     (event.ctrlKey ? 4 : 0) +
     (event.metaKey ? 8 : 0);
+  if (navigation) {
+    const key = CSI_KEYS[event.key];
+    if (applicationCursorMode && modifiers === 1 && (event.key === "Home" || event.key === "End")) {
+      return "\x1bO" + key.final;
+    }
+    if (modifiers === 1) return `${CSI}${key.omitPlainParameter ? "" : key.parameter}${key.final}`;
+    return `${CSI}${key.parameter};${modifiers}${key.final}`;
+  }
 
   if (number <= 4) {
     const final = "PQRS"[number - 1];
@@ -505,6 +518,7 @@ export function encodeTerminalKeyboardEvent(
   platform: string,
   rawFlags: number,
   explicitEventType?: KittyKeyboardEventType,
+  applicationCursorMode = false,
 ): string | null {
   const eventType = explicitEventType ?? (event.repeat ? "repeat" : "press");
   if (event.key === "Backspace") {
@@ -520,7 +534,7 @@ export function encodeTerminalKeyboardEvent(
     );
   }
   if ((rawFlags & KITTY_KEYBOARD_SUPPORTED_FLAGS) === 0) {
-    return encodeLegacyFunctionKey(event, eventType);
+    return encodeLegacyNonTextKey(event, eventType, applicationCursorMode);
   }
   return encodeKittyKeyboardEvent(event, rawFlags, eventType);
 }
