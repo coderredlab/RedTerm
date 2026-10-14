@@ -1209,5 +1209,37 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(".redterm-upload-")
         }));
+
+        let protected = root.join("acl-protected");
+        fs::create_dir(&protected).unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(Command::new("/bin/chmod")
+            .args(["+a", "everyone deny delete"])
+            .arg(&protected)
+            .status()
+            .unwrap()
+            .success());
+        let upload = connection
+            .upload_paths_via_sftp(
+                protected.to_str().unwrap(),
+                vec![root.join(&filename)],
+                UploadSelectionKind::Files,
+                &|_| {},
+            )
+            .await
+            .unwrap();
+        assert!(upload.failed.is_empty(), "{:?}", upload.failed);
+        assert_eq!(upload.uploaded.len(), 1);
+        assert_eq!(
+            fs::read(&upload.uploaded[0].remote_path).unwrap(),
+            b"private upload bytes"
+        );
+        assert!(Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(&protected)
+            .status()
+            .unwrap()
+            .success());
+        fs::remove_dir_all(protected).unwrap();
     }
 }
