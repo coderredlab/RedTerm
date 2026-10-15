@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-terminal-resolve-paths"
+description = "Enables the terminal_resolve_paths command without any pre-configured scope."
+commands.allow = ["terminal_resolve_paths"]
+
+[[permission]]
+identifier = "deny-terminal-resolve-paths"
+description = "Denies the terminal_resolve_paths command without any pre-configured scope."
+commands.deny = ["terminal_resolve_paths"]

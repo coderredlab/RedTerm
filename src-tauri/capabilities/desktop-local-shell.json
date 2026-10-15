@@ -15,6 +15,7 @@
     "allow-local-shell-resize",
     "allow-local-shell-disconnect",
     "allow-local-shell-get-output",
+    "allow-terminal-resolve-paths",
     "allow-local-home-dir",
     "allow-local-list-dir",
     "allow-local-read-file",

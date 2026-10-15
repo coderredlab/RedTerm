@@ -49,7 +49,7 @@ test("uses OSC 8 file and absolute targets even when labels span rows", () => {
   const raw = new AnsiParser(30, 2);
   raw.write("\x1b]8;;/tmp/report.txt:12\x1b\\open\x1b]8;;\x1b\\");
   expect(findPathAtCell(raw.getBuffer(), { row: 0, col: 1 })?.path).toBe("/tmp/report.txt:12");
-  for (const uri of ["https://example.com/a/b", "data:text/plain,abc", "src/file.ts"]) {
+  for (const uri of ["https://example.com/a/b", "data:text/plain,abc"]) {
     const parser = new AnsiParser(60, 2);
     parser.write(`\x1b]8;;${uri}\x1b\\source\x1b]8;;\x1b\\`);
     expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 2 })).toBeNull();
@@ -404,12 +404,14 @@ test("a relative path retains the OSC 7 directory from its printed cells", () =>
     parser.getCurrentDirectoryUri())?.path).toBe("/tmp/b/src/file.ts");
 });
 
-test("a relative path assembled from two printed directories is not actionable", () => {
+test("a relative path from conflicting printed directories requires workspace lookup", () => {
   const parser = new AnsiParser(40, 2);
   parser.write("\x1b]7;file:///tmp/a\x07src/");
   parser.write("\x1b]7;file:///tmp/b\x07file.ts");
   expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 3 },
-    parser.getCurrentDirectoryUri())).toBeNull();
+    parser.getCurrentDirectoryUri())).toMatchObject({
+      path: "src/file.ts", alternativePath: null, choiceReason: "relative-path",
+    });
 });
 
 test("clearing a former continuation cannot open its old prefix", () => {
@@ -568,4 +570,166 @@ test("does not normalize parent components across filesystem symlinks in file UR
   ]) expect(resolveTerminalPath(uri)).toBeNull();
   // Plain paths retain the component so the explorer can report it as unsupported.
   expect(resolveTerminalPath("/home/me/alias/../target.txt")).toBe("/home/me/alias/../target.txt");
+});
+
+test("joins composed-pane paths despite sidebars and both compositor margins", () => {
+  const path = "/home/me/exports/shorts/tech/202610/artex-agent-explained.mp4";
+  for (const padding of [1, 2]) {
+    const parser = new AnsiParser(70, 6);
+    parser.write("\x1b[?7l");
+    for (let row = 0; row < 6; row++) {
+      parser.write(`\x1b[${row + 1};1H${" ".repeat(15)}│`);
+    }
+    const width = 70 - 16;
+    const split = width - 2 - padding;
+    parser.write("\x1b[1;17H \x1b[4mOpen video\x1b[0m");
+    parser.write(`\x1b[2;1H/sidebar/path\x1b[2;17H (${path.slice(0, split)}${" ".repeat(padding)}`);
+    parser.write(`\x1b[3;17H ${path.slice(split)})`);
+    for (const point of [{ row: 0, col: 22 }, { row: 1, col: 22 }, { row: 2, col: 21 }]) {
+      const match = findPathAtCell(parser.getBuffer(), point);
+      expect(match?.path).toBe(path);
+      expect(match).toHaveProperty("alternativePath");
+    }
+    expect(findPathAtCell(parser.getBuffer(), { row: 1, col: 15 })).toBeNull();
+  }
+});
+
+test("relative displayed paths without OSC 7 require automatic workspace lookup", () => {
+  const parser = new AnsiParser(80, 4);
+  parser.write("exports/shorts/video.mp4");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 5 }))
+    .toMatchObject({ path: "exports/shorts/video.mp4", alternativePath: null,
+      choiceReason: "relative-path" });
+});
+
+test("underlined labels use the adjacent displayed target only after confirmation", () => {
+  const parser = new AnsiParser(100, 4);
+  parser.write("\x1b[4mOpen video\x1b[0m (/home/me/video.mp4)\r\n");
+  parser.write("\x1b[4mYouTube copy\x1b[0m (exports/shorts/youtube-shorts.md)");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 3 }))
+    .toMatchObject({ path: "/home/me/video.mp4", alternativePath: null,
+      choiceReason: "rendered-label", startCol: 0, endCol: 9 });
+  expect(findPathAtCell(parser.getBuffer(), { row: 1, col: 4 }))
+    .toMatchObject({ path: "exports/shorts/youtube-shorts.md",
+      choiceReason: "relative-path", startCol: 0, endCol: 11 });
+});
+
+test("relative OSC 8 targets without a printed cwd require explicit resolution", () => {
+  const parser = new AnsiParser(60, 2);
+  parser.write("\x1b]8;;exports/video.mp4\x1b\\Open video\x1b]8;;\x1b\\");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 3 })).toMatchObject({
+    path: "exports/video.mp4", alternativePath: null, choiceReason: "relative-path",
+  });
+});
+
+test("pane clipping retains snapshot uncertainty instead of reopening old fragments", () => {
+  const source = new AnsiParser(40, 4);
+  source.write("\x1b[?7l");
+  for (let y = 0; y < 4; y++) source.write(`\x1b[${y + 1};1H     │`);
+  source.write("\x1b[2;7H /home/me/exports/a-very-long-file\r\n");
+  const restored = new AnsiParser(40, 4);
+  restored.restoreSnapshot(source.createSnapshot());
+  expect(findPathAtCell(restored.getBuffer(), { row: 1, col: 12 })).toBeNull();
+});
+
+test("composed panes never hide an OSC 8 or hidden right-margin cell", () => {
+  for (const linked of [false, true]) {
+    const parser = new AnsiParser(40, 4);
+    parser.write("\x1b[?7l");
+    for (let y = 0; y < 4; y++) parser.write(`\x1b[${y + 1};1H     │`);
+    parser.write(`\x1b[2;7H /tmp/${"a".repeat(26)}  \x1b[3;7H tail`);
+    const margin = parser.getBuffer()[1][39];
+    parser.getBuffer()[1][39] = linked
+      ? { ...margin, hyperlink: { uri: "https://example.com", id: "other" } }
+      : { ...margin, style: { ...DEFAULT_STYLE, hidden: true } };
+    expect(findPathAtCell(parser.getBuffer(), { row: 1, col: 12 })).toBeNull();
+  }
+});
+
+test("unsupported explicit hyperlinks never fall through to an adjacent path", () => {
+  const parser = new AnsiParser(80, 4);
+  parser.write("\x1b]8;;javascript:bad\x1b\\\x1b[4mOpen video\x1b[0m\x1b]8;;\x1b\\ (/tmp/video.mp4)");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 3 })).toBeNull();
+});
+
+test("all relative OSC 8 label cells must agree on a printed working directory", () => {
+  for (const width of [80, 6]) {
+    for (const initial of ["", "\x1b]7;file:///tmp/a\x07"]) {
+      const parser = new AnsiParser(width, 3);
+      parser.write(`${initial}\x1b]8;;exports/video.mp4\x1b\\Open\x1b]7;file:///tmp/b\x07 video\x1b]8;;\x1b\\`);
+      for (const index of [1, 6]) {
+        expect(findPathAtCell(parser.getBuffer(), { row: Math.floor(index / width), col: index % width }))
+          .toMatchObject({ path: "exports/video.mp4", alternativePath: null, choiceReason: "relative-path" });
+      }
+    }
+  }
+});
+
+test("a path-looking underlined label refers to its adjacent displayed target", () => {
+  const parser = new AnsiParser(80, 3);
+  parser.write("\x1b[4m/tmp/label.mp4\x1b[0m (/tmp/target.mp4)");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 5 })).toMatchObject({
+    path: "/tmp/target.mp4", alternativePath: null, choiceReason: "rendered-label",
+  });
+});
+
+test("pane detection does not truncate a wider scrollback filename after narrowing", () => {
+  const parser = new AnsiParser(80, 1);
+  parser.write(`${"     │".padEnd(80)}\r\n     │ /tmp/${"a".repeat(66)}  \r\n     │ tail.txt`);
+  parser.resize(40, 1);
+  const match = findPathAtCell(parser.getFullBuffer(), { row: 2, col: 9 });
+  expect([match?.path, match?.alternativePath, ...(match?.intermediatePaths ?? [])])
+    .not.toContain(`/tmp/${"a".repeat(28)}tail.txt`);
+});
+
+test("a rejected adjacent target never falls back to opening its path-looking label", () => {
+  const parser = new AnsiParser(80, 3);
+  parser.write("\x1b[4m/tmp/label.mp4\x1b[0m (javascript:bad)");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 5 })).toBeNull();
+});
+
+test("wrapped rendered labels locate their target from every label row", () => {
+  const parser = new AnsiParser(20, 5);
+  parser.write("\x1b[4mA very long video label\x1b[0m (/tmp/video.mp4)");
+  for (const point of [{ row: 0, col: 3 }, { row: 1, col: 1 }]) {
+    expect(findPathAtCell(parser.getBuffer(), point)).toMatchObject({
+      path: "/tmp/video.mp4", choiceReason: "rendered-label",
+    });
+  }
+});
+
+test("an opening parenthesis at the row edge still leads to its full target", () => {
+  const parser = new AnsiParser(20, 4);
+  parser.write("\x1b[4mOpen exported file\x1b[0m (/tmp/video.mp4)");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 3 })).toMatchObject({
+    path: "/tmp/video.mp4", choiceReason: "rendered-label",
+  });
+});
+
+test("relative suffix alternatives survive an unknown cwd at a rendered boundary", () => {
+  const parser = new AnsiParser(16, 4);
+  parser.write(`${"x".repeat(15)} \r\n src/file.ts`);
+  const match = findPathAtCell(parser.getBuffer(), { row: 1, col: 5 });
+  expect(match?.choiceReason).toBe("relative-path");
+  expect([match?.path, match?.alternativePath, ...(match?.intermediatePaths ?? [])])
+    .toContain("src/file.ts");
+});
+
+test("wrapped rendered labels do not bridge obscured or snapshot continuation rows", () => {
+  for (const obstruction of ["hidden", "hyperlink", "snapshot"]) {
+    const parser = new AnsiParser(20, 5);
+    parser.write("\x1b[4mA very long video label\x1b[0m (/tmp/video.mp4)");
+    const buffer = parser.getBuffer();
+    if (obstruction === "snapshot") {
+      const restored = new AnsiParser(20, 5);
+      restored.restoreSnapshot(parser.createSnapshot());
+      buffer[1] = restored.getBuffer()[1];
+    } else {
+      const cell = buffer[1][0];
+      buffer[1][0] = obstruction === "hidden"
+        ? { ...cell, style: { ...cell.style, hidden: true } }
+        : { ...cell, hyperlink: { uri: "https://example.com", id: "other" } };
+    }
+    expect(findPathAtCell(buffer, { row: 0, col: 3 })).toBeNull();
+  }
 });

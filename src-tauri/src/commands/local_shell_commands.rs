@@ -23,6 +23,8 @@ pub struct LocalShellManager {
     shells: RwLock<HashMap<String, LocalShell>>,
 }
 
+pub(crate) struct LocalShellIdentity(Arc<Mutex<LocalRecentOutput>>);
+
 struct LocalShell {
     master: Mutex<Box<dyn MasterPty + Send>>,
     /// FIFO to the writer pump — keystrokes must reach the PTY in the order
@@ -99,6 +101,38 @@ impl LocalShellManager {
     pub fn new() -> Self {
         Self {
             shells: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) async fn terminal_path_identity(
+        &self,
+        id: &str,
+    ) -> Result<LocalShellIdentity, String> {
+        let shells = self.shells.read().await;
+        let shell = shells.get(id).ok_or("Local shell not found")?;
+        if shell
+            .child
+            .lock()
+            .map_err(|_| "Local shell process is unavailable")?
+            .try_wait()
+            .map_err(|error| format!("Failed to inspect local shell: {error}"))?
+            .is_some()
+        {
+            return Err("The originating local shell has exited".to_string());
+        }
+        Ok(LocalShellIdentity(Arc::clone(&shell.recent_output)))
+    }
+
+    pub(crate) async fn validate_terminal_path_identity(
+        &self,
+        id: &str,
+        identity: &LocalShellIdentity,
+    ) -> Result<(), String> {
+        let current = self.terminal_path_identity(id).await?;
+        if Arc::ptr_eq(&current.0, &identity.0) {
+            Ok(())
+        } else {
+            Err("The originating local shell changed during path lookup".to_string())
         }
     }
 }
@@ -460,6 +494,10 @@ fn normalize_local_path_text(text: &str) -> String {
 /// Local browsing is scoped to the user's home directory so a compromised
 /// webview cannot read or write arbitrary locations.
 fn ensure_within_home(path: &Path) -> Result<std::path::PathBuf, String> {
+    path_within_home_scope(path)?.ok_or_else(|| "Path is outside the home directory".to_string())
+}
+
+pub(crate) fn path_within_home_scope(path: &Path) -> Result<Option<std::path::PathBuf>, String> {
     let home = local_home_dir_path().ok_or("Home directory not found")?;
     let canonical_home = std::fs::canonicalize(&home)
         .map(|path| std::path::PathBuf::from(normalize_local_path_text(&path.to_string_lossy())))
@@ -470,15 +508,15 @@ fn ensure_within_home(path: &Path) -> Result<std::path::PathBuf, String> {
         .components()
         .any(|component| matches!(component, std::path::Component::ParentDir))
     {
-        return Err("Path is outside the home directory".to_string());
+        return Ok(None);
     }
     let canonical = std::fs::canonicalize(path)
         .map(|path| std::path::PathBuf::from(normalize_local_path_text(&path.to_string_lossy())))
         .unwrap_or_else(|_| path.to_path_buf());
     if !canonical.starts_with(&canonical_home) {
-        return Err("Path is outside the home directory".to_string());
+        return Ok(None);
     }
-    Ok(canonical)
+    Ok(Some(canonical))
 }
 
 fn local_home_dir_command() -> Result<String, String> {

@@ -55,6 +55,7 @@
     localShellWrite,
     localShellResize,
     localShellDisconnect,
+    resolveTerminalPaths,
     sendDesktopBellNotification,
     sendDesktopTerminalNotification,
     listenLocalData,
@@ -71,7 +72,7 @@
   import { ctrlKey, altKey, getArrowKeyCode } from "$lib/utils/key-mapper";
   import { settingsStore, terminalFontStack } from "$lib/stores/settings.svelte";
   import { createStartupScriptDispatcher, type StartupScriptDispatcher } from "./startup-script";
-  import { findPathAtCell } from "./terminal-paths";
+  import { findPathAtCell, resolveTerminalPath, type TerminalPathMatch } from "./terminal-paths";
   import { findUrlAtCell, validateTerminalUrl, type SafeTerminalUrl } from "./terminal-links";
   import { extractTerminalSelection } from "./terminal-selection";
   import { formatTerminalPaste } from "./terminal-paste";
@@ -348,7 +349,7 @@
   let autoStickToBottom = true;
   let reconnecting = false;
   let disconnectRequested = false;
-  let connectionGeneration = 0;
+  let connectionGeneration = $state(0);
 
   // Local PTYs can relay remote SSH bytes, so output provenance cannot be
   // inferred from the outer session kind. Every generation earns approval.
@@ -372,15 +373,24 @@
   let hoveredPath = $state<string | null>(null);
   let pendingTerminalUrl = $state<SafeTerminalUrl | null>(null);
   let openingTerminalUrl = $state(false);
-  let pendingTerminalPath = $state<{
+  type PendingTerminalPath = {
+    requestId: number;
     path: string;
     alternativePath: string | null;
     intermediatePaths: string[];
-    choiceReason?: "source-location";
+    choiceReason?: TerminalPathMatch["choiceReason"];
+    kind: "ssh" | "local";
     sessionId: string;
     generation: number;
     paneSessionId: string | null;
-  } | null>(null);
+    resolution: {
+      resolving: boolean;
+      targets: Array<{ source: string; target: string }>;
+      error: string;
+    } | null;
+  };
+  let pendingTerminalPath = $state<PendingTerminalPath | null>(null);
+  let terminalPathRequestId = 0;
   let pendingSelectionRefresh = false;
   let selectionStart = $state<{ row: number; col: number } | null>(null);
   let selectionEnd = $state<{ row: number; col: number } | null>(null);
@@ -675,7 +685,7 @@
       ? findPathAtCell(buffer, point, parser?.getCurrentDirectoryUri() ?? null)
       : null;
     if (!path) return null;
-    if ("alternativePath" in path) {
+    if ("alternativePath" in path || path.choiceReason) {
       return { kind: "path" as const, value: path.path, alternativePath: path.alternativePath,
         choiceReason: path.choiceReason, intermediatePaths: path.intermediatePaths ?? [] };
     }
@@ -689,52 +699,139 @@
 
   function openTerminalLink(link: { kind: "url" | "path"; value: string;
     alternativePath?: string | null; intermediatePaths?: string[];
-    choiceReason?: "source-location" }) {
+    choiceReason?: TerminalPathMatch["choiceReason"] }) {
     if (link.kind === "url") {
       confirmAndOpenTerminalUrl(link.value);
       return;
     }
-    if (!sessionId || !connected || sessionId !== existingSessionId) return;
-    if ("alternativePath" in link) {
+    if (destroyed || !interactive || !sessionId || !connected || sessionId !== existingSessionId) return;
+    if ("alternativePath" in link || link.choiceReason) {
       pendingTerminalPath = {
+        requestId: ++terminalPathRequestId,
         path: link.value,
         alternativePath: link.alternativePath ?? null,
         intermediatePaths: link.intermediatePaths ?? [],
         choiceReason: link.choiceReason,
+        kind,
         sessionId,
         generation: connectionGeneration,
         paneSessionId: existingSessionId,
+        resolution: link.choiceReason === "relative-path"
+          ? { resolving: true, targets: [], error: "" } : null,
       };
+      if (pendingTerminalPath.resolution) void resolvePendingTerminalPaths(pendingTerminalPath);
     } else {
-      onRevealPath?.(link.value, sessionId);
+      const target = safeTerminalPathTarget(link.value);
+      if (target) onRevealPath?.(target, sessionId);
     }
   }
 
   function cancelPendingTerminalPath(refocus = true) {
+    const requestId = ++terminalPathRequestId;
     pendingTerminalPath = null;
     if (refocus) {
       void tick().then(() => {
-        if (!destroyed && interactive && connected && !pendingTerminalPath &&
-          !terminalContainer?.closest("[inert]")) focusInput();
+        if (requestId === terminalPathRequestId && !destroyed && interactive && connected &&
+          !pendingTerminalPath && !terminalContainer?.closest("[inert]")) focusInput();
       });
+    }
+  }
+
+  function safeTerminalPathTarget(path: string): string | null {
+    if (!/^(?:\/|[A-Za-z]:[\\/]|~(?:\/|$))/.test(path)) return null;
+    const target = resolveTerminalPath(path);
+    if (!target || target.split(/[\\/]/).includes("..")) return null;
+    return target;
+  }
+
+  function isTerminalPathSessionCurrent(pending: PendingTerminalPath): boolean {
+    return !destroyed && interactive && connected && kind === pending.kind &&
+      sessionId === pending.sessionId && connectionGeneration === pending.generation &&
+      existingSessionId === pending.paneSessionId;
+  }
+
+  function isPendingTerminalPathCurrent(pending: PendingTerminalPath): boolean {
+    return pendingTerminalPath === pending && terminalPathRequestId === pending.requestId &&
+      isTerminalPathSessionCurrent(pending);
+  }
+
+  async function resolvePendingTerminalPaths(pending: PendingTerminalPath) {
+    const resolution = pending.resolution;
+    if (!resolution || !isPendingTerminalPathCurrent(pending)) return;
+    const sources = [...new Set([pending.path, pending.alternativePath, ...pending.intermediatePaths]
+      .filter((path): path is string => path !== null))];
+    const absoluteTargets = new Map<string, { source: string; target: string }>();
+    const relativeSources: string[] = [];
+    for (const source of sources) {
+      const target = safeTerminalPathTarget(source);
+      if (target) {
+        if (!absoluteTargets.has(target)) absoluteTargets.set(target, { source, target });
+      } else if (source && source.length <= 4096 &&
+        !/^(?:[\\/]|~|[A-Za-z][A-Za-z\d+.-]*:)/.test(source) &&
+        !source.split(/[\\/]/).includes("..") &&
+        !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(source)) {
+        relativeSources.push(source);
+      }
+    }
+    try {
+      if (relativeSources.length > 32 || absoluteTargets.size > 32) {
+        throw new Error("Too many path choices");
+      }
+      const matches = relativeSources.length
+        ? await resolveTerminalPaths(pending.kind, pending.sessionId, relativeSources) : [];
+      if (!isPendingTerminalPathCurrent(pending)) return;
+      const requestedSources = new Set(relativeSources);
+      const targets = new Map(absoluteTargets);
+      if (!Array.isArray(matches)) throw new Error("Invalid path choices");
+      for (const match of matches) {
+        if (!match || typeof match.source !== "string" || typeof match.target !== "string" ||
+          !requestedSources.has(match.source)) throw new Error("Invalid path choice");
+        const target = safeTerminalPathTarget(match.target);
+        if (!target) throw new Error("Unsafe path choice");
+        if (!targets.has(target)) targets.set(target, { source: match.source, target });
+        if (targets.size > 32) throw new Error("Too many path choices");
+      }
+      await tick();
+      if (!isPendingTerminalPathCurrent(pending)) return;
+      resolution.targets = [...targets.values()];
+      resolution.resolving = false;
+      resolution.error = targets.size ? "" : "No existing path was found in this session's workspaces.";
+    } catch (error) {
+      if (!isPendingTerminalPathCurrent(pending)) return;
+      await tick();
+      if (!isPendingTerminalPathCurrent(pending)) return;
+      resolution.targets = absoluteTargets.size <= 32 ? [...absoluteTargets.values()] : [];
+      resolution.resolving = false;
+      const detail = error instanceof Error ? error.message : String(error);
+      resolution.error = `Could not resolve this path in this session: ${detail}`;
     }
   }
 
   async function revealPendingTerminalPath(path: string) {
     const pending = pendingTerminalPath;
-    if (!pending || (path !== pending.path && path !== pending.alternativePath &&
-      !pending.intermediatePaths.includes(path))) return;
-    cancelPendingTerminalPath(false);
+    if (!pending || !isPendingTerminalPathCurrent(pending)) return;
+    if (pending.resolution) {
+      if (pending.resolution.resolving ||
+        !pending.resolution.targets.some(choice => choice.target === path)) return;
+    } else if (path !== pending.path && path !== pending.alternativePath &&
+      !pending.intermediatePaths.includes(path)) return;
+    const target = safeTerminalPathTarget(path);
+    if (!target) return;
+    pendingTerminalPath = null;
     await tick();
-    if (destroyed || !connected || sessionId !== pending.sessionId ||
-      connectionGeneration !== pending.generation || existingSessionId !== pending.paneSessionId) return;
-    onRevealPath?.(path, pending.sessionId);
+    if (terminalPathRequestId !== pending.requestId || pendingTerminalPath ||
+      !isTerminalPathSessionCurrent(pending)) return;
+    onRevealPath?.(target, pending.sessionId);
   }
 
   $effect(() => {
     const active = connected;
     const paneSessionId = existingSessionId;
-    if (pendingTerminalPath && (!active || !interactive ||
+    const currentSessionId = sessionId;
+    const generation = connectionGeneration;
+    if (pendingTerminalPath && (!active || !interactive || kind !== pendingTerminalPath.kind ||
+      currentSessionId !== pendingTerminalPath.sessionId ||
+      generation !== pendingTerminalPath.generation ||
       paneSessionId !== pendingTerminalPath.paneSessionId)) {
       cancelPendingTerminalPath(false);
     }
@@ -5390,28 +5487,56 @@
           <p class="link-dialog-kicker">Terminal path</p>
           <h2 id="path-dialog-title">Which path should open?</h2>
           <p id="path-dialog-description" class="path-dialog-description">
-            {pendingTerminalPath.choiceReason === "source-location"
-              ? "The trailing numbers may be part of a filename or a source location. Choose the exact target; nothing opens automatically."
-              : "The terminal text crosses a row boundary. Choose the exact target; nothing opens automatically."}
+            {pendingTerminalPath.choiceReason === "relative-path"
+              ? "RedTerm checks this session's workspaces for existing targets. Choose the exact full path; nothing opens automatically."
+              : pendingTerminalPath.choiceReason === "rendered-label"
+                ? "This target is inferred from displayed terminal text. Choose the exact target; nothing opens automatically."
+                : pendingTerminalPath.choiceReason === "source-location"
+                  ? "The trailing numbers may be part of a filename or a source location. Choose the exact target; nothing opens automatically."
+                  : "The terminal text crosses a row boundary. Choose the exact target; nothing opens automatically."}
           </p>
-          <div class="path-dialog-choice">
-            <span class="path-dialog-label">{pendingTerminalPath.choiceReason === "source-location"
-              ? "Literal filename" : "Joined path (all visible rows)"}</span>
-            <code class="link-dialog-url path-dialog-value" dir="ltr">{pendingTerminalPath.path}</code>
-          </div>
-          {#if pendingTerminalPath.alternativePath !== null}
+          {#if pendingTerminalPath.resolution}
             <div class="path-dialog-choice">
-              <span class="path-dialog-label">{pendingTerminalPath.choiceReason === "source-location"
-                ? "File without line numbers" : "First-row path (without the next row)"}</span>
-              <code class="link-dialog-url path-dialog-value" dir="ltr">{pendingTerminalPath.alternativePath}</code>
+              <span class="path-dialog-label">Printed path</span>
+              <code class="link-dialog-url path-dialog-value" dir="ltr">{pendingTerminalPath.path}</code>
             </div>
+            {#if pendingTerminalPath.resolution.resolving}
+              <p class="path-dialog-description" role="status">Looking for existing paths in this session...</p>
+            {:else}
+              {#each pendingTerminalPath.resolution.targets as choice, index}
+                <div class="path-dialog-choice">
+                  <span class="path-dialog-label">Full path {index + 1}</span>
+                  <code class="link-dialog-url path-dialog-value" dir="ltr">{choice.target}</code>
+                </div>
+              {/each}
+              {#if pendingTerminalPath.resolution.error}
+                <p class="path-dialog-description path-dialog-error" role="alert">{pendingTerminalPath.resolution.error}</p>
+              {/if}
+            {/if}
+          {:else}
+            <div class="path-dialog-choice">
+              <span class="path-dialog-label">{pendingTerminalPath.choiceReason === "rendered-label"
+                ? "Displayed path"
+                : pendingTerminalPath.choiceReason === "source-location"
+                  ? "Literal filename" : "Joined path (all visible rows)"}</span>
+              <code class="link-dialog-url path-dialog-value" dir="ltr">{pendingTerminalPath.path}</code>
+            </div>
+            {#if pendingTerminalPath.alternativePath !== null}
+              <div class="path-dialog-choice">
+                <span class="path-dialog-label">{pendingTerminalPath.choiceReason === "source-location"
+                  ? "File without line numbers"
+                  : pendingTerminalPath.choiceReason === "rendered-label"
+                    ? "Partial path (first visible row)" : "First-row path (without the next row)"}</span>
+                <code class="link-dialog-url path-dialog-value" dir="ltr">{pendingTerminalPath.alternativePath}</code>
+              </div>
+            {/if}
+            {#each pendingTerminalPath.intermediatePaths as path, index}
+              <div class="path-dialog-choice">
+                <span class="path-dialog-label">Other possible path {index + 1}</span>
+                <code class="link-dialog-url path-dialog-value" dir="ltr">{path}</code>
+              </div>
+            {/each}
           {/if}
-          {#each pendingTerminalPath.intermediatePaths as path, index}
-            <div class="path-dialog-choice">
-              <span class="path-dialog-label">Other possible path {index + 1}</span>
-              <code class="link-dialog-url path-dialog-value" dir="ltr">{path}</code>
-            </div>
-          {/each}
         </div>
         <div class="link-dialog-actions path-dialog-actions">
           <button
@@ -5422,32 +5547,53 @@
           >
             Cancel
           </button>
-          {#if pendingTerminalPath.alternativePath !== null}
+          {#if pendingTerminalPath.resolution}
+            {#if !pendingTerminalPath.resolution.resolving}
+              {#each pendingTerminalPath.resolution.targets as choice, index}
+                <button
+                  type="button"
+                  class="link-dialog-btn primary"
+                  onclick={(e) => { swallowPointerClick(e); void revealPendingTerminalPath(choice.target); }}
+                >
+                  Open path {index + 1}
+                </button>
+              {/each}
+            {/if}
+          {:else}
+            {#if pendingTerminalPath.alternativePath !== null}
+              <button
+                type="button"
+                class="link-dialog-btn ghost"
+                disabled={!safeTerminalPathTarget(pendingTerminalPath.alternativePath)}
+                onclick={(e) => { swallowPointerClick(e); void revealPendingTerminalPath(pendingTerminalPath!.alternativePath!); }}
+              >
+                {pendingTerminalPath.choiceReason === "source-location"
+                  ? "Open file without line numbers"
+                  : pendingTerminalPath.choiceReason === "rendered-label"
+                    ? "Open partial path" : "Open first-row path"}
+              </button>
+            {/if}
+            {#each pendingTerminalPath.intermediatePaths as path, index}
+              <button
+                type="button"
+                class="link-dialog-btn ghost"
+                disabled={!safeTerminalPathTarget(path)}
+                onclick={(e) => { swallowPointerClick(e); void revealPendingTerminalPath(path); }}
+              >
+                Open other path {index + 1}
+              </button>
+            {/each}
             <button
               type="button"
-              class="link-dialog-btn ghost"
-              onclick={(e) => { swallowPointerClick(e); void revealPendingTerminalPath(pendingTerminalPath!.alternativePath!); }}
+              class="link-dialog-btn primary"
+              disabled={!safeTerminalPathTarget(pendingTerminalPath.path)}
+              onclick={(e) => { swallowPointerClick(e); void revealPendingTerminalPath(pendingTerminalPath!.path); }}
             >
-              {pendingTerminalPath.choiceReason === "source-location"
-                ? "Open file without line numbers" : "Open first-row path"}
+              {pendingTerminalPath.choiceReason === "rendered-label"
+                ? "Open displayed path"
+                : pendingTerminalPath.choiceReason === "source-location" ? "Open literal filename" : "Open joined path"}
             </button>
           {/if}
-          {#each pendingTerminalPath.intermediatePaths as path, index}
-            <button
-              type="button"
-              class="link-dialog-btn ghost"
-              onclick={(e) => { swallowPointerClick(e); void revealPendingTerminalPath(path); }}
-            >
-              Open other path {index + 1}
-            </button>
-          {/each}
-          <button
-            type="button"
-            class="link-dialog-btn primary"
-            onclick={(e) => { swallowPointerClick(e); void revealPendingTerminalPath(pendingTerminalPath!.path); }}
-          >
-            {pendingTerminalPath.choiceReason === "source-location" ? "Open literal filename" : "Open joined path"}
-          </button>
         </div>
       </div>
     </div>
@@ -5899,6 +6045,10 @@
     color: var(--text-secondary);
     font-size: 13px;
     line-height: 1.45;
+  }
+
+  .path-dialog-error {
+    color: var(--status-error);
   }
 
   .path-dialog-choice {

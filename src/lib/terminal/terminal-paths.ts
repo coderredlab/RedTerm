@@ -1,12 +1,12 @@
-import { hasReflowIncomingContent, hasReflowOutgoingContent, isReflowContinuation, isReflowTail, isUnprovenSnapshotRow, printedDirectoryUri, reflowContinuationEnd, type Cell } from "./ansi-parser";
+import { hasReflowIncomingContent, hasReflowOutgoingContent, isReflowContinuation, isReflowTail, isUnprovenSnapshotRow, printedDirectoryUri, reflowContinuationEnd, sliceTerminalPathRow, type Cell } from "./ansi-parser";
 
 export interface TerminalPathMatch {
   path: string;
-  /** Present only for a textual path spanning rows: the first-row standalone choice, if valid. */
+  /** Presence requires explicit confirmation; null means no alternate target is valid. */
   alternativePath?: string | null;
-  /** Other valid targets ending or starting at an ambiguous visual row. */
+  /** Other possible targets at rendered row boundaries. */
   intermediatePaths?: string[];
-  choiceReason?: "source-location";
+  choiceReason?: "source-location" | "relative-path" | "rendered-label";
   startCol: number;
   endCol: number;
 }
@@ -42,10 +42,163 @@ export function resolveTerminalPath(candidate: string, cwdUri: string | null = n
   return `${cwd.replace(/\/$/, "")}/${path}`;
 }
 
+function unresolvedRelativePath(candidate: string): string | null {
+  return candidate.length <= 4096 && candidate.includes("/") &&
+    !ABSOLUTE.test(candidate) && !candidate.startsWith("~") &&
+    !/^[A-Za-z][A-Za-z\d+.-]*:/.test(candidate) &&
+    !candidate.split(/[\\/]/).includes("..") && !UNSAFE.test(candidate)
+    ? candidate : null;
+}
+
+function pathContinuationGaps(
+  before: Cell[], after: Cell[], panePadding: boolean, ignoreHyperlinks = false,
+): number {
+  const known = isReflowContinuation(before, after);
+  const herdrTail = isReflowTail(before) && !known &&
+    after[0]?.char === " " && !!after[1]?.char.trim() &&
+    !isUnprovenSnapshotRow(before);
+  if (isReflowTail(before) && !known && !herdrTail) return -1;
+  // A reflow tail can still be the first half of a TUI-internal hard wrap.
+  // Its indented next row is ambiguous and must be shown as a choice.
+  if (!ignoreHyperlinks && before.length !== after.length && !known && !herdrTail) return -1;
+  const continuationEnd = reflowContinuationEnd(before, after);
+  let trailing = 0;
+  if (continuationEnd !== null) trailing = before.length - continuationEnd;
+  else if (herdrTail) {
+    while (trailing < before.length && before[before.length - trailing - 1]?.char === " ") trailing++;
+  } else if (panePadding) {
+    // The compositor's reserved column can follow the nested TUI's own margin.
+    while (trailing < 2 && before[before.length - trailing - 1]?.char === " ") trailing++;
+  } else if (before.at(-1)?.char === " " && before.at(-2)?.char.trim()) trailing = 1;
+  // A wide glyph's final-column placeholder occupies the cell, not a margin.
+  const lastContent = before[before.length - 1 - trailing];
+  const wideEnd = lastContent?.char === "" && before.at(-2 - trailing)?.char.trim();
+  const end = before[before.length - 1 - trailing - (wideEnd ? 1 : 0)];
+  if (!end?.char.trim() || (!ignoreHyperlinks && end.hyperlink)) return -1;
+  const leading = after[0]?.char === " " && after[1]?.char.trim() ? 1 : 0;
+  return after[leading]?.char.trim() &&
+    (ignoreHyperlinks || (!after[leading]?.hyperlink && (!leading || !after[0]?.hyperlink)))
+    ? (trailing << 1) | leading : -1;
+}
+
+function findRenderedPathLabel(
+  buffer: Cell[][], point: { row: number; col: number }, cwdUri: string | null,
+  panePadding = false,
+): TerminalPathMatch | null | undefined {
+  const row = buffer[point.row];
+  const isLabelCell = (cell: Cell | undefined) => cell?.style.underline &&
+    !cell.style.hidden && !cell.hyperlink && !UNSAFE.test(cell.char);
+  if (!isLabelCell(row?.[point.col])) return undefined;
+  if (isUnprovenSnapshotRow(row)) return null;
+  let start = point.col, end = point.col;
+  while (start > 0 && isLabelCell(row[start - 1])) start--;
+  while (end + 1 < row.length && isLabelCell(row[end + 1])) end++;
+  let targetRow = point.row, targetCol = end + 1, scanned = end - start + 1;
+  const advanceRow = (): number | null | undefined => {
+    const before = buffer[targetRow], after = buffer[targetRow + 1];
+    if (!after) return undefined;
+    const known = isReflowContinuation(before, after);
+    if (targetRow - point.row >= 32 || isUnprovenSnapshotRow(after) ||
+      (before.length !== after.length && !known) ||
+      (!known && (hasReflowOutgoingContent(before) || hasReflowIncomingContent(after)))) return null;
+    const gaps = pathContinuationGaps(before, after, panePadding);
+    targetRow++;
+    targetCol = gaps >= 0 ? gaps & 1 : 0;
+    if (targetCol && (after[0].style.hidden || after[0].hyperlink)) return null;
+    return gaps;
+  };
+  while (true) {
+    const current = buffer[targetRow];
+    let labelOnRow = targetRow === point.row;
+    while (targetCol < current.length && isLabelCell(current[targetCol])) {
+      if (current[targetCol].char.trim()) labelOnRow = true;
+      targetCol++;
+      if (++scanned > 4096) return null;
+    }
+    while (targetCol < current.length && current[targetCol].char === " ") {
+      if (current[targetCol].style.hidden || current[targetCol].hyperlink) return null;
+      targetCol++;
+      if (++scanned > 4096) return null;
+    }
+    if (targetCol < current.length) break;
+    if (!labelOnRow) return undefined;
+    const gaps = advanceRow();
+    if (gaps === undefined) return undefined;
+    if (gaps === null) return null;
+    if (isLabelCell(buffer[targetRow][targetCol]) && gaps < 0) return undefined;
+  }
+  const opener = buffer[targetRow]?.[targetCol];
+  if (opener?.char !== "(") return undefined;
+  if (opener.style.hidden || opener.hyperlink) return null;
+  targetCol++;
+  const targetLine = buffer[targetRow];
+  while (targetCol < targetLine.length && targetLine[targetCol].char === " ") {
+    if (targetLine[targetCol].style.hidden || targetLine[targetCol].hyperlink) return null;
+    targetCol++;
+  }
+  if (targetCol === targetLine.length) {
+    const gaps = advanceRow();
+    if (gaps === undefined || gaps === null || gaps < 0) return null;
+  }
+  const match = findPathInRows(buffer, { row: targetRow, col: targetCol }, cwdUri, panePadding);
+  if (!match) return null;
+  return { ...match, startCol: start, endCol: end,
+    alternativePath: match.alternativePath ?? null,
+    choiceReason: match.choiceReason === "relative-path" ? "relative-path" : "rendered-label" };
+}
+
+/** Infer a fixed display pane, never treating its neighboring sidebar as path text. */
 export function findPathAtCell(
+  buffer: Cell[][], point: { row: number; col: number }, cwdUri: string | null = null,
+): TerminalPathMatch | null {
+  const row = buffer[point.row];
+  if (!row?.[point.col]) return null;
+  // Unsupported explicit links must not fall through to inferred text targets.
+  if (row[point.col].hyperlink) return findPathInRows(buffer, point, cwdUri);
+  const divider = (line: Cell[] | undefined, col: number) => {
+    const cell = line?.[col];
+    return !!cell && /^[│┃║]$/.test(cell.char) && !cell.style.hidden && !cell.hyperlink;
+  };
+  const continuousDivider = (col: number) => {
+    const top = Math.max(0, Math.min(point.row - 1, buffer.length - 3));
+    return buffer.length >= 3 && divider(buffer[top], col) &&
+      divider(buffer[top + 1], col) && divider(buffer[top + 2], col);
+  };
+  if (continuousDivider(point.col)) return null;
+  let left = 0, right = row.length;
+  for (let col = point.col - 1; col >= 0; col--) {
+    if (continuousDivider(col)) { left = col + 1; break; }
+  }
+  for (let col = point.col + 1; col < row.length; col++) {
+    if (continuousDivider(col)) { right = col; break; }
+  }
+  if (left === 0 && right === row.length) {
+    const rendered = findRenderedPathLabel(buffer, point, cwdUri);
+    return rendered === undefined ? findPathInRows(buffer, point, cwdUri) : rendered;
+  }
+  const withinPane = (line: Cell[]) => line.length >= right &&
+    (left === 0 || divider(line, left - 1)) &&
+    (right === row.length ? line.length === row.length : divider(line, right));
+  const reach = Math.min(33, Math.ceil(4096 / Math.max(1, right - left)) + 1);
+  let top = point.row, bottom = point.row;
+  while (top > 0 && point.row - top < reach && withinPane(buffer[top - 1])) top--;
+  while (bottom + 1 < buffer.length && bottom - point.row < reach &&
+    withinPane(buffer[bottom + 1])) bottom++;
+  const pane = buffer.slice(top, bottom + 1).map(line => sliceTerminalPathRow(line, left, right));
+  const localPoint = { row: point.row - top, col: point.col - left };
+  const rendered = findRenderedPathLabel(pane, localPoint, cwdUri, true);
+  const match = rendered === undefined ? findPathInRows(pane, localPoint, cwdUri, true) : rendered;
+  if (!match) return null;
+  return { ...match, startCol: match.startCol + left, endCol: match.endCol + left,
+    alternativePath: match.alternativePath ?? null,
+    choiceReason: match.choiceReason ?? "rendered-label" };
+}
+
+function findPathInRows(
   buffer: Cell[][],
   point: { row: number; col: number },
   cwdUri: string | null = null,
+  panePadding = false,
 ): TerminalPathMatch | null {
   const row = buffer[point.row];
   if (!row || point.col < 0 || !row[point.col]) return null;
@@ -53,18 +206,52 @@ export function findPathAtCell(
   if (explicit) {
     // OSC 8 targets are paths, not rendered text: do not infer a wrap from their label.
     // OMP emits raw absolute hrefs as well as file: URLs.
+    const same = (y: number, x: number) => buffer[y]?.[x]?.hyperlink?.uri === explicit.uri &&
+      buffer[y][x].hyperlink?.id === explicit.id;
+    let firstRow = point.row, firstCol = point.col, lastRow = point.row, lastCol = point.col;
+    let spanCells = 1;
+    while (firstRow > 0 || firstCol > 0) {
+      const y = firstCol > 0 ? firstRow : firstRow - 1;
+      const x = firstCol > 0 ? firstCol - 1 : buffer[y].length - 1;
+      if (!same(y, x)) break;
+      if (++spanCells > 4096) return null;
+      firstRow = y; firstCol = x;
+    }
+    while (lastRow + 1 < buffer.length || lastCol + 1 < buffer[lastRow].length) {
+      const y = lastCol + 1 < buffer[lastRow].length ? lastRow : lastRow + 1;
+      const x = y === lastRow ? lastCol + 1 : 0;
+      if (!same(y, x)) break;
+      if (++spanCells > 4096) return null;
+      lastRow = y; lastCol = x;
+    }
+    let printedCwd: string | null = null;
+    let consistentCwd = true;
+    for (let y = firstRow; y <= lastRow; y++) {
+      const from = y === firstRow ? firstCol : 0;
+      const to = y === lastRow ? lastCol : buffer[y].length - 1;
+      for (let x = from; x <= to; x++) {
+        const cell = buffer[y][x];
+        if (cell.style.hidden) return null;
+        if (!cell.char.trim()) continue;
+        const cwd = printedDirectoryUri(cell);
+        if (!cwd || (printedCwd && cwd !== printedCwd)) consistentCwd = false;
+        if (cwd) printedCwd = cwd;
+      }
+    }
+    const relative = unresolvedRelativePath(explicit.uri);
+    const resolvedRelative = relative && consistentCwd
+      ? resolveTerminalPath(relative, printedCwd) : null;
     const path = /^file:/i.test(explicit.uri)
       ? resolveTerminalPath(explicit.uri)
       : ABSOLUTE.test(explicit.uri) && explicit.uri.length <= 4096 && !UNSAFE.test(explicit.uri)
         ? /^[A-Za-z]:[\\/]/.test(explicit.uri) ? explicit.uri.replace(/\\/g, "/") : explicit.uri
-        : null;
+        : resolvedRelative ?? relative;
     if (!path) return null;
-    const same = (col: number) => row[col]?.hyperlink?.uri === explicit.uri && row[col]?.hyperlink?.id === explicit.id;
-    let startCol = point.col, endCol = point.col;
-    while (startCol > 0 && same(startCol - 1)) startCol--;
-    while (endCol + 1 < row.length && same(endCol + 1)) endCol++;
-    if (row.slice(startCol, endCol + 1).some(cell => cell.style.hidden)) return null;
-    return { path, startCol, endCol };
+    const startCol = firstRow === point.row ? firstCol : 0;
+    const endCol = lastRow === point.row ? lastCol : row.length - 1;
+    return { path, startCol, endCol,
+      ...(relative && !resolvedRelative
+        ? { alternativePath: null, choiceReason: "relative-path" as const } : {}) };
   }
   // Stored snapshots have no wrap ancestry. Rendered plain text with
   // surviving original cells is non-actionable; OSC 8 above is explicit.
@@ -72,31 +259,8 @@ export function findPathAtCell(
   // A nested TUI can wrap inside the outer terminal with one padding cell
   // on the right and one indentation cell on the next row (Herdr does this).
   // Encode trailing/leading margins in bits 1/0; -1 means no continuation.
-  const continuationGaps = (before: Cell[], after: Cell[], ignoreHyperlinks = false) => {
-    const known = isReflowContinuation(before, after);
-    const herdrTail = isReflowTail(before) && !known &&
-      after[0]?.char === " " && !!after[1]?.char.trim() &&
-      !isUnprovenSnapshotRow(before);
-    if (isReflowTail(before) && !known && !herdrTail) return -1;
-    // A reflow tail can still be the first half of a TUI-internal hard wrap.
-    // Its indented next row is ambiguous and must be shown as a choice.
-    if (!ignoreHyperlinks && before.length !== after.length && !known && !herdrTail) return -1;
-    const continuationEnd = reflowContinuationEnd(before, after);
-    let trailing = 0;
-    if (continuationEnd !== null) trailing = before.length - continuationEnd;
-    else if (herdrTail) {
-      while (trailing < before.length && before[before.length - trailing - 1]?.char === " ") trailing++;
-    } else if (before.at(-1)?.char === " " && before.at(-2)?.char.trim()) trailing = 1;
-    // A wide glyph's final-column placeholder occupies the cell, not a margin.
-    const lastContent = before[before.length - 1 - trailing];
-    const wideEnd = lastContent?.char === "" && before.at(-2 - trailing)?.char.trim();
-    const end = before[before.length - 1 - trailing - (wideEnd ? 1 : 0)];
-    if (!end?.char.trim() || (!ignoreHyperlinks && end.hyperlink)) return -1;
-    const leading = after[0]?.char === " " && after[1]?.char.trim() ? 1 : 0;
-    return after[leading]?.char.trim() &&
-      (ignoreHyperlinks || (!after[leading]?.hyperlink && (!leading || !after[0]?.hyperlink)))
-      ? (trailing << 1) | leading : -1;
-  };
+  const continuationGaps = (before: Cell[], after: Cell[], ignoreHyperlinks = false) =>
+    pathContinuationGaps(before, after, panePadding, ignoreHyperlinks);
   let first = point.row;
   let last = point.row;
   let length = row.length;
@@ -204,7 +368,9 @@ export function findPathAtCell(
     const after = last + 1 < buffer.length ? continuationGaps(buffer[last], buffer[last + 1]) : -1;
     if ((before >= 0 && /^[ ([{"'`]*$/.test(text.slice(0, offset))) ||
         (after >= 0 && /^[)\]},;."'`]* ?$/.test(text.slice(endOffset)))) continue;
-    const wholePath = resolveTerminalPath(candidate, printedCwd(offset, endOffset));
+    const resolvedPath = resolveTerminalPath(candidate, printedCwd(offset, endOffset));
+    const wholePath = resolvedPath ?? unresolvedRelativePath(candidate);
+    const requiresLookup = !resolvedPath && wholePath !== null;
     const firstTokenRow = rowStarts.findIndex((start, index) =>
       index < rowStarts.length - 1 && offset < rowStarts[index + 1]);
     const lastTokenRow = rowStarts.findIndex((start, index) =>
@@ -284,18 +450,21 @@ export function findPathAtCell(
       if (!wholePath) continue;
       const withoutLine = /:\d+(?::\d+)?$/.test(candidate)
         ? resolveTerminalPath(candidate.replace(/:\d+(?::\d+)?$/, ""),
-          printedCwd(offset, endOffset))
+          printedCwd(offset, endOffset)) ??
+          (requiresLookup ? unresolvedRelativePath(candidate.replace(/:\d+(?::\d+)?$/, "")) : null)
         : null;
       return { path: wholePath, startCol, endCol,
-        ...(withoutLine && withoutLine !== wholePath
-          ? { alternativePath: withoutLine, choiceReason: "source-location" as const }
-          : {}) };
+        ...(requiresLookup ? { alternativePath: withoutLine, choiceReason: "relative-path" as const }
+          : withoutLine && withoutLine !== wholePath
+            ? { alternativePath: withoutLine, choiceReason: "source-location" as const }
+            : {}) };
     }
     const firstRowEnd = rowStarts[firstTokenRow + 1];
     const firstRowText = text.slice(offset, firstRowEnd);
     const alternativePath = resolveTerminalPath(
       quoted ? firstRowText : trimPlainPathSuffix(firstRowText),
-      printedCwd(offset, firstRowEnd));
+      printedCwd(offset, firstRowEnd)) ??
+      (requiresLookup ? unresolvedRelativePath(quoted ? firstRowText : trimPlainPathSuffix(firstRowText)) : null);
     // Hard newlines and TUI-internal wraps look identical. Preserve every
     // plausible starting/stopping row rather than just maximal joins.
     if (lastTokenRow - firstTokenRow > 32) return null;
@@ -307,7 +476,8 @@ export function findPathAtCell(
       const raw = quoted ? rawText : trimPlainPathSuffix(rawText);
       const withoutLine = raw.replace(/:\d+(?::\d+)?$/, "");
       for (const variant of withoutLine === raw ? [raw] : [raw, withoutLine]) {
-        const resolved = resolveTerminalPath(variant, printedCwd(start, end));
+        const resolved = resolveTerminalPath(variant, printedCwd(start, end)) ??
+          (requiresLookup ? unresolvedRelativePath(variant) : null);
         if (resolved && resolved !== alternativePath && resolved !== wholePath &&
           !candidates.includes(resolved)) {
           if (candidates.length === 32) tooManyCandidates = true;
@@ -324,17 +494,28 @@ export function findPathAtCell(
       const wrapperLength = text.slice(rowStart, endOffset).match(/^[([{]+/)?.[0].length ?? 0;
       const startOffset = rowStart + wrapperLength;
       const suffix = text.slice(startOffset, endOffset);
-      if (!/^(?:\/|~\/|file:|[A-Za-z]:[\\/])/.test(suffix) &&
-        !(printedCwd(startOffset, endOffset) && /^[^\s/]+\/[^\s]/.test(suffix))) continue;
+      if (!resolveTerminalPath(suffix, printedCwd(startOffset, endOffset)) &&
+        !(requiresLookup && unresolvedRelativePath(suffix))) continue;
       for (let endRow = clickTokenRow; endRow <= lastTokenRow && !tooManyCandidates; endRow++) {
         const end = endRow === lastTokenRow ? endOffset : rowStarts[endRow + 1];
         addCandidate(startOffset, end);
       }
     }
     if (tooManyCandidates) return null;
-    const path = wholePath ?? candidates.shift();
+    let path = wholePath ?? candidates.shift();
+    if (requiresLookup) {
+      const absoluteIndex = candidates.findIndex(value => ABSOLUTE.test(value) || value.startsWith("~/"));
+      if (absoluteIndex >= 0) {
+        path = candidates.splice(absoluteIndex, 1)[0];
+        if (wholePath) {
+          if (candidates.length === 32) return null;
+          candidates.unshift(wholePath);
+        }
+      }
+    }
     if (!path) continue;
     return { path, startCol, endCol, alternativePath,
+      ...(requiresLookup ? { choiceReason: "relative-path" as const } : {}),
       ...(candidates.length ? { intermediatePaths: candidates } : {}) };
   }
   return null;

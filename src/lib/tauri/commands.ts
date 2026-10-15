@@ -308,6 +308,19 @@ export async function sshGetSessionSnapshot(
   return snapshot ? { snapshot, last_seq: stored.last_seq } : null;
 }
 
+export interface TerminalPathResolution {
+  source: string;
+  target: string;
+}
+
+export async function resolveTerminalPaths(
+  kind: "ssh" | "local",
+  sessionId: string,
+  paths: string[],
+): Promise<TerminalPathResolution[]> {
+  return invoke("terminal_resolve_paths", { kind, sessionId, paths });
+}
+
 export async function sshUploadClipboardImage(
   sessionId: string,
   data: Uint8Array

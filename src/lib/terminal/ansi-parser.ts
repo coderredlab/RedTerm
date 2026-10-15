@@ -158,6 +158,12 @@ function copyUnprovenSnapshotRow(source: Cell[], target: Cell[], start = 0, end 
     if (retained) reflowIncomingCells.set(target, retained);
   }
 }
+/** Crop a display pane without dropping surviving path-ancestry guards. */
+export function sliceTerminalPathRow(row: Cell[], start: number, end: number): Cell[] {
+  const sliced = row.slice(start, end);
+  copyUnprovenSnapshotRow(row, sliced, start, Math.min(end, row.length));
+  return sliced;
+}
 function mightSpanBoundary(before: Cell[] | undefined, after: Cell[] | undefined): boolean {
   if (!before || !after) return false;
   const last = before.at(-1)?.char;

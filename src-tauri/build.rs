@@ -25,6 +25,7 @@ fn main() {
             "ssh_get_session_snapshot",
             "ssh_session_exists",
             "ssh_store_session_snapshot",
+            "terminal_resolve_paths",
             "ssh_upload_clipboard_image",
             "ssh_upload_clipboard_image_from_local_path",
             "sftp_list_dir",

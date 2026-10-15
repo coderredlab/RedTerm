@@ -45,7 +45,7 @@ use commands::{
     local_download_to_dir, local_home_dir, local_list_dir, local_read_file, local_remove_path,
     local_save_copy, local_shell_disconnect, local_shell_get_output, local_shell_resize,
     local_shell_start, local_shell_write, local_upload, sftp_download_folder, sftp_upload,
-    DesktopClipboardState, LocalShellManager,
+    terminal_resolve_paths, DesktopClipboardState, LocalShellManager,
 };
 
 use storage::{
@@ -203,6 +203,8 @@ pub fn run() {
             local_shell_disconnect,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_shell_get_output,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            terminal_resolve_paths,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             local_home_dir,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]

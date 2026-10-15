@@ -32,6 +32,33 @@ const EXEC_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_COMMAND_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_CHANNEL_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+// A plain russh Channel does not close on drop. Timeouts can cancel the
+// capture future, so retain ownership that terminates only this exec channel.
+struct ClosingExecChannel(Option<russh::Channel<Msg>>);
+
+impl Drop for ClosingExecChannel {
+    fn drop(&mut self) {
+        let Some(channel) = self.0.take() else { return };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            log::warn!("SSH exec channel cleanup has no running async runtime");
+            return;
+        };
+        runtime.spawn(async move {
+            let cleanup = async {
+                if let Err(error) = channel.signal(russh::Sig::TERM).await {
+                    log::debug!("SSH exec process termination could not be sent: {error}");
+                }
+                channel.close().await
+            };
+            match tokio::time::timeout(SSH_CHANNEL_CLOSE_TIMEOUT, cleanup).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log::warn!("SSH exec channel cleanup failed: {error}"),
+                Err(_) => log::warn!("SSH exec channel cleanup timed out"),
+            }
+        });
+    }
+}
+
 const MAX_SFTP_RESPONSE_BYTES: usize = 1024 * 1024;
 
 // russh-sftp 2.4.0 passes u32::MAX to its client frame reader and allocates
@@ -406,15 +433,17 @@ impl SshConnection {
         Ok(SshSession::new(channel, data_tx, exit_tx))
     }
 
-    pub(super) async fn exec_capture(
+    pub(crate) async fn exec_capture(
         &self,
         command: &str,
     ) -> Result<(Option<u32>, String, String), SshError> {
-        let mut channel = self
-            .handle
-            .channel_open_session()
-            .await
-            .map_err(|e| SshError::SessionError(e.to_string()))?;
+        let mut ownership = ClosingExecChannel(Some(
+            self.handle
+                .channel_open_session()
+                .await
+                .map_err(|e| SshError::SessionError(e.to_string()))?,
+        ));
+        let channel = ownership.0.as_mut().expect("newly opened exec channel");
 
         channel
             .exec(true, command)
@@ -455,6 +484,8 @@ impl SshConnection {
                 _ => {}
             }
         }
+        // A remote Close/closed receiver already completed the channel lifecycle.
+        drop(ownership.0.take());
 
         let out = String::from_utf8_lossy(&stdout).trim().to_string();
         let err = String::from_utf8_lossy(&stderr).trim().to_string();
@@ -646,7 +677,7 @@ finally:
         Ok("unknown".to_string())
     }
 
-    async fn open_sftp(&self) -> Result<SftpSession, SshError> {
+    pub(crate) async fn open_sftp(&self) -> Result<SftpSession, SshError> {
         let channel = self
             .handle
             .channel_open_session()

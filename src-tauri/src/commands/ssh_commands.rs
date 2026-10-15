@@ -204,6 +204,36 @@ impl SessionManager {
     pub async fn remove_session(&self, id: &str) -> Option<SessionEntry> {
         self.sessions.write().await.remove(id)
     }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(crate) async fn terminal_path_connection(
+        &self,
+        id: &str,
+    ) -> Result<Arc<SshConnection>, String> {
+        self.sessions
+            .read()
+            .await
+            .get(id)
+            .map(|entry| Arc::clone(&entry.connection))
+            .ok_or_else(|| "Session not found".to_string())
+    }
+
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    pub(crate) async fn validate_terminal_path_connection(
+        &self,
+        id: &str,
+        connection: &Arc<SshConnection>,
+    ) -> Result<(), String> {
+        let sessions = self.sessions.read().await;
+        if sessions
+            .get(id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.connection, connection))
+        {
+            Ok(())
+        } else {
+            Err("The originating SSH session changed during path lookup".to_string())
+        }
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
