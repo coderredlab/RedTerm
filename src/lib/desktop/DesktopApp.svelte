@@ -53,7 +53,9 @@
   let workspaceEl: HTMLElement | null = $state(null);
   let editPaneRequestGeneration = 0;
   let connectionsViewRequest = $state(0);
-  let revealPathRequest = $state<{ paneId: string; path: string; id: number } | null>(null);
+  let revealPathRequest = $state<{
+    paneId: string; path: string; sessionId: string; id: number;
+  } | null>(null);
   let revealPathSequence = 0;
 
   interface ClosePrompt {
@@ -858,12 +860,14 @@
 
 
   const workspaceApi: WorkspaceApi = {
-    revealPath(tabId, paneId, path) {
-      if (paneIsClosing(tabId, paneId) || !tabsStore.getPane(tabId, paneId)) return;
+    revealPath(tabId, paneId, path, sourceSessionId) {
+      if (paneIsClosing(tabId, paneId) ||
+        tabsStore.getPane(tabId, paneId)?.sessionId !== sourceSessionId) return;
       void tabsStore.setActivePane(tabId, paneId).then(() => {
-        if (tabsStore.activeTabId !== tabId || tabsStore.getActivePane()?.id !== paneId) return;
+        if (tabsStore.activeTabId !== tabId || tabsStore.getActivePane()?.id !== paneId ||
+          tabsStore.getPane(tabId, paneId)?.sessionId !== sourceSessionId) return;
         if (desktopPrefsStore.prefs.sidebarCollapsed) desktopPrefsStore.toggleSidebar();
-        revealPathRequest = { paneId, path, id: ++revealPathSequence };
+        revealPathRequest = { paneId, path, sessionId: sourceSessionId, id: ++revealPathSequence };
       });
     },
     registerTerminal(paneId, terminal) {
@@ -1034,6 +1038,7 @@
     width={desktopPrefsStore.prefs.sidebarWidth}
     collapsed={desktopPrefsStore.prefs.sidebarCollapsed}
     activeSessionId={activeSessionId}
+    paneSessionId={activePane?.sessionId ?? null}
     explorerKind={explorerKind}
     explorerId={explorerId}
     connectionsViewRequest={connectionsViewRequest}

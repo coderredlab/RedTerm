@@ -11,6 +11,7 @@ const FOCUSABLE_SELECTOR = [
 
 interface ModalFocusOptions {
   onClose: () => void;
+  shouldRestoreFocus?: () => boolean;
 }
 
 interface ModalStackEntry {
@@ -156,7 +157,7 @@ export function modalFocus(node: HTMLElement, initialOptions: ModalFocusOptions)
 
       if (modalStack.length === 0) {
         maybeDetachDocumentListener();
-        if (previouslyFocused?.isConnected) {
+        if (previouslyFocused?.isConnected && options.shouldRestoreFocus?.() !== false) {
           previouslyFocused.focus({ preventScroll: true });
         }
         return;

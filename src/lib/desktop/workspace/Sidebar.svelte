@@ -13,10 +13,11 @@
     width: number;
     collapsed: boolean;
     activeSessionId: string | null;
+    paneSessionId: string | null;
     explorerKind: "ssh" | "local" | null;
     explorerId: string | null;
     connectionsViewRequest: number;
-    revealPathRequest: { paneId: string; path: string; id: number } | null;
+    revealPathRequest: { paneId: string; path: string; sessionId: string; id: number } | null;
     onWidthChange: (width: number) => void;
     onEdit: (connection: SavedConnection) => void;
     onNewConnection: () => void;
@@ -29,6 +30,7 @@
     width,
     collapsed,
     activeSessionId,
+    paneSessionId,
     explorerKind,
     explorerId,
     connectionsViewRequest,
@@ -54,11 +56,13 @@
 
   $effect(() => {
     const request = revealPathRequest;
-    if (!request || request.id <= handledRevealId || request.paneId !== explorerId) return;
+    if (!request || request.id <= handledRevealId || request.paneId !== explorerId ||
+      request.sessionId !== paneSessionId) return;
     view = "files";
     // The keyed explorer must finish switching sessions before receiving the request.
     void tick().then(() => {
       if (revealPathRequest?.id !== request.id || explorerId !== request.paneId ||
+          paneSessionId !== request.sessionId ||
           request.id <= handledRevealId || !fileExplorer) return;
       handledRevealId = request.id;
       void fileExplorer.revealPath(request.path);
@@ -159,7 +163,7 @@
   {#if view === "connections"}
     <ConnectionList onEdit={onEdit} {onNewConnection} {onOpenLocal} />
   {:else if explorerKind && explorerId}
-    {#key explorerId}
+    {#key `${explorerId}:${activeSessionId ?? ""}`}
       <FileExplorer
         kind={explorerKind}
         sessionId={activeSessionId}

@@ -67,6 +67,7 @@
   import { tabsStore } from "$lib/stores/tabs.svelte";
   import { terminalModesStore } from "$lib/stores/terminal-modes.svelte";
   import { terminalModalGate } from "$lib/stores/terminal-modal-gate.svelte";
+  import { modalFocus } from "$lib/desktop/workspace/modal-focus";
   import { ctrlKey, altKey, getArrowKeyCode } from "$lib/utils/key-mapper";
   import { settingsStore, terminalFontStack } from "$lib/stores/settings.svelte";
   import { createStartupScriptDispatcher, type StartupScriptDispatcher } from "./startup-script";
@@ -132,7 +133,7 @@
     interactive?: boolean;
     refocusOnBlur?: boolean;
     disconnectOnDestroy?: boolean | (() => boolean);
-    onRevealPath?: (path: string) => void;
+    onRevealPath?: (path: string, sourceSessionId: string) => void;
     /** "local" spawns the machine's own shell instead of an SSH session. */
     kind?: "ssh" | "local";
     startupScript?: string;
@@ -230,7 +231,7 @@
   let terminalSurfaceVisible = false;
 
   // Render state
-  let buffer = $state<Cell[][]>([]);
+  let buffer = $state.raw<Cell[][]>([]);
   let cursorPos = $state({ x: 0, y: 0 });
   let prevCursorY = 0;
   let rendererSized = false;
@@ -371,6 +372,15 @@
   let hoveredPath = $state<string | null>(null);
   let pendingTerminalUrl = $state<SafeTerminalUrl | null>(null);
   let openingTerminalUrl = $state(false);
+  let pendingTerminalPath = $state<{
+    path: string;
+    alternativePath: string | null;
+    intermediatePaths: string[];
+    choiceReason?: "source-location";
+    sessionId: string;
+    generation: number;
+    paneSessionId: string | null;
+  } | null>(null);
   let pendingSelectionRefresh = false;
   let selectionStart = $state<{ row: number; col: number } | null>(null);
   let selectionEnd = $state<{ row: number; col: number } | null>(null);
@@ -379,7 +389,8 @@
   let suppressBlurRefocus = false;
   let touchLongPressTimer: number | null = null;
   let touchPointerId: number | null = null;
-  let touchPointerStart: { x: number; y: number } | null = null;
+  let touchPointerStart: { x: number; y: number; link: ReturnType<typeof findTerminalLink>;
+    sessionId: string | null; generation: number } | null = null;
   let touchPointerMoved = false;
   let remoteTouchScroll = $state(false);
   let longPressTriggered = false;
@@ -394,6 +405,9 @@
     startX: number;
     startY: number;
     startCell: { row: number; col: number };
+    link: ReturnType<typeof findTerminalLink>;
+    sessionId: string | null;
+    generation: number;
   } | null = null;
   let selectionDragTarget: 'range' | 'start-handle' | 'end-handle' | null = null;
   let selectionHandleBoundary: 'selectionStart' | 'selectionEnd' | null = null;
@@ -655,16 +669,76 @@
   function findTerminalLink(point: { row: number; col: number }) {
     const url = findUrlAtCell(buffer, point);
     if (url) return { kind: "url" as const, value: url.url };
-    const path = isDesktopTarget && onRevealPath
+    // The pane publishes its session after replay; never reveal before the
+    // sidebar can bind the clicked path to that same session.
+    const path = isDesktopTarget && onRevealPath && connected && sessionId === existingSessionId
       ? findPathAtCell(buffer, point, parser?.getCurrentDirectoryUri() ?? null)
       : null;
-    return path ? { kind: "path" as const, value: path.path } : null;
+    if (!path) return null;
+    if ("alternativePath" in path) {
+      return { kind: "path" as const, value: path.path, alternativePath: path.alternativePath,
+        choiceReason: path.choiceReason, intermediatePaths: path.intermediatePaths ?? [] };
+    }
+    return { kind: "path" as const, value: path.path };
   }
 
-  function openTerminalLink(link: { kind: "url" | "path"; value: string }) {
-    if (link.kind === "path") onRevealPath?.(link.value);
-    else confirmAndOpenTerminalUrl(link.value);
+  function registerPathModal(_node: HTMLElement) {
+    terminalModalGate.enter();
+    return { destroy: () => terminalModalGate.exit() };
   }
+
+  function openTerminalLink(link: { kind: "url" | "path"; value: string;
+    alternativePath?: string | null; intermediatePaths?: string[];
+    choiceReason?: "source-location" }) {
+    if (link.kind === "url") {
+      confirmAndOpenTerminalUrl(link.value);
+      return;
+    }
+    if (!sessionId || !connected || sessionId !== existingSessionId) return;
+    if ("alternativePath" in link) {
+      pendingTerminalPath = {
+        path: link.value,
+        alternativePath: link.alternativePath ?? null,
+        intermediatePaths: link.intermediatePaths ?? [],
+        choiceReason: link.choiceReason,
+        sessionId,
+        generation: connectionGeneration,
+        paneSessionId: existingSessionId,
+      };
+    } else {
+      onRevealPath?.(link.value, sessionId);
+    }
+  }
+
+  function cancelPendingTerminalPath(refocus = true) {
+    pendingTerminalPath = null;
+    if (refocus) {
+      void tick().then(() => {
+        if (!destroyed && interactive && connected && !pendingTerminalPath &&
+          !terminalContainer?.closest("[inert]")) focusInput();
+      });
+    }
+  }
+
+  async function revealPendingTerminalPath(path: string) {
+    const pending = pendingTerminalPath;
+    if (!pending || (path !== pending.path && path !== pending.alternativePath &&
+      !pending.intermediatePaths.includes(path))) return;
+    cancelPendingTerminalPath(false);
+    await tick();
+    if (destroyed || !connected || sessionId !== pending.sessionId ||
+      connectionGeneration !== pending.generation || existingSessionId !== pending.paneSessionId) return;
+    onRevealPath?.(path, pending.sessionId);
+  }
+
+  $effect(() => {
+    const active = connected;
+    const paneSessionId = existingSessionId;
+    if (pendingTerminalPath && (!active || !interactive ||
+      paneSessionId !== pendingTerminalPath.paneSessionId)) {
+      cancelPendingTerminalPath(false);
+    }
+  });
 
   function confirmAndOpenTerminalUrl(url: string) {
     const safeUrl = validateTerminalUrl(url);
@@ -2732,6 +2806,7 @@
     if (reconnecting || disconnectRequested || destroyed) return;
     reconnecting = true;
     const generation = ++connectionGeneration;
+    cancelPendingTerminalPath(false);
     dismissPasteError();
     resumingSshData = false;
     replayBufferedChunks = null;
@@ -2985,7 +3060,7 @@
   }
 
   function focusInput() {
-    if (!interactive || selectionMode) return;
+    if (!interactive || selectionMode || pendingTerminalPath) return;
     hiddenInput?.focus();
   }
 
@@ -3060,8 +3135,8 @@
       // Rendered URLs take local precedence over remote TUI mouse reporting.
       const localSelectionOverride =
         e.button === 0 && e.shiftKey && shouldForwardTerminalMouseEvents();
-      const localUrlClick =
-        e.button === 0 && !!findTerminalLink(pointerToCell(e));
+      const linkAtDown = e.button === 0 ? findTerminalLink(pointerToCell(e)) : null;
+      const localUrlClick = linkAtDown !== null;
       if (shouldForwardTerminalMouseEvents() && !localSelectionOverride && !localUrlClick) {
         if (e.button < 0 || e.button > 2) return;
         e.preventDefault();
@@ -3096,6 +3171,9 @@
         startX: e.clientX,
         startY: e.clientY,
         startCell: pointerToCell(e),
+        link: linkAtDown,
+        sessionId,
+        generation: connectionGeneration,
       };
 
       if (scrollContainer && !scrollContainer.hasPointerCapture(e.pointerId)) {
@@ -3112,7 +3190,8 @@
 
     clearTouchLongPressTimer();
     touchPointerId = e.pointerId;
-    touchPointerStart = { x: e.clientX, y: e.clientY };
+    touchPointerStart = { x: e.clientX, y: e.clientY, link: findTerminalLink(pointerToCell(e)),
+      sessionId, generation: connectionGeneration };
     touchPointerMoved = false;
     longPressTriggered = false;
 
@@ -3283,6 +3362,7 @@
 
     if (pendingMouseClick?.pointerId === e.pointerId) {
       e.preventDefault();
+      const pressed = pendingMouseClick;
       const point = pointerToCell(e);
       const match = e.type === "pointerup" ? findTerminalLink(point) : null;
       pendingMouseClick = null;
@@ -3291,7 +3371,12 @@
         scrollContainer.releasePointerCapture(e.pointerId);
       }
 
-      if (match) {
+      if (match && pressed.link && interactive && pressed.sessionId === sessionId &&
+        pressed.generation === connectionGeneration &&
+        match.kind === pressed.link.kind && match.value === pressed.link.value &&
+        match.alternativePath === pressed.link.alternativePath &&
+        match.choiceReason === pressed.link.choiceReason &&
+        JSON.stringify(match.intermediatePaths) === JSON.stringify(pressed.link.intermediatePaths)) {
         openTerminalLink(match);
       } else {
         focusInput();
@@ -3330,12 +3415,23 @@
         !longPressTriggered &&
         touchPointerStart
       ) {
-        // Match mouse clicks: rendered URLs take precedence over TUI mouse reporting.
+        // A redraw or session switch between press and release must not act
+        // on a different path, even when the touch did not move.
+        const pressed = touchPointerStart;
         const match = findTerminalLink(pointerToCell(e));
         resetTouchLongPressState();
-        if (match) {
+        if (match && pressed.link && interactive && pressed.sessionId === sessionId &&
+          pressed.generation === connectionGeneration &&
+          match.kind === pressed.link.kind && match.value === pressed.link.value &&
+          match.alternativePath === pressed.link.alternativePath &&
+          match.choiceReason === pressed.link.choiceReason &&
+          JSON.stringify(match.intermediatePaths) === JSON.stringify(pressed.link.intermediatePaths)) {
           e.preventDefault();
           openTerminalLink(match);
+          focusInput();
+          return;
+        }
+        if (match || pressed.link) {
           focusInput();
           return;
         }
@@ -4861,6 +4957,7 @@
     }
     if (pasteErrorTimeout !== null) clearTimeout(pasteErrorTimeout);
     connectionGeneration++;
+    cancelPendingTerminalPath(false);
     if (hostKeyPromptResolver) resolveHostKeyPrompt("cancel");
     if (keyPassphrasePromptResolver) resolveKeyPassphrasePrompt(null);
     if (osc52ApprovalResolver) settleOsc52Approval(false);
@@ -5015,6 +5112,7 @@
     }
     const pendingWrites = isDesktopTarget && activeSessionId ? drainDesktopWrites(activeSessionId) : null;
     connectionGeneration++;
+    cancelPendingTerminalPath(false);
     if (hostKeyPromptResolver) resolveHostKeyPrompt("cancel");
     if (keyPassphrasePromptResolver) resolveKeyPassphrasePrompt(null);
     disconnectRequested = true;
@@ -5267,6 +5365,91 @@
       {#if selectionFeedback}
         <span class="selection-feedback">{selectionFeedback}</span>
       {/if}
+    </div>
+  {/if}
+
+  {#if isDesktopTarget && pendingTerminalPath}
+    <div
+      class="link-dialog-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="path-dialog-title"
+      aria-describedby="path-dialog-description"
+      tabindex="-1"
+      use:modalFocus={{
+        onClose: cancelPendingTerminalPath,
+        shouldRestoreFocus: () => interactive && connected && !destroyed,
+      }}
+      use:registerPathModal
+      onclick={(e) => e.stopPropagation()}
+      onpointerdown={(e) => e.stopPropagation()}
+    >
+      <div class="link-dialog-card path-dialog-card">
+        <div class="link-dialog-mark" aria-hidden="true">?</div>
+        <div class="link-dialog-content">
+          <p class="link-dialog-kicker">Terminal path</p>
+          <h2 id="path-dialog-title">Which path should open?</h2>
+          <p id="path-dialog-description" class="path-dialog-description">
+            {pendingTerminalPath.choiceReason === "source-location"
+              ? "The trailing numbers may be part of a filename or a source location. Choose the exact target; nothing opens automatically."
+              : "The terminal text crosses a row boundary. Choose the exact target; nothing opens automatically."}
+          </p>
+          <div class="path-dialog-choice">
+            <span class="path-dialog-label">{pendingTerminalPath.choiceReason === "source-location"
+              ? "Literal filename" : "Joined path (all visible rows)"}</span>
+            <code class="link-dialog-url path-dialog-value" dir="ltr">{pendingTerminalPath.path}</code>
+          </div>
+          {#if pendingTerminalPath.alternativePath !== null}
+            <div class="path-dialog-choice">
+              <span class="path-dialog-label">{pendingTerminalPath.choiceReason === "source-location"
+                ? "File without line numbers" : "First-row path (without the next row)"}</span>
+              <code class="link-dialog-url path-dialog-value" dir="ltr">{pendingTerminalPath.alternativePath}</code>
+            </div>
+          {/if}
+          {#each pendingTerminalPath.intermediatePaths as path, index}
+            <div class="path-dialog-choice">
+              <span class="path-dialog-label">Other possible path {index + 1}</span>
+              <code class="link-dialog-url path-dialog-value" dir="ltr">{path}</code>
+            </div>
+          {/each}
+        </div>
+        <div class="link-dialog-actions path-dialog-actions">
+          <button
+            type="button"
+            class="link-dialog-btn ghost"
+            data-modal-initial-focus
+            onclick={(e) => { swallowPointerClick(e); cancelPendingTerminalPath(); }}
+          >
+            Cancel
+          </button>
+          {#if pendingTerminalPath.alternativePath !== null}
+            <button
+              type="button"
+              class="link-dialog-btn ghost"
+              onclick={(e) => { swallowPointerClick(e); void revealPendingTerminalPath(pendingTerminalPath!.alternativePath!); }}
+            >
+              {pendingTerminalPath.choiceReason === "source-location"
+                ? "Open file without line numbers" : "Open first-row path"}
+            </button>
+          {/if}
+          {#each pendingTerminalPath.intermediatePaths as path, index}
+            <button
+              type="button"
+              class="link-dialog-btn ghost"
+              onclick={(e) => { swallowPointerClick(e); void revealPendingTerminalPath(path); }}
+            >
+              Open other path {index + 1}
+            </button>
+          {/each}
+          <button
+            type="button"
+            class="link-dialog-btn primary"
+            onclick={(e) => { swallowPointerClick(e); void revealPendingTerminalPath(pendingTerminalPath!.path); }}
+          >
+            {pendingTerminalPath.choiceReason === "source-location" ? "Open literal filename" : "Open joined path"}
+          </button>
+        </div>
+      </div>
     </div>
   {/if}
 
@@ -5704,6 +5887,39 @@
     box-shadow:
       0 24px 60px rgba(0, 0, 0, 0.54),
       inset 0 1px 0 color-mix(in srgb, var(--terminal-fg) 10%, transparent);
+  }
+
+  .path-dialog-card {
+    max-height: 100%;
+    overflow-y: auto;
+  }
+
+  .path-dialog-description {
+    margin: 10px 0 0;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  .path-dialog-choice {
+    margin-top: 14px;
+  }
+
+  .path-dialog-label {
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .path-dialog-value {
+    display: block;
+    margin-top: 6px;
+    white-space: pre-wrap;
+    unicode-bidi: isolate;
+  }
+
+  .link-dialog-actions.path-dialog-actions {
+    grid-template-columns: 1fr;
   }
 
   .link-dialog-mark {

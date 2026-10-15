@@ -72,6 +72,174 @@ export interface Cell {
   imagePlaceholder?: KittyPlaceholderCell;
   textSizing?: TerminalTextSizingCell;
 }
+// Row identity records exact soft-wrap/reflow ancestry across scrollback and
+// viewport copies. Weak keys disappear with their rows; padding added by a
+// wider viewport is not part of the original path text.
+const reflowSuccessors = new WeakMap<Cell[], Cell[]>();
+const reflowContentEnds = new WeakMap<Cell[], number>();
+const reflowSourceCells = new WeakMap<Cell[], Cell[]>();
+const reflowTails = new WeakMap<Cell[], Cell[]>();
+const reflowOutgoingCells = new WeakMap<Cell[], Set<Cell>>();
+const reflowIncomingCells = new WeakMap<Cell[], Set<Cell>>();
+const reflowIncomingNextColumn = new WeakMap<Cell[], number>();
+const unknownPredecessorRows = new WeakSet<Cell[]>();
+// Bind relative text to its printed OSC 7 directory, never the click-time cwd.
+// Shared empty cells cannot carry a directory and are ignored by the matcher.
+const printedDirectoryUris = new WeakMap<Cell, string>();
+export function printedDirectoryUri(cell: Cell): string | null {
+  return printedDirectoryUris.get(cell) ?? null;
+}
+// Snapshot rows retain their cells but not soft-wrap ancestry. A padded row
+// restored next to unrelated text cannot safely yield a boundary path.
+const unprovenSnapshotRows = new WeakMap<Cell[], Set<Cell>>();
+
+export function isUnprovenSnapshotRow(row: Cell[]): boolean {
+  const original = unprovenSnapshotRows.get(row);
+  // Insert/delete-character sequences move existing cells between columns.
+  // Uncertainty ends only after all pre-snapshot content has been replaced.
+  return unknownPredecessorRows.has(row) ||
+    (original ? row.some(cell => original.has(cell)) : false);
+}
+function markUnprovenSnapshotRow(row: Cell[]) {
+  let original: Set<Cell> | null = null;
+  for (const cell of row) {
+    if (cell.char.trim() || cell.char === "") (original ??= new Set()).add(cell);
+  }
+  if (original) unprovenSnapshotRows.set(row, original);
+}
+function markUnprovenSnapshotRows(rows: Cell[][]) {
+  for (const row of rows) markUnprovenSnapshotRow(row);
+}
+function transferUnprovenSnapshotRow(source: Cell[], target: Cell[]) {
+  if (unknownPredecessorRows.has(source)) unknownPredecessorRows.add(target);
+  const incoming = reflowIncomingCells.get(source);
+  if (incoming) {
+    let transferred: Set<Cell> | null = null;
+    for (let col = 0; col < Math.min(source.length, target.length); col++) {
+      if (incoming.has(source[col])) (transferred ??= new Set()).add(target[col]);
+    }
+    if (transferred) reflowIncomingCells.set(target, transferred);
+  }
+  const original = unprovenSnapshotRows.get(source);
+  if (!original) return;
+  let transferred: Set<Cell> | null = null;
+  for (let col = 0; col < Math.min(source.length, target.length); col++) {
+    if (original.has(source[col])) (transferred ??= new Set()).add(target[col]);
+  }
+  if (transferred) unprovenSnapshotRows.set(target, transferred);
+}
+function copyUnprovenSnapshotRow(source: Cell[], target: Cell[], start = 0, end = source.length) {
+  const original = unprovenSnapshotRows.get(source);
+  if (original) {
+    let retained: Set<Cell> | null = null;
+    for (let col = start; col < end; col++) {
+      const cell = source[col];
+      if (original.has(cell)) (retained ??= new Set()).add(cell);
+    }
+    if (retained) unprovenSnapshotRows.set(target, retained);
+  }
+  if (unknownPredecessorRows.has(source)) unknownPredecessorRows.add(target);
+  const outgoing = reflowOutgoingCells.get(source);
+  if (outgoing) {
+    let retained: Set<Cell> | null = null;
+    for (let col = start; col < end; col++) {
+      const cell = source[col];
+      if (outgoing.has(cell)) (retained ??= new Set()).add(cell);
+    }
+    if (retained) reflowOutgoingCells.set(target, retained);
+  }
+  const incoming = reflowIncomingCells.get(source);
+  if (incoming) {
+    let retained: Set<Cell> | null = null;
+    for (let col = start; col < end; col++) {
+      const cell = source[col];
+      if (incoming.has(cell)) (retained ??= new Set()).add(cell);
+    }
+    if (retained) reflowIncomingCells.set(target, retained);
+  }
+}
+function mightSpanBoundary(before: Cell[] | undefined, after: Cell[] | undefined): boolean {
+  if (!before || !after) return false;
+  const last = before.at(-1)?.char;
+  const prior = before.at(-2)?.char;
+  const endsAtEdge = !!last?.trim() || ((last === " " || last === "") && !!prior?.trim());
+  const startsAtEdge = !!after[0]?.char.trim() ||
+    (after[0]?.char === " " && !!after[1]?.char.trim());
+  return isReflowContinuation(before, after) || (endsAtEdge && startsAtEdge);
+}
+function markIfLostPredecessor(before: Cell[] | undefined, after: Cell[] | undefined) {
+  if (mightSpanBoundary(before, after)) markUnprovenSnapshotRow(after!);
+}
+function markChangedContinuation(before: Cell[] | undefined, after: Cell[] | undefined) {
+  if (!mightSpanBoundary(before, after)) return;
+  // Exact soft-wrap pairs already retain surviving source/suffix cells.
+  // Generic taint here would suppress a fully redrawn standalone successor.
+  if (isReflowContinuation(before!, after!)) return;
+  markUnprovenSnapshotRow(before!);
+  markUnprovenSnapshotRow(after!);
+}
+function markReflowTail(row: Cell[]) {
+  reflowTails.set(row, row.slice());
+}
+function recordReflowContinuation(before: Cell[], after: Cell[], end = before.length) {
+  reflowSuccessors.set(before, after);
+  reflowSourceCells.set(before, before.slice());
+  let outgoing: Set<Cell> | null = null;
+  for (const cell of before) {
+    if (cell.char.trim() || cell.char === "") (outgoing ??= new Set()).add(cell);
+  }
+  if (outgoing) reflowOutgoingCells.set(before, outgoing);
+  if (end < before.length) reflowContentEnds.set(before, end);
+  else reflowContentEnds.delete(before);
+  const incoming = new Set<Cell>();
+  for (const cell of after) {
+    if (cell.char.trim() || cell.char === "") incoming.add(cell);
+  }
+  reflowIncomingCells.set(after, incoming);
+  if (incoming.size === 0) reflowIncomingNextColumn.set(after, 0);
+  else reflowIncomingNextColumn.delete(after);
+}
+
+export function reflowContinuationEnd(before: Cell[], after: Cell[]): number | null {
+  if (reflowSuccessors.get(before) !== after) return null;
+  const original = reflowSourceCells.get(before);
+  if (!original || original.length !== before.length ||
+    original.some((cell, col) => before[col] !== cell)) return null;
+  return reflowContentEnds.get(before) ?? before.length;
+}
+
+export function isReflowContinuation(before: Cell[], after: Cell[]): boolean {
+  return reflowContinuationEnd(before, after) !== null;
+}
+
+export function isReflowTail(row: Cell[]): boolean {
+  const original = reflowTails.get(row);
+  return !!original && original.length === row.length &&
+    original.every((cell, col) => row[col] === cell);
+}
+export function hasReflowOutgoingContent(row: Cell[]): boolean {
+  const original = reflowOutgoingCells.get(row);
+  return original ? row.some(cell => original.has(cell)) : false;
+}
+export function hasReflowIncomingContent(row: Cell[]): boolean {
+  const original = reflowIncomingCells.get(row);
+  return original ? row.some(cell => original.has(cell)) : false;
+}
+function replaceRepaintedCell(row: Cell[], col: number, oldCell: Cell, updated: Cell) {
+  const unproven = unprovenSnapshotRows.get(row);
+  if (unproven?.delete(oldCell)) unproven.add(updated);
+  const outgoing = reflowOutgoingCells.get(row);
+  if (outgoing?.delete(oldCell)) outgoing.add(updated);
+  const incoming = reflowIncomingCells.get(row);
+  if (incoming?.delete(oldCell)) incoming.add(updated);
+  const cwd = printedDirectoryUris.get(oldCell);
+  if (cwd) printedDirectoryUris.set(updated, cwd);
+  const source = reflowSourceCells.get(row);
+  if (source?.[col] === oldCell) source[col] = updated;
+  const tail = reflowTails.get(row);
+  if (tail?.[col] === oldCell) tail[col] = updated;
+}
+
 interface KittyPlaceholderCell {
   renderId: number;
   imageId: number;
@@ -645,13 +813,19 @@ export class AnsiParser {
   }
 
   private cloneRow(row: Cell[], shareEmptyCells = false): Cell[] {
-    return row.map((cell) => shareEmptyCells && cell === this.emptyCell ? cell : ({
-      char: cell.char,
-      style: cell.style,
-      hyperlink: cell.hyperlink ? { ...cell.hyperlink } : undefined,
-      imagePlaceholder: cell.imagePlaceholder ? { ...cell.imagePlaceholder } : undefined,
-      textSizing: cell.textSizing ? { ...cell.textSizing } : undefined,
-    }));
+    return row.map((cell) => {
+      if (shareEmptyCells && cell === this.emptyCell) return cell;
+      const cloned: Cell = {
+        char: cell.char,
+        style: cell.style,
+        hyperlink: cell.hyperlink ? { ...cell.hyperlink } : undefined,
+        imagePlaceholder: cell.imagePlaceholder ? { ...cell.imagePlaceholder } : undefined,
+        textSizing: cell.textSizing ? { ...cell.textSizing } : undefined,
+      };
+      const cwd = printedDirectoryUris.get(cell);
+      if (cwd) printedDirectoryUris.set(cloned, cwd);
+      return cloned;
+    });
   }
 
   private cloneBuffer(buffer: Cell[][], shareEmptyCells = false): Cell[][] {
@@ -740,6 +914,24 @@ export class AnsiParser {
     const oldScrollTop = this.scrollTop;
     const oldScrollBottom = this.scrollBottom;
     const oldScrollbackLength = oldScrollback.length;
+    if (cols > oldCols && !this.usingAlternateScreen) {
+      const priorRows = oldScrollback.concat(oldBuffer);
+      for (let index = 0; index + 1 < priorRows.length; index++) {
+        const before = priorRows[index];
+        const after = priorRows[index + 1];
+        if (before.length !== oldCols || isReflowContinuation(before, after)) continue;
+        const edge = before[oldCols - 1]?.char;
+        const previous = before[oldCols - 2]?.char;
+        const mayContinue = edge?.trim() ||
+          ((edge === " " || edge === "") && previous?.trim());
+        const nextStarts = after[0]?.char.trim() ||
+          (after[0]?.char === " " && after[1]?.char.trim());
+        if (mayContinue && nextStarts) {
+          markUnprovenSnapshotRow(before);
+          markUnprovenSnapshotRow(after);
+        }
+      }
+    }
     const imageContentLengths = new Map<number, number>();
     for (const image of this.images) {
       imageContentLengths.set(
@@ -826,6 +1018,8 @@ export class AnsiParser {
           this.rowContentLength(row),
           origin ? (imageContentLengths.get(origin.oldRow) ?? 0) : 0,
         );
+        const predecessor = y > 0 ? nextBufferRows[y - 1] : nextScrollback.at(-1);
+        const continuesPrevious = predecessor && isReflowContinuation(predecessor, row);
         let pushed = 0;
         let start = 0;
         while (start < contentLength) {
@@ -842,7 +1036,16 @@ export class AnsiParser {
           ) {
             end -= 1;
           }
-          allRows.push(row.slice(start, end));
+          const chunk = row.slice(start, end);
+          copyUnprovenSnapshotRow(row, chunk, start, end);
+          if (pushed === 0 && continuesPrevious) {
+            const priorChunk = y > 0 ? allRows.at(-1) : predecessor;
+            if (priorChunk) recordReflowContinuation(priorChunk, chunk,
+              Math.min(priorChunk.length, reflowContinuationEnd(predecessor!, row) ?? priorChunk.length));
+          } else if (pushed > 0) {
+            recordReflowContinuation(allRows[allRows.length - 1], chunk);
+          }
+          allRows.push(chunk);
           allOrigins.push(
             origin
               ? {
@@ -856,6 +1059,7 @@ export class AnsiParser {
           start = end;
           pushed++;
         }
+        if (pushed > 0) markReflowTail(allRows[allRows.length - 1]);
         if (pushed === 0) {
           allRows.push([]);
           allOrigins.push(origin);
@@ -889,15 +1093,23 @@ export class AnsiParser {
     // Fit the reflowed screen into the viewport while keeping provenance in
     // lockstep. Rows above the cursor enter scrollback; rows below it drop.
     if (finalRows.length > rows) {
+      const droppedBottom = finalRows.length > finalCursorY + 1;
+      if (droppedBottom && finalRows[finalCursorY + 1]?.some(cell => cell.char.trim() || cell.char === "")) {
+        markUnprovenSnapshotRow(finalRows[finalCursorY]);
+      }
       const keptCount = Math.min(finalRows.length, finalCursorY + 1);
       finalRows = finalRows.slice(0, keptCount);
       finalOrigins = finalOrigins.slice(0, keptCount);
       const overflowCount = Math.max(0, finalRows.length - rows);
       if (overflowCount > 0) {
         if (!this.usingAlternateScreen) {
-          nextScrollback = this.tailScrollback(
-            nextScrollback.concat(finalRows.slice(0, overflowCount)),
-          );
+          const combined = nextScrollback.concat(finalRows.slice(0, overflowCount));
+          const retainedStart = Math.max(0, combined.length - this.maxScrollback);
+          if (retainedStart > 0) {
+            markIfLostPredecessor(combined[retainedStart - 1],
+              combined[retainedStart] ?? finalRows[overflowCount]);
+          }
+          nextScrollback = this.tailScrollback(combined);
           nextScrollbackOrigins = this.tailScrollback(
             nextScrollbackOrigins.concat(finalOrigins.slice(0, overflowCount)),
           );
@@ -913,6 +1125,10 @@ export class AnsiParser {
       }
     }
 
+    if (oldScrollback.length && nextScrollback.length && oldScrollback[0] !== nextScrollback[0]) {
+      const index = oldScrollback.indexOf(nextScrollback[0]);
+      if (index > 0) markIfLostPredecessor(oldScrollback[index - 1], nextScrollback[0]);
+    }
     this.scrollback = nextScrollback;
     this.buffer = this.createBuffer();
 
@@ -922,6 +1138,19 @@ export class AnsiParser {
       for (let x = 0; x < source.length && x < cols; x++) {
         this.buffer[y][x] = source[x];
       }
+      copyUnprovenSnapshotRow(source, this.buffer[y], 0, Math.min(source.length, cols));
+      if (isReflowTail(source)) markReflowTail(this.buffer[y]);
+    }
+    const scrollbackEnd = this.scrollback.at(-1);
+    if (scrollbackEnd && copyRows > 0 &&
+      isReflowContinuation(scrollbackEnd, finalRows[0])) {
+      recordReflowContinuation(scrollbackEnd, this.buffer[0],
+        reflowContinuationEnd(scrollbackEnd, finalRows[0]) ?? scrollbackEnd.length);
+    }
+    for (let y = 0; y + 1 < copyRows; y++) {
+      const end = reflowContinuationEnd(finalRows[y], finalRows[y + 1]);
+      if (end === null || end > cols) continue;
+      recordReflowContinuation(this.buffer[y], this.buffer[y + 1], end);
     }
 
     const anchorDestinations = new Map<
@@ -1609,7 +1838,11 @@ export class AnsiParser {
         for (let col = 0; col < row.length; col++) {
           const cell = row[col];
           const style = refresh(cell.style, true);
-          if (style !== cell.style) row[col] = { ...cell, style };
+          if (style !== cell.style) {
+            const updated = { ...cell, style };
+            replaceRepaintedCell(row, col, cell, updated);
+            row[col] = updated;
+          }
         }
       }
     }
@@ -4086,6 +4319,21 @@ export class AnsiParser {
 
     this.mainScreenBuffer = this.cloneBuffer(this.buffer, true);
     this.mainScreenScrollback = this.cloneBuffer(this.scrollback, true);
+    const originalRows = this.scrollback.concat(this.buffer);
+    const savedRows = this.mainScreenScrollback.concat(this.mainScreenBuffer);
+    for (let index = 0; index < originalRows.length; index++) {
+      if (isUnprovenSnapshotRow(originalRows[index])) {
+        transferUnprovenSnapshotRow(originalRows[index], savedRows[index]);
+      }
+      if (isReflowTail(originalRows[index]) ||
+        hasReflowOutgoingContent(originalRows[index]) ||
+        hasReflowIncomingContent(originalRows[index]) ||
+        (index > 0 && isReflowContinuation(originalRows[index - 1], originalRows[index])) ||
+        (index + 1 < originalRows.length &&
+          isReflowContinuation(originalRows[index], originalRows[index + 1]))) {
+        markUnprovenSnapshotRow(savedRows[index]);
+      }
+    }
     this.mainScreenCursor = { x: this.cursorX, y: this.cursorY };
     this.mainScreenScrollRegion = { top: this.scrollTop, bottom: this.scrollBottom };
     this.mainScreenImages = this.images;
@@ -4122,6 +4370,9 @@ export class AnsiParser {
       this.mainScreenBuffer.length > this.rows
         ? this.mainScreenBuffer.slice(0, this.mainScreenCursor.y + 1)
         : this.mainScreenBuffer;
+    const savedRows = this.mainScreenScrollback.concat(mainScreenBuffer ?? []);
+    const droppedSavedBottom = (this.mainScreenBuffer?.length ?? 0) -
+      (mainScreenBuffer?.length ?? 0);
     const restoredMainScreen = this.restoreViewportState(
       mainScreenBuffer ?? undefined,
       this.mainScreenScrollback,
@@ -4130,6 +4381,28 @@ export class AnsiParser {
     );
     this.buffer = this.mainScreenBuffer ? restoredMainScreen.buffer : this.createBuffer();
     this.scrollback = restoredMainScreen.scrollback;
+    // Only cloned rows with lost ancestry, changed width, or a dropped
+    // neighboring row are uncertain. Ordinary live one-line links survive.
+    const visibleRows = this.scrollback.concat(this.buffer);
+    for (let index = 0; index < visibleRows.length; index++) {
+      const saved = savedRows[index + restoredMainScreen.removedTopRows];
+      if (!saved) continue;
+      if (saved.length !== visibleRows[index].length) {
+        markUnprovenSnapshotRow(visibleRows[index]);
+      } else if (isUnprovenSnapshotRow(saved)) {
+        transferUnprovenSnapshotRow(saved, visibleRows[index]);
+      }
+    }
+    if (restoredMainScreen.removedTopRows > 0 && visibleRows.length) {
+      markUnprovenSnapshotRow(visibleRows[0]);
+    }
+    const lastRetained = Math.min(visibleRows.length - 1,
+      savedRows.length - 1 - restoredMainScreen.removedTopRows);
+    if ((droppedSavedBottom > 0 ||
+      savedRows.length > visibleRows.length + restoredMainScreen.removedTopRows) &&
+      lastRetained >= 0) {
+      markUnprovenSnapshotRow(visibleRows[lastRetained]);
+    }
     this.cursorX = Math.min(this.cols - 1, Math.max(0, this.mainScreenCursor.x));
     this.cursorY = restoredMainScreen.cursorY;
 
@@ -4165,10 +4438,17 @@ export class AnsiParser {
     this.markAllRowsDirty();
   }
 
+  private preservePathRowBoundaries(rowIndex: number) {
+    markChangedContinuation(this.buffer[rowIndex - 1] ?? this.scrollback.at(-1),
+      this.buffer[rowIndex]);
+    markChangedContinuation(this.buffer[rowIndex], this.buffer[rowIndex + 1]);
+  }
+
   private insertChars(count: number) {
     const row = this.buffer[this.cursorY];
     const amount = this.boundedCsiCount(count, this.cols - this.cursorX);
     if (amount === 0) return;
+    this.preservePathRowBoundaries(this.cursorY);
     const targets = new Map<string, number>();
     for (let col = this.cursorX; col < this.cols; col++) {
       const sizing = row[col].textSizing;
@@ -4190,6 +4470,7 @@ export class AnsiParser {
     const row = this.buffer[this.cursorY];
     const amount = this.boundedCsiCount(count, this.cols - this.cursorX);
     if (amount === 0) return;
+    this.preservePathRowBoundaries(this.cursorY);
     const targets = new Map<string, number>();
     for (let col = this.cursorX; col < this.cols; col++) {
       const sizing = row[col].textSizing;
@@ -4209,6 +4490,7 @@ export class AnsiParser {
   private eraseChars(count: number) {
     const row = this.buffer[this.cursorY];
     const amount = this.boundedCsiCount(count, this.cols - this.cursorX);
+    this.preservePathRowBoundaries(this.cursorY);
     this.eraseTextSizingIntersecting(
       this.cursorY,
       this.cursorY,
@@ -4224,6 +4506,11 @@ export class AnsiParser {
     if (this.cursorY < this.scrollTop || this.cursorY > this.scrollBottom) return;
 
     const amount = Math.min(Math.max(1, count), this.scrollBottom - this.cursorY + 1);
+    markChangedContinuation(this.buffer[this.cursorY - 1] ?? this.scrollback.at(-1),
+      this.buffer[this.cursorY]);
+    markChangedContinuation(this.buffer[this.scrollBottom], this.buffer[this.scrollBottom + 1]);
+    markChangedContinuation(this.buffer[this.scrollBottom - amount],
+      this.buffer[this.scrollBottom - amount + 1]);
     const splitTargets: number[] = [];
     for (let col = 0; col < this.cols; col++) {
       const sizing = this.buffer[this.cursorY][col].textSizing;
@@ -4249,6 +4536,11 @@ export class AnsiParser {
     if (this.cursorY < this.scrollTop || this.cursorY > this.scrollBottom) return;
 
     const amount = Math.min(Math.max(1, count), this.scrollBottom - this.cursorY + 1);
+    markChangedContinuation(this.buffer[this.cursorY - 1] ?? this.scrollback.at(-1),
+      this.buffer[this.cursorY]);
+    markChangedContinuation(this.buffer[this.cursorY + amount - 1],
+      this.buffer[this.cursorY + amount]);
+    markChangedContinuation(this.buffer[this.scrollBottom], this.buffer[this.scrollBottom + 1]);
     this.eraseTextSizingCrossingRowBoundary(this.scrollBottom + 1);
     this.eraseTextSizingIntersecting(
       this.cursorY,
@@ -4282,6 +4574,13 @@ export class AnsiParser {
   private scrollRegionUp(count: number, trackScrollback = false) {
     const amount = this.boundedCsiCount(count, this.scrollBottom - this.scrollTop + 1);
     if (!trackScrollback) {
+      markChangedContinuation(this.buffer[this.scrollTop - 1] ?? this.scrollback.at(-1),
+        this.buffer[this.scrollTop]);
+      markChangedContinuation(this.buffer[this.scrollTop + amount - 1],
+        this.buffer[this.scrollTop + amount]);
+      markChangedContinuation(this.buffer[this.scrollBottom], this.buffer[this.scrollBottom + 1]);
+    }
+    if (!trackScrollback) {
       this.eraseTextSizingCrossingRowBoundary(this.scrollBottom + 1);
       this.eraseTextSizingIntersecting(
         this.scrollTop,
@@ -4302,6 +4601,8 @@ export class AnsiParser {
         this.scrollback.push(removedLine);
         if (this.scrollback.length > this.maxScrollback) {
           this.eraseTextSizingInAbsoluteRow(0);
+          markIfLostPredecessor(this.scrollback[0], this.scrollback[1] ?? this.buffer[0]);
+          if (this.maxScrollback === 0) unknownPredecessorRows.add(this.buffer[this.scrollBottom]);
           this.scrollback.shift();
           droppedScrollbackRows++;
         }
@@ -4464,6 +4765,11 @@ export class AnsiParser {
 
   private scrollRegionDown(count: number) {
     const amount = this.boundedCsiCount(count, this.scrollBottom - this.scrollTop + 1);
+    markChangedContinuation(this.buffer[this.scrollTop - 1] ?? this.scrollback.at(-1),
+      this.buffer[this.scrollTop]);
+    markChangedContinuation(this.buffer[this.scrollBottom], this.buffer[this.scrollBottom + 1]);
+    markChangedContinuation(this.buffer[this.scrollBottom - amount],
+      this.buffer[this.scrollBottom - amount + 1]);
     this.eraseTextSizingCrossingRowBoundary(this.scrollTop);
     this.eraseTextSizingIntersecting(
       this.scrollBottom - amount + 1,
@@ -4953,8 +5259,10 @@ export class AnsiParser {
     const isWide = this.isWideChar(char);
     if (this.cursorX >= this.cols || (isWide && this.cursorX >= this.cols - 1)) {
       if (this.autoWrapMode) {
+        const previousRow = this.buffer[this.cursorY];
         this.cursorX = 0;
         this.lineFeed();
+        recordReflowContinuation(previousRow, this.buffer[this.cursorY]);
       } else {
         this.cursorX = Math.max(0, this.cols - (isWide ? 2 : 1));
       }
@@ -4985,6 +5293,20 @@ export class AnsiParser {
       this.kittyVirtualOriginsDirty = true;
     }
     this.buffer[this.cursorY][this.cursorX] = cell;
+    if (this.oscCurrentDirectoryUri && cell !== this.emptyCell) {
+      printedDirectoryUris.set(cell, this.oscCurrentDirectoryUri);
+    }
+    const incomingNext = reflowIncomingNextColumn.get(this.buffer[this.cursorY]);
+    if (incomingNext !== undefined) {
+      if (incomingNext === this.cursorX) {
+        if (cell.char.trim() || cell.char === "") {
+          reflowIncomingCells.get(this.buffer[this.cursorY])?.add(cell);
+        }
+        reflowIncomingNextColumn.set(this.buffer[this.cursorY], this.cursorX + (isWide ? 2 : 1));
+      } else {
+        reflowIncomingNextColumn.delete(this.buffer[this.cursorY]);
+      }
+    }
     if (cell.imagePlaceholder) {
       this.recordKittyVirtualOrigin(
         cell.imagePlaceholder,
@@ -5053,6 +5375,10 @@ export class AnsiParser {
 
   private eraseInDisplay(mode: number) {
     this.markFullBufferDirty();
+    if (mode === 0 || mode === 1) this.preservePathRowBoundaries(this.cursorY);
+    if (mode === 1 || mode === 2) {
+      markChangedContinuation(this.scrollback.at(-1), this.buffer[0]);
+    }
     if (mode === 0) {
       this.eraseTextSizingIntersecting(this.cursorY, this.cursorY, this.cursorX, this.cols - 1);
       this.eraseTextSizingIntersecting(this.cursorY + 1, this.rows - 1, 0, this.cols - 1);
@@ -5094,6 +5420,7 @@ export class AnsiParser {
 
   private eraseInLine(mode: number) {
     const row = this.buffer[this.cursorY];
+    this.preservePathRowBoundaries(this.cursorY);
     if (mode === 0) {
       this.eraseTextSizingIntersecting(this.cursorY, this.cursorY, this.cursorX, this.cols - 1);
       for (let x = this.cursorX; x < this.cols; x++) row[x] = this.createEmptyCell();
@@ -5299,6 +5626,8 @@ export class AnsiParser {
     const overflow = this.scrollback.length - bounded;
     if (overflow > 0) {
       for (let i = 0; i < overflow; i++) this.eraseTextSizingInAbsoluteRow(i);
+      markIfLostPredecessor(this.scrollback[overflow - 1],
+        this.scrollback[overflow] ?? this.buffer[0]);
       this.scrollback = this.scrollback.slice(overflow);
       this.rebaseImageRows(overflow);
     }
@@ -5861,6 +6190,8 @@ export class AnsiParser {
     );
     this.scrollback = restoredState.scrollback;
     this.buffer = restoredState.buffer;
+    markUnprovenSnapshotRows(this.scrollback);
+    markUnprovenSnapshotRows(this.buffer);
 
     this.cursorX = Math.min(this.cols - 1, Math.max(0, snapshot.cursorX));
     this.cursorY = restoredState.cursorY;
@@ -5908,6 +6239,8 @@ export class AnsiParser {
     );
     this.mainScreenBuffer = snapshot.mainScreenBufferRows ? restoredMainScreenState.buffer : null;
     this.mainScreenScrollback = restoredMainScreenState.scrollback;
+    markUnprovenSnapshotRows(this.mainScreenScrollback);
+    if (this.mainScreenBuffer) markUnprovenSnapshotRows(this.mainScreenBuffer);
     this.normalizeTextSizingRows(this.scrollback.concat(this.buffer));
     if (this.mainScreenBuffer) {
       this.normalizeTextSizingRows(this.mainScreenScrollback.concat(this.mainScreenBuffer));
