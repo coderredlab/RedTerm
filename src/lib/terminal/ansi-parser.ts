@@ -100,12 +100,17 @@ export function isUnprovenSnapshotRow(row: Cell[]): boolean {
   return unknownPredecessorRows.has(row) ||
     (original ? row.some(cell => original.has(cell)) : false);
 }
-function markUnprovenSnapshotRow(row: Cell[]) {
+function markUnprovenSnapshotRow(row: Cell[], start = 0, end = row.length) {
+  const previous = unprovenSnapshotRows.get(row);
   let original: Set<Cell> | null = null;
-  for (const cell of row) {
-    if (cell.char.trim() || cell.char === "") (original ??= new Set()).add(cell);
+  for (let col = 0; col < row.length; col++) {
+    const cell = row[col];
+    if ((col >= start && col < end && (cell.char.trim() || cell.char === "")) || previous?.has(cell)) {
+      (original ??= new Set()).add(cell);
+    }
   }
   if (original) unprovenSnapshotRows.set(row, original);
+  else unprovenSnapshotRows.delete(row);
 }
 function markUnprovenSnapshotRows(rows: Cell[][]) {
   for (const row of rows) markUnprovenSnapshotRow(row);
@@ -164,14 +169,67 @@ export function sliceTerminalPathRow(row: Cell[], start: number, end: number): C
   copyUnprovenSnapshotRow(row, sliced, start, Math.min(end, row.length));
   return sliced;
 }
+/** Shared by path detection and mutation invalidation; -1 means no supported indentation. */
+export function pathContinuationLeadingMargin(before: Cell[], after: Cell[]): number {
+  return pathLeadingMarginInRange(before, after, 0, before.length, after.length);
+}
+
+function pathLeadingMarginInRange(
+  before: Cell[], after: Cell[], start: number, beforeEnd: number, afterEnd: number,
+): number {
+  if (start >= beforeEnd || start >= afterEnd) return -1;
+  let leading = 0;
+  while (start + leading < afterEnd && after[start + leading].char === " ") leading++;
+  if (start + leading >= afterEnd || !after[start + leading].char.trim()) return -1;
+  if (leading <= 1) return leading;
+  let indentation = 0;
+  while (start + indentation < beforeEnd && before[start + indentation].char === " ") indentation++;
+  const marker = start + indentation;
+  const listContinuation = leading === indentation + 2 && marker + 1 < beforeEnd &&
+    /^[-+*]$/.test(before[marker].char) && before[marker + 1].char === " ";
+  return leading === indentation || listContinuation ? leading : -1;
+}
+
+function mightSpanPathRange(
+  before: Cell[], after: Cell[], start: number, beforeEnd: number, afterEnd: number,
+  boundedPane: boolean,
+): boolean {
+  const leading = pathLeadingMarginInRange(before, after, start, beforeEnd, afterEnd);
+  if (leading < 0) return false;
+  const limit = isReflowTail(before) && leading > 0 ? beforeEnd - start : boundedPane ? 2 : 1;
+  let end = beforeEnd - 1, trailing = 0;
+  while (end >= start && trailing < limit && before[end].char === " ") { end--; trailing++; }
+  if (end >= start && before[end].char === "") end--;
+  return end >= start && !!before[end].char.trim();
+}
+
+function visiblePathDivider(cell: Cell | undefined): boolean {
+  return !!cell && cell.char.length === 1 && "│┃║".includes(cell.char) &&
+    !cell.style.hidden && !cell.hyperlink;
+}
+
+/** Use the same three-row pane boundary for matching and partial mutation guards. */
+export function isTerminalPathDividerColumn(buffer: Cell[][], row: number, col: number): boolean {
+  if (buffer.length < 3) return false;
+  const top = Math.max(0, Math.min(row - 1, buffer.length - 3));
+  return visiblePathDivider(buffer[top]?.[col]) && visiblePathDivider(buffer[top + 1]?.[col]) &&
+    visiblePathDivider(buffer[top + 2]?.[col]);
+}
+
 function mightSpanBoundary(before: Cell[] | undefined, after: Cell[] | undefined): boolean {
   if (!before || !after) return false;
-  const last = before.at(-1)?.char;
-  const prior = before.at(-2)?.char;
-  const endsAtEdge = !!last?.trim() || ((last === " " || last === "") && !!prior?.trim());
-  const startsAtEdge = !!after[0]?.char.trim() ||
-    (after[0]?.char === " " && !!after[1]?.char.trim());
-  return isReflowContinuation(before, after) || (endsAtEdge && startsAtEdge);
+  if (isReflowContinuation(before, after)) return true;
+  if (mightSpanPathRange(before, after, 0, before.length, after.length, false)) return true;
+  // A disappearing neighboring row must not turn sidebar differences into proof
+  // that an otherwise identical pane continuation was a complete standalone path.
+  let start = 0, bounded = false;
+  for (let col = 0; col < Math.min(before.length, after.length); col++) {
+    if (!visiblePathDivider(before[col]) || !visiblePathDivider(after[col])) continue;
+    if (mightSpanPathRange(before, after, start, col, col, true)) return true;
+    start = col + 1;
+    bounded = true;
+  }
+  return bounded && mightSpanPathRange(before, after, start, before.length, after.length, true);
 }
 function markIfLostPredecessor(before: Cell[] | undefined, after: Cell[] | undefined) {
   if (mightSpanBoundary(before, after)) markUnprovenSnapshotRow(after!);
@@ -183,6 +241,15 @@ function markChangedContinuation(before: Cell[] | undefined, after: Cell[] | und
   if (isReflowContinuation(before!, after!)) return;
   markUnprovenSnapshotRow(before!);
   markUnprovenSnapshotRow(after!);
+}
+function markChangedPathRange(
+  before: Cell[] | undefined, after: Cell[] | undefined, start: number, end: number,
+) {
+  if (!before || !after || isReflowContinuation(before, after)) return;
+  const beforeEnd = Math.min(end, before.length), afterEnd = Math.min(end, after.length);
+  if (!mightSpanPathRange(before, after, start, beforeEnd, afterEnd, true)) return;
+  markUnprovenSnapshotRow(before, start, beforeEnd);
+  markUnprovenSnapshotRow(after, start, afterEnd);
 }
 function markReflowTail(row: Cell[]) {
   reflowTails.set(row, row.slice());
@@ -4444,17 +4511,45 @@ export class AnsiParser {
     this.markAllRowsDirty();
   }
 
-  private preservePathRowBoundaries(rowIndex: number) {
-    markChangedContinuation(this.buffer[rowIndex - 1] ?? this.scrollback.at(-1),
-      this.buffer[rowIndex]);
-    markChangedContinuation(this.buffer[rowIndex], this.buffer[rowIndex + 1]);
+  private preservePathRowBoundaries(rowIndex: number, from = 0, to = this.cols) {
+    const row = this.buffer[rowIndex];
+    if (row[from]?.char === "") from = Math.max(0, from - 1);
+    if (row[to]?.char === "") to = Math.min(this.cols, to + 1);
+    let partial = from > 0 || to < this.cols;
+    if (partial) {
+      for (let col = from; col < to; col++) {
+        if (row[col]?.textSizing) { partial = false; break; }
+      }
+    }
+    if (partial) {
+      let start = 0, bounded = false;
+      for (let col = 0; col < this.cols; col++) {
+        if (!isTerminalPathDividerColumn(this.buffer, rowIndex, col)) continue;
+        this.preservePathPaneBoundary(rowIndex, start, col, from, to);
+        start = col + 1;
+        bounded = true;
+      }
+      if (bounded) {
+        this.preservePathPaneBoundary(rowIndex, start, this.cols, from, to);
+        return;
+      }
+    }
+    markChangedContinuation(this.buffer[rowIndex - 1] ?? this.scrollback.at(-1), row);
+    markChangedContinuation(row, this.buffer[rowIndex + 1]);
+  }
+
+  private preservePathPaneBoundary(rowIndex: number, start: number, end: number, from: number, to: number) {
+    if (to <= Math.max(0, start - 1) || from >= Math.min(this.cols, end + 1)) return;
+    markChangedPathRange(this.buffer[rowIndex - 1] ?? this.scrollback.at(-1),
+      this.buffer[rowIndex], start, end);
+    markChangedPathRange(this.buffer[rowIndex], this.buffer[rowIndex + 1], start, end);
   }
 
   private insertChars(count: number) {
     const row = this.buffer[this.cursorY];
     const amount = this.boundedCsiCount(count, this.cols - this.cursorX);
     if (amount === 0) return;
-    this.preservePathRowBoundaries(this.cursorY);
+    this.preservePathRowBoundaries(this.cursorY, this.cursorX);
     const targets = new Map<string, number>();
     for (let col = this.cursorX; col < this.cols; col++) {
       const sizing = row[col].textSizing;
@@ -4476,7 +4571,7 @@ export class AnsiParser {
     const row = this.buffer[this.cursorY];
     const amount = this.boundedCsiCount(count, this.cols - this.cursorX);
     if (amount === 0) return;
-    this.preservePathRowBoundaries(this.cursorY);
+    this.preservePathRowBoundaries(this.cursorY, this.cursorX);
     const targets = new Map<string, number>();
     for (let col = this.cursorX; col < this.cols; col++) {
       const sizing = row[col].textSizing;
@@ -4496,7 +4591,7 @@ export class AnsiParser {
   private eraseChars(count: number) {
     const row = this.buffer[this.cursorY];
     const amount = this.boundedCsiCount(count, this.cols - this.cursorX);
-    this.preservePathRowBoundaries(this.cursorY);
+    this.preservePathRowBoundaries(this.cursorY, this.cursorX, this.cursorX + amount);
     this.eraseTextSizingIntersecting(
       this.cursorY,
       this.cursorY,
@@ -5381,8 +5476,13 @@ export class AnsiParser {
 
   private eraseInDisplay(mode: number) {
     this.markFullBufferDirty();
-    if (mode === 0 || mode === 1) this.preservePathRowBoundaries(this.cursorY);
-    if (mode === 1 || mode === 2) {
+    if (mode === 0 && this.cursorY + 1 < this.rows) {
+      markChangedContinuation(this.buffer[this.cursorY], this.buffer[this.cursorY + 1]);
+    }
+    if (mode === 1 && this.cursorY > 0) {
+      markChangedContinuation(this.buffer[this.cursorY - 1], this.buffer[this.cursorY]);
+    }
+    if (mode === 2 || (mode === 1 && this.cursorY > 0)) {
       markChangedContinuation(this.scrollback.at(-1), this.buffer[0]);
     }
     if (mode === 0) {
@@ -5426,7 +5526,8 @@ export class AnsiParser {
 
   private eraseInLine(mode: number) {
     const row = this.buffer[this.cursorY];
-    this.preservePathRowBoundaries(this.cursorY);
+    this.preservePathRowBoundaries(this.cursorY, mode === 0 ? this.cursorX : 0,
+      mode === 1 ? this.cursorX + 1 : this.cols);
     if (mode === 0) {
       this.eraseTextSizingIntersecting(this.cursorY, this.cursorY, this.cursorX, this.cols - 1);
       for (let x = this.cursorX; x < this.cols; x++) row[x] = this.createEmptyCell();

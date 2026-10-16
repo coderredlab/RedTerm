@@ -59,7 +59,7 @@ test("uses OSC 8 file and absolute targets even when labels span rows", () => {
   expect(findPathAtCell(hidden, { row: 0, col: 4 })).toBeNull();
 });
 
-test("requires a choice for plain paths spanning terminal rows", () => {
+test("preserves candidate boundaries for plain paths spanning terminal rows", () => {
   const path = "/home/coderred/Projects/coderred-video/exports/shorts/tech/202610/rea-reverse-engineer-anything-easy-shorts/rea-reverse-engineer-anything-easy-shorts.mp4";
   const parser = new AnsiParser(100, 5);
   parser.write(`(${path})`);
@@ -150,7 +150,7 @@ test("never opens a path cut off by a linked next-row suffix", () => {
   expect(findPathAtCell(parser.getBuffer(), { row: 1, col: 1 })).toBeNull();
 });
 
-test("reflowed scrollback rows with different widths require a choice", () => {
+test("reflowed scrollback rows with different widths retain alternative targets", () => {
   const path = `/tmp/${"a".repeat(32)}`;
   const parser = new AnsiParser(30, 3);
   parser.write(`${path}\r\n${"X".repeat(30)}\r\n${"Y".repeat(30)}`);
@@ -602,7 +602,7 @@ test("relative displayed paths without OSC 7 require automatic workspace lookup"
       choiceReason: "relative-path" });
 });
 
-test("underlined labels use the adjacent displayed target only after confirmation", () => {
+test("underlined labels identify their adjacent displayed target for verification", () => {
   const parser = new AnsiParser(100, 4);
   parser.write("\x1b[4mOpen video\x1b[0m (/home/me/video.mp4)\r\n");
   parser.write("\x1b[4mYouTube copy\x1b[0m (exports/shorts/youtube-shorts.md)");
@@ -732,4 +732,125 @@ test("wrapped rendered labels do not bridge obscured or snapshot continuation ro
     }
     expect(findPathAtCell(buffer, { row: 0, col: 3 })).toBeNull();
   }
+});
+
+test("recognizes file URIs across matching Markdown continuation indentation", () => {
+  const path = "/home/me/exports/apple-homeview-family-screen-explained-shorts/apple-homeview-family-screen-explained-shorts.mp4";
+  const uri = `file://${path}`;
+  for (const indentation of [2, 3, 4]) {
+    const padding = " ".repeat(indentation);
+    const split = 80 - indentation - 2;
+    const parser = new AnsiParser(80, 5);
+    parser.write(`\x1b[?7l${padding}\x1b[4mOpen video\x1b[0m\r\n${padding}(${uri.slice(0, split)} \r\n${padding}${uri.slice(split)})`);
+    for (const point of [
+      { row: 0, col: indentation + 2 },
+      { row: 1, col: indentation + 8 },
+      { row: 2, col: indentation + 4 },
+    ]) expect(findPathAtCell(parser.getBuffer(), point)?.path).toBe(path);
+  }
+});
+
+test("indented continuations cannot hide a linked or concealed middle margin cell", () => {
+  const path = `/tmp/${"a".repeat(90)}.mp4`;
+  for (const linked of [false, true]) {
+    const parser = new AnsiParser(80, 4);
+    parser.write(`\x1b[?7l   (${path.slice(0, 75)} \r\n   ${path.slice(75)})`);
+    const buffer = parser.getBuffer();
+    const margin = buffer[1][1];
+    buffer[1][1] = linked
+      ? { ...margin, hyperlink: { uri: "https://example.com", id: "other" } }
+      : { ...margin, style: { ...margin.style, hidden: true } };
+    expect(findPathAtCell(buffer, { row: 0, col: 12 })).toBeNull();
+    expect(findPathAtCell(buffer, { row: 1, col: 6 })).toBeNull();
+  }
+});
+
+test("Markdown indentation survives real pane clipping and both right margins", () => {
+  const path = "/home/me/exports/family-screen-explained-shorts/family-screen-explained-shorts.mp4";
+  const uri = `file://${path}`;
+  for (const margin of [1, 2]) {
+    const parser = new AnsiParser(104, 5);
+    parser.write("\x1b[?7l");
+    for (let line = 1; line <= 5; line++) {
+      parser.write(`\x1b[${line};1H/sidebar/file\x1b[${line};16H│\x1b[${line};97H│`);
+    }
+    const split = 80 - 4 - margin;
+    parser.write(`\x1b[1;17H   \x1b[4mOpen video\x1b[0m`);
+    parser.write(`\x1b[2;17H   (${uri.slice(0, split)}${" ".repeat(margin)}`);
+    parser.write(`\x1b[3;17H   ${uri.slice(split)})`);
+    for (const point of [{ row: 0, col: 21 }, { row: 1, col: 30 }, { row: 2, col: 25 }]) {
+      expect(findPathAtCell(parser.getBuffer(), point)?.path).toBe(path);
+    }
+  }
+});
+
+test("mutating an indented continuation cannot expose its surviving prefix", () => {
+  for (const command of ["2K", "M", "J"]) {
+    const parser = new AnsiParser(16, 3);
+    parser.write("   /tmp/fooABCD \r\n   /baz");
+    expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 6 })?.path).toBe("/tmp/fooABCD/baz");
+    parser.write(`\x1b[2;1H\x1b[${command}`);
+    expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 6 })).toBeNull();
+  }
+});
+
+test("evicting an indented predecessor cannot expose its surviving suffix", () => {
+  const parser = new AnsiParser(16, 1);
+  parser.write("   /tmp/fooABCD \r\n   /baz");
+  parser.setMaxScrollback(0);
+  expect(findPathAtCell(parser.getFullBuffer(), { row: 0, col: 5 })).toBeNull();
+});
+
+test("erasing a composed continuation with two right margins invalidates its prefix", () => {
+  const parser = new AnsiParser(17, 3);
+  parser.write("\x1b[?7l│   /tmp/xxxxxx  \r\n│   /baz\r\n│");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 7 })?.path).toBe("/tmp/xxxxxx/baz");
+  parser.write("\x1b[2;2H\x1b[K");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 7 })).toBeNull();
+});
+
+test("ordinary trailing whitespace does not create a two-margin pane boundary", () => {
+  const parser = new AnsiParser(16, 3);
+  parser.write("   /tmp/fooABC  \r\n   unrelated");
+  parser.write("\x1b[2;1H\x1b[2K");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 6 })?.path).toBe("/tmp/fooABC");
+});
+
+test("pane-local mutation guards ignore differing sidebar indentation", () => {
+  for (const mutation of ["\x1b[2;7H\x1b[K", "\x1b[1;1H\x1b[M"]) {
+    const parser = new AnsiParser(22, 4);
+    parser.write("\x1b[?7lX    │   /tmp/fooABCD \r\n     │   /baz\r\n     │\r\n     │");
+    expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 12 })?.path).toBe("/tmp/fooABCD/baz");
+    parser.write(mutation);
+    expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 12 })).toBeNull();
+  }
+});
+
+test("pane-local eviction retains lost ancestry despite changing sidebar content", () => {
+  const parser = new AnsiParser(22, 1);
+  parser.write("\x1b[?7lX    │   /tmp/fooABCD \r\n     │   /baz");
+  parser.setMaxScrollback(0);
+  expect(findPathAtCell(parser.getFullBuffer(), { row: 0, col: 11 })).toBeNull();
+});
+
+test("sidebar-only erasure leaves the untouched composed file link actionable", () => {
+  for (const sidebar of [["X    ", "     ", "     "], ["abcde", "vwxyz", "alpha"]]) {
+    for (const mutation of ["\x1b[1;1H\x1b[5X", "\x1b[1;5H\x1b[1K", "\x1b[1;5H\x1b[1J"]) {
+      const parser = new AnsiParser(22, 3);
+      parser.write(`\x1b[?7l${sidebar[0]}│   /tmp/fooABCD \r\n${sidebar[1]}│   /baz\r\n${sidebar[2]}│`);
+      parser.write(mutation);
+      expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 12 })?.path).toBe("/tmp/fooABCD/baz");
+    }
+  }
+});
+
+test("uncertainty in one pane survives a later mutation in another pane", () => {
+  const parser = new AnsiParser(33, 3);
+  parser.write(`\x1b[?7l /tmp/leftABCDE │ /tmp/rightABCD \r\n${" tail".padEnd(16)}│${" tail".padEnd(16)}\r\n${" ".repeat(16)}│`);
+  parser.write("\x1b[2;1H\x1b[16X");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 5 })).toBeNull();
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 23 })?.path).toBe("/tmp/rightABCDtail");
+  parser.write("\x1b[2;18H\x1b[16X");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 5 })).toBeNull();
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 23 })).toBeNull();
 });

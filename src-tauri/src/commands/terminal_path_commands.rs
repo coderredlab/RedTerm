@@ -43,6 +43,21 @@ struct HerdrSession {
 }
 
 #[derive(Deserialize)]
+struct WorkspaceResponse {
+    result: WorkspaceList,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceList {
+    workspaces: Vec<HerdrWorkspace>,
+}
+
+#[derive(Deserialize)]
+struct HerdrWorkspace {
+    workspace_id: String,
+}
+
+#[derive(Deserialize)]
 struct PaneResponse {
     result: PaneList,
 }
@@ -70,30 +85,35 @@ fn unsafe_text(text: &str) -> bool {
     })
 }
 
-fn relative_requests(paths: Vec<String>) -> Result<Vec<String>, String> {
+fn path_requests(paths: Vec<String>) -> Result<Vec<String>, String> {
     if paths.is_empty() || paths.len() > MAX_REQUESTS {
-        return Err("Path lookup requires between 1 and 32 relative paths".to_string());
+        return Err("Path lookup requires between 1 and 32 paths".to_string());
     }
     let mut unique = HashSet::new();
     let mut result = Vec::new();
     for path in paths {
-        let has_scheme = path.split_once(':').is_some_and(|(prefix, _)| {
-            let mut bytes = prefix.bytes();
-            bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
-                && bytes
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-        });
+        let drive_absolute = is_drive_absolute(&path);
+        let has_scheme = !drive_absolute
+            && path.split_once(':').is_some_and(|(prefix, _)| {
+                let mut bytes = prefix.bytes();
+                bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+                    && bytes.all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+                    })
+            });
         if path.is_empty()
             || path.len() > MAX_PATH_BYTES
             || unsafe_text(&path)
-            || path.starts_with(['/', '\\', '~'])
-            || has_scheme
+            || path.starts_with("//")
             || path.contains('\\')
+            || has_scheme
+            || (path.starts_with('~') && path != "~" && !path.starts_with("~/"))
             || path.split('/').any(|part| part == "..")
-            || !path.split('/').any(|part| !part.is_empty() && part != ".")
+            || (path != "/" && !path.split('/').any(|part| !part.is_empty() && part != "."))
         {
             return Err(
-                "Path lookup accepts only safe relative paths without parent traversal".to_string(),
+                "Path lookup accepts only safe filesystem paths without parent traversal"
+                    .to_string(),
             );
         }
         if unique.insert(path.clone()) {
@@ -101,6 +121,15 @@ fn relative_requests(paths: Vec<String>) -> Result<Vec<String>, String> {
         }
     }
     Ok(result)
+}
+
+fn is_drive_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1..3] == *b":/"
+}
+
+fn is_explicit_path(path: &str) -> bool {
+    path.starts_with('/') || path.starts_with('~') || is_drive_absolute(path)
 }
 
 fn running_session_names(json: &str) -> Result<Vec<String>, String> {
@@ -124,6 +153,25 @@ fn running_session_names(json: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(names)
+}
+
+fn workspace_ids(json: &str) -> Result<Vec<String>, String> {
+    let response: WorkspaceResponse = serde_json::from_str(json)
+        .map_err(|error| format!("Failed to parse Herdr workspace metadata: {error}"))?;
+    let mut ids = Vec::new();
+    for workspace in response.result.workspaces {
+        let id = workspace.workspace_id;
+        if id.is_empty() || id.len() > 256 || id.starts_with('-') || unsafe_text(&id) {
+            return Err("Herdr returned an unsafe workspace ID".to_string());
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+            if ids.len() > MAX_DIRECTORIES {
+                return Err("Too many Herdr workspaces for safe path lookup".to_string());
+            }
+        }
+    }
+    Ok(ids)
 }
 
 fn workspace_directories(json: &str, host: HostPaths) -> Result<Vec<String>, String> {
@@ -196,50 +244,111 @@ fn candidate_paths(
     paths: &[String],
     directories: &[String],
     host: HostPaths,
+    home: Option<&str>,
 ) -> Result<Vec<TerminalPathResolution>, String> {
-    if paths.len().saturating_mul(directories.len()) > MAX_STAT_PAIRS {
-        return Err("Too many workspace/path combinations for safe path lookup".to_string());
-    }
     let mut candidates = Vec::new();
     let mut unique = HashSet::new();
     for source in paths {
-        let mut relative = String::with_capacity(source.len());
-        for part in source
+        let normalized = source
             .split('/')
             .filter(|part| !part.is_empty() && *part != ".")
-        {
-            if !relative.is_empty() {
-                relative.push('/');
+            .collect::<Vec<_>>()
+            .join("/");
+        let targets = if source == "~" || source.starts_with("~/") {
+            let home = home.ok_or("Home directory is unavailable for path lookup")?;
+            let suffix = normalized.strip_prefix("~/").unwrap_or("");
+            vec![if suffix.is_empty() {
+                home.to_string()
+            } else {
+                format!("{}/{suffix}", home.trim_end_matches('/'))
+            }]
+        } else if source.starts_with('/') {
+            vec![format!("/{normalized}")]
+        } else if is_drive_absolute(source) {
+            if matches!(host, HostPaths::Posix) || !cfg!(windows) {
+                continue;
             }
-            relative.push_str(part);
-        }
-        #[cfg(windows)]
-        if matches!(host, HostPaths::Local) && relative.contains(':') {
-            // NTFS stream/invalid-name syntax is not a browsable directory entry.
-            // Keep the valid source-location alternatives in the same batch.
-            continue;
-        }
-        for directory in directories {
-            let target = match host {
-                HostPaths::Posix => format!("{}/{relative}", directory.trim_end_matches('/')),
-                HostPaths::Local => Path::new(directory)
-                    .join(&relative)
-                    .to_str()
-                    .ok_or("Workspace path is not valid Unicode")?
-                    .replace('\\', "/"),
-            };
+            vec![normalized.clone()]
+        } else {
+            directories
+                .iter()
+                .map(|directory| match host {
+                    HostPaths::Posix => {
+                        format!("{}/{normalized}", directory.trim_end_matches('/'))
+                    }
+                    HostPaths::Local => Path::new(directory)
+                        .join(&normalized)
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                })
+                .collect()
+        };
+        for target in targets {
+            #[cfg(windows)]
+            if matches!(host, HostPaths::Local) && invalid_windows_path(&target) {
+                // A literal POSIX filename may have a valid stripped alternative.
+                continue;
+            }
             if target.len() > MAX_PATH_BYTES {
-                return Err("Resolved workspace path is too long".to_string());
+                return Err("Resolved filesystem path is too long".to_string());
             }
-            if unique.insert(target.clone()) {
+            // Preserve source aliases: the UI must know which requested candidate exists.
+            if unique.insert((source.clone(), target.clone())) {
                 candidates.push(TerminalPathResolution {
                     source: source.clone(),
                     target,
                 });
+                if candidates.len() > MAX_STAT_PAIRS {
+                    return Err(
+                        "Too many workspace/path combinations for safe path lookup".to_string()
+                    );
+                }
             }
         }
     }
     Ok(candidates)
+}
+
+#[cfg(windows)]
+fn invalid_windows_path(path: &str) -> bool {
+    let tail = if is_drive_absolute(path) {
+        &path[3..]
+    } else {
+        path
+    };
+    tail.split('/').any(|part| {
+        part.contains([':', '*', '?', '"', '<', '>', '|'])
+            || part.ends_with(['.', ' '])
+            || matches!(
+                part.split('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_uppercase()
+                    .as_str(),
+                "CON"
+                    | "PRN"
+                    | "AUX"
+                    | "NUL"
+                    | "COM1"
+                    | "COM2"
+                    | "COM3"
+                    | "COM4"
+                    | "COM5"
+                    | "COM6"
+                    | "COM7"
+                    | "COM8"
+                    | "COM9"
+                    | "LPT1"
+                    | "LPT2"
+                    | "LPT3"
+                    | "LPT4"
+                    | "LPT5"
+                    | "LPT6"
+                    | "LPT7"
+                    | "LPT8"
+                    | "LPT9"
+            )
+    })
 }
 
 fn quote_posix(value: &str) -> String {
@@ -249,14 +358,19 @@ fn quote_posix(value: &str) -> String {
 async fn remote_metadata(
     connection: &SshConnection,
     session: Option<&str>,
+    workspace: Option<&str>,
 ) -> Result<String, String> {
-    // Only metadata-derived names enter a fixed read-only command, as one quoted argument.
-    // Terminal text never enters a shell command or the interactive PTY.
-    let command = match session {
-        None => format!("{REMOTE_HERDR_PREFIX} session list --json"),
-        Some(name) => format!(
-            "{REMOTE_HERDR_PREFIX} --session {} pane list",
+    // Only validated metadata identifiers enter shell arguments, never path text.
+    let command = match (session, workspace) {
+        (None, _) => format!("{REMOTE_HERDR_PREFIX} session list --json"),
+        (Some(name), None) => format!(
+            "{REMOTE_HERDR_PREFIX} --session {} workspace list",
             quote_posix(name)
+        ),
+        (Some(name), Some(workspace)) => format!(
+            "{REMOTE_HERDR_PREFIX} --session {} pane list --workspace {}",
+            quote_posix(name),
+            quote_posix(workspace)
         ),
     };
     let (status, stdout, stderr) =
@@ -264,6 +378,9 @@ async fn remote_metadata(
             .await
             .map_err(|_| "Herdr metadata query timed out".to_string())?
             .map_err(|error| format!("Herdr metadata query failed: {error}"))?;
+    if stdout.len() + stderr.len() > MAX_METADATA_BYTES {
+        return Err("Herdr metadata output exceeded 64 KiB".to_string());
+    }
     if status != Some(0) || !stderr.is_empty() {
         return Err(format!(
             "Herdr metadata query failed (exit {status:?}): {stderr}"
@@ -285,7 +402,7 @@ async fn bounded_pipe(mut pipe: impl AsyncRead + Unpin) -> Result<Vec<u8>, Strin
     Ok(bytes)
 }
 
-async fn local_metadata(session: Option<&str>) -> Result<String, String> {
+async fn local_metadata(session: Option<&str>, workspace: Option<&str>) -> Result<String, String> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .ok_or("Home directory not found")?;
@@ -307,12 +424,15 @@ async fn local_metadata(session: Option<&str>) -> Result<String, String> {
             command.env_remove(key);
         }
     }
-    match session {
-        None => {
+    match (session, workspace) {
+        (None, _) => {
             command.args(["session", "list", "--json"]);
         }
-        Some(name) => {
-            command.args(["--session", name, "pane", "list"]);
+        (Some(name), None) => {
+            command.args(["--session", name, "workspace", "list"]);
+        }
+        (Some(name), Some(workspace)) => {
+            command.args(["--session", name, "pane", "list", "--workspace", workspace]);
         }
     }
     command
@@ -357,9 +477,8 @@ fn local_scope_directories(directories: Vec<String>) -> Result<Vec<String>, Stri
     let mut eligible = Vec::new();
     for directory in directories {
         let path = Path::new(&directory);
-        // Herdr lists every live workspace. Exclude unsupported roots before
-        // touching their filesystem, rather than letting an unrelated /tmp
-        // pane prevent lookup in an otherwise eligible home workspace.
+        // Exclude unsupported roots before touching their filesystem, so an
+        // unrelated /tmp workspace cannot block an eligible home workspace.
         if !path.starts_with(&home) && !path.starts_with(&canonical_home) {
             continue;
         }
@@ -401,44 +520,118 @@ async fn local_existing_candidates(
     .map_err(|error| format!("Workspace path lookup failed: {error}"))?
 }
 
+fn explicit_lookup_complete(paths: &[String], existing: &[TerminalPathResolution]) -> bool {
+    paths.iter().all(|path| is_explicit_path(path))
+        || paths.first().is_some_and(|primary| {
+            is_explicit_path(primary)
+                && existing
+                    .iter()
+                    .filter(|item| item.source == *primary)
+                    .count()
+                    == 1
+        })
+}
+
 async fn resolve_local(paths: &[String]) -> Result<Vec<TerminalPathResolution>, String> {
-    let sessions = running_session_names(&local_metadata(None).await?)?;
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or("Home directory not found")?;
+    let home = home
+        .to_str()
+        .ok_or("Home directory is not valid Unicode")?
+        .replace('\\', "/");
+    let explicit =
+        local_existing_candidates(candidate_paths(paths, &[], HostPaths::Local, Some(&home))?)
+            .await?;
+    if explicit_lookup_complete(paths, &explicit) {
+        return Ok(explicit);
+    }
+    let sessions = running_session_names(&local_metadata(None, None).await?)?;
     let mut directories = Vec::new();
     for session in sessions {
-        append_directories(
-            &mut directories,
-            workspace_directories(&local_metadata(Some(&session)).await?, HostPaths::Local)?,
-        )?;
+        for workspace in workspace_ids(&local_metadata(Some(&session), None).await?)? {
+            append_directories(
+                &mut directories,
+                workspace_directories(
+                    &local_metadata(Some(&session), Some(&workspace)).await?,
+                    HostPaths::Local,
+                )?,
+            )?;
+        }
     }
     let directories = tokio::task::spawn_blocking(move || local_scope_directories(directories))
         .await
         .map_err(|error| format!("Workspace scope lookup failed: {error}"))??;
-    local_existing_candidates(candidate_paths(paths, &directories, HostPaths::Local)?).await
+    local_existing_candidates(candidate_paths(
+        paths,
+        &directories,
+        HostPaths::Local,
+        Some(&home),
+    )?)
+    .await
 }
 
 async fn resolve_remote(
     connection: &SshConnection,
     paths: &[String],
 ) -> Result<Vec<TerminalPathResolution>, String> {
-    let sessions = running_session_names(&remote_metadata(connection, None).await?)?;
-    let mut directories = Vec::new();
-    for session in sessions {
-        append_directories(
-            &mut directories,
-            workspace_directories(
-                &remote_metadata(connection, Some(&session)).await?,
-                HostPaths::Posix,
-            )?,
-        )?;
-    }
-    let candidates = candidate_paths(paths, &directories, HostPaths::Posix)?;
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
     let sftp = connection
         .open_sftp()
         .await
-        .map_err(|error| format!("Workspace SFTP lookup failed: {error}"))?;
+        .map_err(|error| format!("Filesystem SFTP lookup failed: {error}"))?;
+    let home = if paths
+        .iter()
+        .any(|path| path == "~" || path.starts_with("~/"))
+    {
+        let home = sftp
+            .canonicalize(".")
+            .await
+            .map_err(|error| format!("Failed to resolve remote home directory: {error}"))?;
+        if !home.starts_with('/')
+            || home.starts_with("//")
+            || home.contains('\\')
+            || home.len() > MAX_PATH_BYTES
+            || unsafe_text(&home)
+            || home.split('/').any(|part| part == "..")
+        {
+            return Err("SFTP returned an unsafe home directory".to_string());
+        }
+        Some(home)
+    } else {
+        None
+    };
+    let explicit = remote_existing_candidates(
+        &sftp,
+        candidate_paths(paths, &[], HostPaths::Posix, home.as_deref())?,
+    )
+    .await?;
+    if explicit_lookup_complete(paths, &explicit) {
+        return Ok(explicit);
+    }
+    let sessions = running_session_names(&remote_metadata(connection, None, None).await?)?;
+    let mut directories = Vec::new();
+    for session in sessions {
+        for workspace in workspace_ids(&remote_metadata(connection, Some(&session), None).await?)? {
+            append_directories(
+                &mut directories,
+                workspace_directories(
+                    &remote_metadata(connection, Some(&session), Some(&workspace)).await?,
+                    HostPaths::Posix,
+                )?,
+            )?;
+        }
+    }
+    remote_existing_candidates(
+        &sftp,
+        candidate_paths(paths, &directories, HostPaths::Posix, home.as_deref())?,
+    )
+    .await
+}
+
+async fn remote_existing_candidates(
+    sftp: &russh_sftp::client::SftpSession,
+    candidates: Vec<TerminalPathResolution>,
+) -> Result<Vec<TerminalPathResolution>, String> {
     let mut existing = Vec::new();
     for candidate in candidates {
         match sftp.metadata(&candidate.target).await {
@@ -453,8 +646,8 @@ async fn resolve_remote(
     Ok(existing)
 }
 
-/// Read-only discovery produces choices, never evidence of a historical pane's cwd.
-/// The UI must retain explicit full-path consent, even when only one target exists.
+/// Resolve existing same-session filesystem targets without writing to a terminal.
+/// Mixed-source discovery only skips metadata for a uniquely resolved explicit primary.
 #[tauri::command]
 pub async fn terminal_resolve_paths(
     session_manager: State<'_, Arc<SessionManager>>,
@@ -463,7 +656,7 @@ pub async fn terminal_resolve_paths(
     session_id: String,
     paths: Vec<String>,
 ) -> Result<Vec<TerminalPathResolution>, String> {
-    let paths = relative_requests(paths)?;
+    let paths = path_requests(paths)?;
     match kind.as_str() {
         "local" => {
             let identity = local_shell_manager
@@ -507,8 +700,13 @@ mod tests {
                 "/home/coderred/Projects/other"
             ]
         );
-        let candidates =
-            candidate_paths(&["exports/short.mp4".to_string()], &dirs, HostPaths::Posix).unwrap();
+        let candidates = candidate_paths(
+            &["exports/short.mp4".to_string()],
+            &dirs,
+            HostPaths::Posix,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             candidates[1].target,
             "/home/coderred/Projects/coderred-video/exports/short.mp4"
@@ -517,30 +715,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsafe_relative_requests_and_preserves_literal_names() {
+    fn rejects_unsafe_requests_and_preserves_literal_names() {
         for bad in [
             "",
-            "/tmp/a",
+            "//foreign-host/a",
             "../a",
             "a/../b",
+            "/home/../etc",
+            "~/../etc",
             "https://host/a",
-            "C:/a",
-            "~/a",
+            "file:///home/a",
+            "~other/a",
             "a\\..\\b",
             "a\u{001b}[1m",
             "a\u{202e}b",
             ".",
             "./",
         ] {
-            assert!(relative_requests(vec![bad.to_string()]).is_err(), "{bad:?}");
+            assert!(path_requests(vec![bad.to_string()]).is_err(), "{bad:?}");
         }
-        let paths = relative_requests(vec![
+        let paths = path_requests(vec![
             "./exports/a b'$(touch marker).mp4".into(),
             "./exports/a b'$(touch marker).mp4".into(),
         ])
         .unwrap();
         assert_eq!(paths.len(), 1);
-        assert!(relative_requests(vec!["safe".into(); MAX_REQUESTS + 1]).is_err());
+        assert!(path_requests(vec!["safe".into(); MAX_REQUESTS + 1]).is_err());
     }
 
     #[test]
@@ -585,37 +785,42 @@ mod tests {
     }
 
     #[test]
-    fn lexical_aliases_do_not_duplicate_workspace_choices() {
+    fn lexical_aliases_preserve_requested_source_with_one_normalized_target() {
         let dirs = workspace_directories(
             r#"{"result":{"panes":[{"cwd":"/project//./","foreground_cwd":"/project/"}]}}"#,
             HostPaths::Posix,
         )
         .unwrap();
         assert_eq!(dirs, ["/project"]);
-        let requests = relative_requests(vec![
+        let requests = path_requests(vec![
             "./exports//clip.mp4".into(),
             "exports/clip.mp4".into(),
         ])
         .unwrap();
-        let candidates = candidate_paths(&requests, &dirs, HostPaths::Posix).unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].target, "/project/exports/clip.mp4");
+        let candidates = candidate_paths(&requests, &dirs, HostPaths::Posix, None).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.target == "/project/exports/clip.mp4"));
+        assert_eq!(candidates[0].source, "./exports//clip.mp4");
+        assert_eq!(candidates[1].source, "exports/clip.mp4");
     }
 
     #[test]
-    fn excessive_choices_fail_instead_of_truncating() {
+    fn excessive_candidates_fail_instead_of_truncating() {
         let dirs: Vec<_> = (0..=MAX_DIRECTORIES)
             .map(|n| format!("/workspace/{n}"))
             .collect();
         assert!(append_directories(&mut Vec::new(), dirs.clone()).is_err());
         assert!(candidate_paths(
-            &vec!["export.mp4".into(); 5],
+            &(0..5).map(|n| format!("export{n}.mp4")).collect::<Vec<_>>(),
             &dirs[..MAX_DIRECTORIES],
-            HostPaths::Posix
+            HostPaths::Posix,
+            None
         )
         .is_err());
         let long = format!("/{}", "a".repeat(MAX_PATH_BYTES - 1));
-        assert!(candidate_paths(&["x".into()], &[long], HostPaths::Posix).is_err());
+        assert!(candidate_paths(&["x".into()], &[long], HostPaths::Posix, None).is_err());
     }
 
     #[tokio::test]
@@ -651,15 +856,16 @@ mod tests {
         let dirs = local_scope_directories(mixed_dirs).unwrap();
         assert_eq!(dirs.len(), 2);
         assert!(local_scope_directories(vec![outside.to_str().unwrap().to_string()]).is_err());
-        let requests = relative_requests(vec![
+        let requests = path_requests(vec![
             "exports/clip.mp4".into(),
             "exports/missing.mp4".into(),
         ])
         .unwrap();
-        let existing =
-            local_existing_candidates(candidate_paths(&requests, &dirs, HostPaths::Local).unwrap())
-                .await
-                .unwrap();
+        let existing = local_existing_candidates(
+            candidate_paths(&requests, &dirs, HostPaths::Local, None).unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(existing.len(), 2);
         assert!(existing
             .iter()
@@ -685,11 +891,11 @@ mod tests {
         for name in ["main.ts", "main.ts:12:4"] {
             std::fs::write(root.join("src").join(name), b"source fixture").unwrap();
         }
-        let requests = relative_requests(vec!["src/main.ts:12:4".into(), "src/main.ts".into()])
+        let requests = path_requests(vec!["src/main.ts:12:4".into(), "src/main.ts".into()])
             .expect("source-location alternatives are valid relative filenames");
         let directories = vec![root.to_str().unwrap().to_string()];
         let existing = local_existing_candidates(
-            candidate_paths(&requests, &directories, HostPaths::Local).unwrap(),
+            candidate_paths(&requests, &directories, HostPaths::Local, None).unwrap(),
         )
         .await
         .unwrap();
@@ -700,5 +906,188 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from(["src/main.ts:12:4", "src/main.ts"])
         );
+    }
+
+    #[test]
+    fn enumerates_unfocused_workspace_ids_and_rejects_malformed_metadata() {
+        let workspaces = workspace_ids(r#"{"id":"cli:workspace:list","result":{"type":"workspace_list","workspaces":[{"workspace_id":"wV","focused":false},{"workspace_id":"w12","focused":true},{"workspace_id":"wV"}]}}"#).unwrap();
+        assert_eq!(workspaces, ["wV", "w12"]);
+        for bad in [
+            "{}",
+            r#"{"result":{"workspaces":null}}"#,
+            r#"{"result":{"workspaces":[{}]}}"#,
+            r#"{"result":{"workspaces":[{"workspace_id":"-option"}]}}"#,
+            r#"{"result":{"workspaces":[{"workspace_id":"w\n1"}]}}"#,
+        ] {
+            assert!(workspace_ids(bad).is_err());
+        }
+        let oversized = serde_json::json!({"result":{"workspaces":(0..=MAX_DIRECTORIES)
+            .map(|n| serde_json::json!({"workspace_id":format!("w{n}")})).collect::<Vec<_>>()}})
+        .to_string();
+        assert!(workspace_ids(&oversized).is_err());
+    }
+
+    #[test]
+    fn absolute_and_home_candidates_do_not_need_workspace_directories() {
+        let sources = path_requests(vec![
+            "/home/test//./clip.mp4:12:4".into(),
+            "/home/test/clip.mp4".into(),
+            "~/exports//./clip.mp4".into(),
+            "~".into(),
+            "relative/clip.mp4".into(),
+        ])
+        .unwrap();
+        let candidates =
+            candidate_paths(&sources, &[], HostPaths::Posix, Some("/home/test")).unwrap();
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(candidates[0].source, sources[0]);
+        assert_eq!(candidates[0].target, "/home/test/clip.mp4:12:4");
+        assert_eq!(candidates[1].target, "/home/test/clip.mp4");
+        assert_eq!(candidates[2].target, "/home/test/exports/clip.mp4");
+        assert_eq!(candidates[3].target, "/home/test");
+        assert_eq!(
+            candidate_paths(&["~".into()], &[], HostPaths::Posix, Some("/")).unwrap()[0].target,
+            "/"
+        );
+        assert!(candidate_paths(&["~/clip".into()], &[], HostPaths::Posix, None).is_err());
+        assert!(
+            candidate_paths(&["C:/clip.mp4".into()], &[], HostPaths::Posix, None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_explicit_lookup_returns_existing_sources_without_herdr() {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .unwrap();
+        let name = format!(".redterm-direct-path-test-{}", uuid::Uuid::new_v4());
+        let root = Path::new(&home).join(&name);
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        std::fs::write(root.join("clip.mp4"), b"fixture").unwrap();
+        let absolute = root.join("clip.mp4").to_str().unwrap().replace('\\', "/");
+        let home_source = format!("~/{name}/clip.mp4");
+        let missing = format!("~/{name}/missing.mp4");
+        let sources = path_requests(vec![absolute.clone(), home_source.clone(), missing]).unwrap();
+        let existing = resolve_local(&sources).await.unwrap();
+        assert_eq!(existing.len(), 2);
+        assert_eq!(existing[0].source, absolute);
+        assert_eq!(existing[1].source, home_source);
+        assert_eq!(existing[0].target, existing[1].target);
+        // A uniquely resolved explicit primary remains usable even if relative
+        // alternatives would need unavailable host workspace metadata.
+        let mixed = resolve_local(&[absolute.clone(), "unrelated/missing.mp4".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            mixed,
+            vec![TerminalPathResolution {
+                source: absolute.clone(),
+                target: absolute,
+            }]
+        );
+        assert!(resolve_local(&[format!("~/{name}/missing.mp4")])
+            .await
+            .unwrap()
+            .is_empty());
+        let outside = Path::new(&home)
+            .parent()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .replace('\\', "/");
+        assert!(resolve_local(&[outside]).await.unwrap().is_empty());
+        // Filesystem errors other than a missing candidate remain errors.
+        #[cfg(unix)]
+        assert!(resolve_local(&[format!("~/{name}/clip.mp4/child")])
+            .await
+            .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_explicit_symlink_cannot_escape_home_scope() {
+        let home = std::env::var_os("HOME").unwrap();
+        let root =
+            Path::new(&home).join(format!(".redterm-link-scope-test-{}", uuid::Uuid::new_v4()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        std::fs::create_dir_all(&root).unwrap();
+        let _cleanup = Cleanup(root.clone());
+        std::os::unix::fs::symlink("/", root.join("outside")).unwrap();
+        assert!(
+            resolve_local(&[root.join("outside").to_str().unwrap().into()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn alternate_explicit_target_does_not_hide_unresolved_primary() {
+        let existing = vec![TerminalPathResolution {
+            source: "/home/test/alternate.mp4".into(),
+            target: "/home/test/alternate.mp4".into(),
+        }];
+        assert!(!explicit_lookup_complete(
+            &["exports/primary.mp4".into(), existing[0].source.clone()],
+            &existing,
+        ));
+        assert!(!explicit_lookup_complete(
+            &[
+                "/home/test/missing.mp4".into(),
+                existing[0].source.clone(),
+                "exports/primary.mp4".into()
+            ],
+            &existing,
+        ));
+        assert!(explicit_lookup_complete(
+            &[existing[0].source.clone(), "exports/primary.mp4".into()],
+            &existing,
+        ));
+        assert!(explicit_lookup_complete(
+            &["/home/test/missing.mp4".into(), "~/missing.mp4".into()],
+            &[],
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn invalid_windows_candidate_does_not_discard_stripped_alternative() {
+        let sources = path_requests(vec![
+            "C:/Users/test/src/main.ts:12:4".into(),
+            "C:/Users/test/src/main.ts".into(),
+            "src/NUL.txt".into(),
+            "src/valid.txt".into(),
+        ])
+        .unwrap();
+        let candidates =
+            candidate_paths(&sources, &["C:/Users/test".into()], HostPaths::Local, None).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].source, "C:/Users/test/src/main.ts");
+        assert_eq!(candidates[1].source, "src/valid.txt");
+    }
+
+    #[test]
+    fn filesystem_root_resolves_without_a_workspace_and_empty_relative_paths_stay_invalid() {
+        let paths = path_requests(vec!["/".into()]).expect("filesystem root is an explicit path");
+        let targets = candidate_paths(&paths, &[], HostPaths::Posix, None).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].target, "/");
+        for invalid in ["", ".", "./"] {
+            assert!(path_requests(vec![invalid.into()]).is_err());
+        }
     }
 }
