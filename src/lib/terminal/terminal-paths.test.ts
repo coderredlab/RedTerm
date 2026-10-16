@@ -363,6 +363,19 @@ test("widening a live pane cannot directly open a former edge fragment", () => {
   expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 3 })).toBeNull();
 });
 
+test("widening an indented two-margin continuation cannot expose either fragment", () => {
+  for (const alternate of [false, true]) {
+    const parser = new AnsiParser(24, 3);
+    if (alternate) parser.write("\x1b[?1049h");
+    parser.write("\x1b[?7l       /tmp/abcdefghij  \r\n       /tail");
+    expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 12 })?.path)
+      .toBe("/tmp/abcdefghij/tail");
+    parser.resize(30, 3);
+    expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 12 })).toBeNull();
+    expect(findPathAtCell(parser.getBuffer(), { row: 1, col: 9 })).toBeNull();
+  }
+});
+
 test("height clipping cannot reveal a discarded continuation's prefix", () => {
   const parser = new AnsiParser(10, 3);
   parser.write("/tmp/aaaaa\r\nbbb\x1b[A");
@@ -784,6 +797,25 @@ test("Markdown indentation survives real pane clipping and both right margins", 
   }
 });
 
+test("Herdr block gutters preserve a wrapped video title and both URI rows", () => {
+  const path = "/home/me/Projects/example-video/exports/shorts/tech/202610/family-screen-demonstration-explained-shorts/family-screen-demonstration-explained-shorts.mp4";
+  const uri = `file://${path}`;
+  const parser = new AnsiParser(149, 5);
+  parser.write("\x1b[?7l");
+  for (let line = 1; line <= 5; line++) {
+    parser.write(`\x1b[${line};18H│\x1b[${line};149H▕`);
+  }
+  parser.write("\x1b[1;19H - \x1b[4m최종 영상 MP4\x1b[0m");
+  parser.write(`\x1b[2;19H   (${uri.slice(0, 125)} `);
+  parser.write(`\x1b[3;19H   ${uri.slice(125)}) — 84.27s · 1080×1920 · 30fps`);
+  for (const point of [{ row: 0, col: 31 }, { row: 1, col: 30 }, { row: 2, col: 24 }]) {
+    expect(findPathAtCell(parser.getBuffer(), point)?.path).toBe(path);
+  }
+  parser.write("\x1b[3;19H\x1b[130X");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 31 })).toBeNull();
+  expect(findPathAtCell(parser.getBuffer(), { row: 1, col: 30 })).toBeNull();
+});
+
 test("mutating an indented continuation cannot expose its surviving prefix", () => {
   for (const command of ["2K", "M", "J"]) {
     const parser = new AnsiParser(16, 3);
@@ -807,13 +839,6 @@ test("erasing a composed continuation with two right margins invalidates its pre
   expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 7 })?.path).toBe("/tmp/xxxxxx/baz");
   parser.write("\x1b[2;2H\x1b[K");
   expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 7 })).toBeNull();
-});
-
-test("ordinary trailing whitespace does not create a two-margin pane boundary", () => {
-  const parser = new AnsiParser(16, 3);
-  parser.write("   /tmp/fooABC  \r\n   unrelated");
-  parser.write("\x1b[2;1H\x1b[2K");
-  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 6 })?.path).toBe("/tmp/fooABC");
 });
 
 test("pane-local mutation guards ignore differing sidebar indentation", () => {
@@ -853,4 +878,59 @@ test("uncertainty in one pane survives a later mutation in another pane", () => 
   parser.write("\x1b[2;18H\x1b[16X");
   expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 5 })).toBeNull();
   expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 23 })).toBeNull();
+});
+
+test("borderless indented displays reconstruct a wrapped target from label and both URI rows", () => {
+  const path = "/home/me/exports/family-screen-explained-shorts/family-screen-explained-shorts.mp4";
+  const uri = `file://${path}`;
+  const padding = " ".repeat(19);
+  const parser = new AnsiParser(104, 5);
+  const split = 104 - padding.length - 3;
+  parser.write(`\x1b[?7l${padding}\x1b[4mOpen video\x1b[0m\r\n${padding}(${uri.slice(0, split)}  \r\n${padding}${uri.slice(split)})`);
+  for (const point of [{ row: 0, col: 22 }, { row: 1, col: 30 }, { row: 2, col: 22 }]) {
+    expect(findPathAtCell(parser.getBuffer(), point)?.path).toBe(path);
+  }
+});
+
+test("borderless indented continuation mutations cannot expose a surviving path fragment", () => {
+  for (const mutation of ["\x1b[2;1H\x1b[2K", "\x1b[2;1H\x1b[M", "\x1b[2;1H\x1b[J"]) {
+    const parser = new AnsiParser(24, 3);
+    parser.write("\x1b[?7l       /tmp/abcdefghij  \r\n       /tail");
+    expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 12 })?.path)
+      .toBe("/tmp/abcdefghij/tail");
+    parser.write(mutation);
+    expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 12 })).toBeNull();
+  }
+});
+
+test("borderless multirow targets retain their full path and reject a deleted middle row", () => {
+  const path = `/tmp/${"long-file-".repeat(7)}.png`;
+  const uri = `file://${path}`;
+  const padding = " ".repeat(7);
+  const parser = new AnsiParser(40, 6);
+  parser.write("\x1b[?7l");
+  let offset = 0, line = 0;
+  while (offset < uri.length) {
+    const capacity = 40 - padding.length - 2 - (line === 0 ? 1 : 0);
+    const part = uri.slice(offset, offset + capacity);
+    offset += part.length;
+    parser.write(`${line ? "\r\n" : ""}${padding}${line ? "" : "("}${part}${offset < uri.length ? "  " : ")"}`);
+    line++;
+  }
+  expect(findPathAtCell(parser.getBuffer(), { row: 1, col: 10 })?.path).toBe(path);
+  parser.write("\x1b[2;1H\x1b[M");
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 12 })).toBeNull();
+});
+
+test("borderless right margins cannot conceal a hidden cell or another hyperlink", () => {
+  for (const linked of [false, true]) {
+    const parser = new AnsiParser(24, 3);
+    parser.write("\x1b[?7l       /tmp/abcdefghij  \r\n       /tail");
+    const buffer = parser.getBuffer();
+    const margin = buffer[0][23];
+    buffer[0][23] = linked
+      ? { ...margin, hyperlink: { uri: "https://example.com", id: "other" } }
+      : { ...margin, style: { ...margin.style, hidden: true } };
+    expect(findPathAtCell(buffer, { row: 0, col: 12 })).toBeNull();
+  }
 });

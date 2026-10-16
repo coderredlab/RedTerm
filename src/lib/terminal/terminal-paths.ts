@@ -76,8 +76,8 @@ function pathContinuationGaps(
   if (continuationEnd !== null) trailing = before.length - continuationEnd;
   else if (herdrTail) {
     while (trailing < before.length && before[before.length - trailing - 1]?.char === " ") trailing++;
-  } else if (panePadding) {
-    // The compositor's reserved column can follow the nested TUI's own margin.
+  } else if (panePadding || leading > 1) {
+    // Borderless TUI sidebars also retain matched indentation and both margins.
     while (trailing < 2 && before[before.length - trailing - 1]?.char === " ") trailing++;
   } else if (before.at(-1)?.char === " " && before.at(-2)?.char.trim()) trailing = 1;
   // A wide glyph's final-column placeholder occupies the cell, not a margin.
@@ -171,7 +171,7 @@ export function findPathAtCell(
   if (row[point.col].hyperlink) return findPathInRows(buffer, point, cwdUri);
   const divider = (line: Cell[] | undefined, col: number) => {
     const cell = line?.[col];
-    return !!cell && /^[│┃║]$/.test(cell.char) && !cell.style.hidden && !cell.hyperlink;
+    return !!cell && /^[│┃║▕]$/.test(cell.char) && !cell.style.hidden && !cell.hyperlink;
   };
   const continuousDivider = (col: number) => isTerminalPathDividerColumn(buffer, point.row, col);
   if (continuousDivider(point.col)) return null;

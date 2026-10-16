@@ -196,7 +196,7 @@ function mightSpanPathRange(
 ): boolean {
   const leading = pathLeadingMarginInRange(before, after, start, beforeEnd, afterEnd);
   if (leading < 0) return false;
-  const limit = isReflowTail(before) && leading > 0 ? beforeEnd - start : boundedPane ? 2 : 1;
+  const limit = isReflowTail(before) && leading > 0 ? beforeEnd - start : boundedPane || leading > 1 ? 2 : 1;
   let end = beforeEnd - 1, trailing = 0;
   while (end >= start && trailing < limit && before[end].char === " ") { end--; trailing++; }
   if (end >= start && before[end].char === "") end--;
@@ -204,7 +204,7 @@ function mightSpanPathRange(
 }
 
 function visiblePathDivider(cell: Cell | undefined): boolean {
-  return !!cell && cell.char.length === 1 && "│┃║".includes(cell.char) &&
+  return !!cell && cell.char.length === 1 && "│┃║▕".includes(cell.char) &&
     !cell.style.hidden && !cell.hyperlink;
 }
 
@@ -987,19 +987,13 @@ export class AnsiParser {
     const oldScrollTop = this.scrollTop;
     const oldScrollBottom = this.scrollBottom;
     const oldScrollbackLength = oldScrollback.length;
-    if (cols > oldCols && !this.usingAlternateScreen) {
-      const priorRows = oldScrollback.concat(oldBuffer);
+    if (cols > oldCols) {
+      const priorRows = this.usingAlternateScreen ? oldBuffer : oldScrollback.concat(oldBuffer);
       for (let index = 0; index + 1 < priorRows.length; index++) {
         const before = priorRows[index];
         const after = priorRows[index + 1];
         if (before.length !== oldCols || isReflowContinuation(before, after)) continue;
-        const edge = before[oldCols - 1]?.char;
-        const previous = before[oldCols - 2]?.char;
-        const mayContinue = edge?.trim() ||
-          ((edge === " " || edge === "") && previous?.trim());
-        const nextStarts = after[0]?.char.trim() ||
-          (after[0]?.char === " " && after[1]?.char.trim());
-        if (mayContinue && nextStarts) {
+        if (mightSpanBoundary(before, after)) {
           markUnprovenSnapshotRow(before);
           markUnprovenSnapshotRow(after);
         }
