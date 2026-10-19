@@ -80,7 +80,7 @@ const reflowContentEnds = new WeakMap<Cell[], number>();
 const reflowSourceCells = new WeakMap<Cell[], Cell[]>();
 const reflowTails = new WeakMap<Cell[], Cell[]>();
 const reflowOutgoingCells = new WeakMap<Cell[], Set<Cell>>();
-const reflowIncomingCells = new WeakMap<Cell[], Set<Cell>>();
+const reflowIncomingCells = new WeakMap<Cell[], Map<Cell, number>>();
 const reflowIncomingNextColumn = new WeakMap<Cell[], number>();
 const unknownPredecessorRows = new WeakSet<Cell[]>();
 // Bind relative text to its printed OSC 7 directory, never the click-time cwd.
@@ -119,9 +119,10 @@ function transferUnprovenSnapshotRow(source: Cell[], target: Cell[]) {
   if (unknownPredecessorRows.has(source)) unknownPredecessorRows.add(target);
   const incoming = reflowIncomingCells.get(source);
   if (incoming) {
-    let transferred: Set<Cell> | null = null;
+    let transferred: Map<Cell, number> | null = null;
     for (let col = 0; col < Math.min(source.length, target.length); col++) {
-      if (incoming.has(source[col])) (transferred ??= new Set()).add(target[col]);
+      const originalCol = incoming.get(source[col]);
+      if (originalCol !== undefined) (transferred ??= new Map()).set(target[col], originalCol);
     }
     if (transferred) reflowIncomingCells.set(target, transferred);
   }
@@ -134,6 +135,9 @@ function transferUnprovenSnapshotRow(source: Cell[], target: Cell[]) {
   if (transferred) unprovenSnapshotRows.set(target, transferred);
 }
 function copyUnprovenSnapshotRow(source: Cell[], target: Cell[], start = 0, end = source.length) {
+  if (reflowIncomingCells.has(source) && !hasCompleteReflowIncomingContent(source)) {
+    markUnprovenSnapshotRow(source);
+  }
   const original = unprovenSnapshotRows.get(source);
   if (original) {
     let retained: Set<Cell> | null = null;
@@ -155,10 +159,11 @@ function copyUnprovenSnapshotRow(source: Cell[], target: Cell[], start = 0, end 
   }
   const incoming = reflowIncomingCells.get(source);
   if (incoming) {
-    let retained: Set<Cell> | null = null;
+    let retained: Map<Cell, number> | null = null;
     for (let col = start; col < end; col++) {
       const cell = source[col];
-      if (incoming.has(cell)) (retained ??= new Set()).add(cell);
+      const originalCol = incoming.get(cell);
+      if (originalCol !== undefined) (retained ??= new Map()).set(cell, originalCol - start);
     }
     if (retained) reflowIncomingCells.set(target, retained);
   }
@@ -264,9 +269,12 @@ function recordReflowContinuation(before: Cell[], after: Cell[], end = before.le
   if (outgoing) reflowOutgoingCells.set(before, outgoing);
   if (end < before.length) reflowContentEnds.set(before, end);
   else reflowContentEnds.delete(before);
-  const incoming = new Set<Cell>();
-  for (const cell of after) {
-    if (cell.char.trim() || cell.char === "") incoming.add(cell);
+  const incoming = new Map<Cell, number>();
+  for (let col = 0; col < after.length; col++) {
+    const cell = after[col];
+    if (cell.char.trim() || cell.char === "") {
+      incoming.set(cell, col);
+    }
   }
   reflowIncomingCells.set(after, incoming);
   if (incoming.size === 0) reflowIncomingNextColumn.set(after, 0);
@@ -298,13 +306,30 @@ export function hasReflowIncomingContent(row: Cell[]): boolean {
   const original = reflowIncomingCells.get(row);
   return original ? row.some(cell => original.has(cell)) : false;
 }
+/** Preserve printed soft-wrap whitespace only while every target cell stays in place. */
+export function hasCompleteReflowIncomingContent(row: Cell[]): boolean {
+  const original = reflowIncomingCells.get(row);
+  if (!original) return false;
+  let retained = 0;
+  for (let col = 0; col < row.length; col++) {
+    if (!original.has(row[col])) continue;
+    if (original.get(row[col]) !== col) return false;
+    retained++;
+  }
+  return retained === original.size;
+}
+
 function replaceRepaintedCell(row: Cell[], col: number, oldCell: Cell, updated: Cell) {
   const unproven = unprovenSnapshotRows.get(row);
   if (unproven?.delete(oldCell)) unproven.add(updated);
   const outgoing = reflowOutgoingCells.get(row);
   if (outgoing?.delete(oldCell)) outgoing.add(updated);
   const incoming = reflowIncomingCells.get(row);
-  if (incoming?.delete(oldCell)) incoming.add(updated);
+  const incomingCol = incoming?.get(oldCell);
+  if (incoming && incomingCol !== undefined) {
+    incoming.delete(oldCell);
+    incoming.set(updated, incomingCol);
+  }
   const cwd = printedDirectoryUris.get(oldCell);
   if (cwd) printedDirectoryUris.set(updated, cwd);
   const source = reflowSourceCells.get(row);
@@ -987,16 +1012,20 @@ export class AnsiParser {
     const oldScrollTop = this.scrollTop;
     const oldScrollBottom = this.scrollBottom;
     const oldScrollbackLength = oldScrollback.length;
-    if (cols > oldCols) {
-      const priorRows = this.usingAlternateScreen ? oldBuffer : oldScrollback.concat(oldBuffer);
-      for (let index = 0; index + 1 < priorRows.length; index++) {
-        const before = priorRows[index];
-        const after = priorRows[index + 1];
-        if (before.length !== oldCols || isReflowContinuation(before, after)) continue;
-        if (mightSpanBoundary(before, after)) {
+    const priorRowCount = (this.usingAlternateScreen ? 0 : oldScrollbackLength) + oldBuffer.length;
+    const priorRow = (index: number) => this.usingAlternateScreen ? oldBuffer[index]
+      : index < oldScrollbackLength ? oldScrollback[index] : oldBuffer[index - oldScrollbackLength];
+    for (let index = 0; index + 1 < priorRowCount; index++) {
+      const before = priorRow(index);
+      const after = priorRow(index + 1);
+      if (isReflowContinuation(before, after)) {
+        if (!hasCompleteReflowIncomingContent(after)) {
           markUnprovenSnapshotRow(before);
           markUnprovenSnapshotRow(after);
         }
+      } else if (cols > oldCols && before.length === oldCols && mightSpanBoundary(before, after)) {
+        markUnprovenSnapshotRow(before);
+        markUnprovenSnapshotRow(after);
       }
     }
     const imageContentLengths = new Map<number, number>();
@@ -5395,7 +5424,7 @@ export class AnsiParser {
     if (incomingNext !== undefined) {
       if (incomingNext === this.cursorX) {
         if (cell.char.trim() || cell.char === "") {
-          reflowIncomingCells.get(this.buffer[this.cursorY])?.add(cell);
+          reflowIncomingCells.get(this.buffer[this.cursorY])?.set(cell, this.cursorX);
         }
         reflowIncomingNextColumn.set(this.buffer[this.cursorY], this.cursorX + (isWide ? 2 : 1));
       } else {
