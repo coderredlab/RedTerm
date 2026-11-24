@@ -89,6 +89,13 @@ export function validateTerminalUrl(candidate: string): SafeTerminalUrl | null {
   };
 }
 
+// A scheme at the start of a pane row normally starts a separate link. A URI
+// value or list (e.g. `?next=https://…` or `%20https://…`) can wrap there too.
+function startsSeparatePaneUrl(text: string, boundary: number): boolean {
+  return /^https?:\/\//i.test(text.slice(boundary, boundary + 8)) &&
+    !/(?:[=+,;]|%[\da-f]{2})$/i.test(text.slice(boundary - 3, boundary));
+}
+
 function findUrlInRows(
   buffer: Cell[][], point: { row: number; col: number }, panePadding: boolean,
 ): TerminalUrlMatch | null {
@@ -107,13 +114,17 @@ function findUrlInRows(
   for (let col = 0; col <= point.col; col++) pointTextEnd += row[col].char.length;
   let first = point.row, last = point.row, length = row.length;
   while (first > 0 && length + buffer[first - 1].length <= 4096 &&
-    point.row - first + 1 < 32 && gaps(buffer[first - 1], buffer[first]) >= 0) {
-    // A visible token start is enough; preceding prose must not consume the budget.
-    const boundary = buffer[first].map(cell => cell.char).join("").search(/\s\(?https?:\/\//i);
-    if (boundary >= 0 && (first < point.row || boundary < pointTextEnd)) break;
+    point.row - first + 1 < 32) {
+    const spacing = gaps(buffer[first - 1], buffer[first]);
+    if (spacing < 0) break;
+    // Pane padding isn't a token separator before a row-initial embedded URI.
+    const margin = panePadding ? spacing & CONTINUATION_MARGIN_MASK : 0;
+    const boundary = buffer[first].map(cell => cell.char).join("").slice(margin).search(/\s\(?https?:\/\//i);
+    if (boundary >= 0 && (first < point.row || margin + boundary < pointTextEnd)) break;
     first--;
     length += buffer[first].length;
   }
+  const paneHead = panePadding && first > 0 ? gaps(buffer[first - 1], buffer[first], true) : -1;
   while (last + 1 < buffer.length && length + buffer[last + 1].length <= 4096 &&
     last - first + 1 < 32 && gaps(buffer[last], buffer[last + 1]) >= 0) {
     last++;
@@ -142,6 +153,17 @@ function findUrlInRows(
     const offset = match.index!;
     let candidate = match[0];
     if (clickOffset < offset || clickOffset >= offset + candidate.length) continue;
+    // If the scan starts mid-token, a later `https://` can belong to its query.
+    // Only a literal separator, not the clipped pane margin, starts a new token.
+    if (paneHead >= 0 && !/[\s<>"'`]/.test(text.slice(paneHead & CONTINUATION_MARGIN_MASK, offset))) return null;
+    const root = rowStarts.findIndex((_, index) => offset < rowStarts[index + 1]);
+    const firstLine = first + root;
+    const tokenEnd = offset + candidate.length;
+    // Infer wrapping only for a standalone URL in a clipped pane. Its scheme
+    // and authority must already be complete before the first inferred join.
+    const authority = panePadding && tokenEnd > rowStarts[root + 1] && /^ *$/.test(text.slice(rowStarts[root], offset))
+      ? /^https?:\/\/[^/\\?#]+[/#?]/i.exec(candidate) : null;
+    let paneSpacing: number | undefined;
     let literalWhitespaceEnd = false;
     let renderedTarget: boolean | undefined;
     for (let line = first; line < last; line++) {
@@ -151,24 +173,31 @@ function findUrlInRows(
       if (renderedTarget === undefined) {
         renderedTarget = false;
         if (text[offset - 1] === "(") {
-          const rootRow = first + rowStarts.findIndex((_, index) => offset < rowStarts[index + 1]);
-          for (let labelRow = Math.max(0, rootRow - 1); labelRow <= rootRow && !renderedTarget; labelRow++) {
+          for (let labelRow = Math.max(0, firstLine - 1); labelRow <= firstLine && !renderedTarget; labelRow++) {
             const label = buffer[labelRow];
             for (let col = 0; col < label.length && !renderedTarget; col++) {
               const cell = label[col], previous = label[col - 1];
               if (!cell.style.underline || cell.style.hidden || cell.hyperlink ||
                 (previous?.style.underline && !previous.style.hidden && !previous.hyperlink)) continue;
               renderedTarget = !!findRenderedTerminalLabel(buffer, { row: labelRow, col }, panePadding,
-                target => target.row === rootRow && target.col === columns[offset]
+                target => target.row === firstLine && target.col === columns[offset]
                   ? { startCol: target.col, endCol: target.col } : null);
             }
           }
         }
       }
       if (renderedTarget) continue;
-      // Only a verified rendered label justifies removing hard-newline margins.
       const spacing = gaps(buffer[line], buffer[line + 1]);
-      if (spacing <= 0) return null;
+      const nextEnd = rowStarts[line - first + 2];
+      const separateUrl = panePadding && startsSeparatePaneUrl(text, boundary);
+      if (authority && offset + authority[0].length <= boundary && !separateUrl &&
+        (paneSpacing === undefined || paneSpacing === spacing) &&
+        (tokenEnd >= nextEnd || /^ *$/.test(text.slice(tokenEnd, nextEnd)))) {
+        paneSpacing = spacing;
+        continue;
+      }
+      // Unlabelled hard lines outside that layout keep their literal separation.
+      if (spacing <= 0 && !separateUrl) return null;
       const leading = spacing & CONTINUATION_MARGIN_MASK;
       for (let col = 0; col < leading; col++) {
         const cell = buffer[line + 1][col];
@@ -202,7 +231,6 @@ function findUrlInRows(
     const end = offset + url.length;
     if (!url || clickOffset < offset || clickOffset >= end) continue;
     if (unsafeDelimiter) return null;
-    const firstLine = first + rowStarts.findIndex((_, index) => offset < rowStarts[index + 1]);
     const lastLine = first + rowStarts.findIndex((_, index) => end <= rowStarts[index + 1]);
     // Never offer a prefix/suffix after truncation, lost ancestry, or a blocked OSC 8 span.
     const before = firstLine > 0 ? gaps(buffer[firstLine - 1], buffer[firstLine], true) : -1;

@@ -40,6 +40,77 @@ test("opens the complete rendered OAuth target from its Korean title and every U
   }
 });
 
+function plainPane(lines: string[], width: number, padding = 1) {
+  const sidebar = "side │";
+  const margin = " ".repeat(padding);
+  const parser = new AnsiParser(sidebar.length + width + 2 * padding + 1, lines.length);
+  parser.write("\x1b[?1049h");
+  lines.forEach((text, row) => {
+    parser.write(`\x1b[${row + 1};1H${sidebar}${margin}${text.padEnd(width)}${margin}▕`);
+  });
+  return { buffer: parser.getFullBuffer(), left: sidebar.length + padding };
+}
+
+test("opens a plain pane-wrapped URL from every row, including schemes embedded in its query", () => {
+  const scopes = ["drive", "spreadsheets", "gmail.modify", "calendar", "documents", "tasks"]
+    .map(scope => `https://www.example.test/auth/${scope}`).join("%20");
+  const url = `https://accounts.example.test/o/oauth2/auth?scope=${scopes}` +
+    "&redirect_uri=http://localhost:12345&client_id=example&prompt=select_account+consent";
+  const printed = `  ${url}`;
+  const inner = printed.indexOf("%20https://") + 3;
+  for (const width of [inner, inner + "https://w".length]) {
+    const chunks = printed.match(new RegExp(`.{1,${width}}`, "g"))!;
+    for (const padding of [0, 1]) {
+      const { buffer, left } = plainPane(["", ...chunks, "", "cancelled"], width, padding);
+      chunks.forEach((chunk, index) => {
+        const startCol = left + (index === 0 ? 2 : 0), endCol = left + chunk.length - 1;
+        for (const col of [startCol, endCol]) {
+          expect(findUrlAtCell(buffer, { row: index + 1, col })).toEqual({ url, startCol, endCol });
+        }
+        expect(findUrlAtCell(buffer, { row: index + 1, col: endCol + 1 })).toBeNull();
+      });
+    }
+  }
+});
+
+test("does not extend a pane URL's host or absorb the next link or a line of prose", () => {
+  for (const [first, second] of [
+    ["https://example.test", ".other.test/path"],
+    ["https://example.test/path", "https://other.test/"],
+    ["https://example.test/path", "next command output"],
+  ]) {
+    const { buffer, left } = plainPane(["", first, second, ""], first.length);
+    expect(findUrlAtCell(buffer, { row: 1, col: left + 8 })?.url).toBe(new URL(first).href);
+    expect(findUrlAtCell(buffer, { row: 2, col: left + 8 })?.url ?? null)
+      .toBe(second.startsWith("https://") ? second : null);
+  }
+});
+
+test("never substitutes an embedded URI when a plain pane URL exceeds the scan budget", () => {
+  const width = 40;
+  const prefix = "https://example.test/?scope=".padEnd(width * 18 - 3, "x") + "%20";
+  const url = (prefix + "https://inner.test/resource/").padEnd(width * 40 + 8, "y");
+  const chunks = url.match(/.{1,40}/g)!;
+  const { buffer, left } = plainPane(["", ...chunks, ""], width);
+  for (const row of [1, 19, chunks.length]) {
+    expect(findUrlAtCell(buffer, { row, col: left + 3 })).toBeNull();
+  }
+});
+
+test("does not offer a partial plain pane link across concealed content or an OSC 8 margin", () => {
+  const chunks = ("https://example.test/path?scope=" + "x".repeat(70)).match(/.{1,40}/g)!;
+  for (const hidden of [true, false]) {
+    const { buffer, left } = plainPane(["", ...chunks, ""], 40);
+    const col = hidden ? left + 5 : left - 1;
+    const cell = buffer[2][col];
+    buffer[2][col] = hidden ? { ...cell, style: { ...cell.style, hidden: true } } :
+      { ...cell, hyperlink: { uri: "https://other.test/" } };
+    for (const row of [1, chunks.length]) {
+      expect(findUrlAtCell(buffer, { row, col: left + 3 })).toBeNull();
+    }
+  }
+});
+
 test("joins actual soft-wrapped URLs without dropping query parameters", () => {
   const parser = new AnsiParser(80, 12);
   parser.write(`(${oauthUrl})`);
