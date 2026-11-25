@@ -1,12 +1,16 @@
 import type { Cell } from "./ansi-parser";
 import { cutsQueryScheme, DISPLAYED_TARGET, paneSchemeOwner, TERMINAL_URL_TOKEN_SEPARATOR, WEB_SCHEME } from "./terminal-url-syntax";
 
+export interface TerminalCodeBlock {
+  first: number; last: number; end: number; lastEnd: number; uri: string;
+}
+
 // OMP indents the Markdown fences by one cell, but prints literal code flush
 // left at the Markdown content width. Herdr reserves one more column when
 // the pane runs to the right edge of the terminal instead of a visible wall.
 export function findTerminalCodeBlock(
-  rows: Cell[][], row: number, left: number, right: number, viewportGutter: boolean,
-): { first: number; last: number; end: number; lastEnd: number; uri: string } | undefined {
+  rows: Cell[][], row: number, left: number, right: number, viewportGutter: boolean, allowSingleRow = false,
+): TerminalCodeBlock | undefined {
   const width = right - left;
   const limit = Math.min(32, Math.floor(4096 / width));
   if (width < 12 || limit < 2 || rows[row]?.[left]?.char === " ") return;
@@ -26,7 +30,7 @@ export function findTerminalCodeBlock(
   const head = rows[first];
   if (!/^[hH]$/.test(head[left]?.char)) return;
   while (last + 1 < rows.length && rows[last + 1][left]?.char !== " " && last - first + 1 < limit) last++;
-  if (first === last || !fence(rows[last + 1], false)) return;
+  if ((!allowSingleRow && first === last) || !fence(rows[last + 1], false)) return;
   const end = right - 2 - (viewportGutter ? 1 : 0);
   let lastEnd = end, uri = "";
   const boundaries: number[] = [];

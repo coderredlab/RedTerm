@@ -6,7 +6,7 @@ import { decodeSixel } from './sixel-decoder';
 import { OscNotifications, type TerminalNotification } from './osc-notifications';
 import { kittyDiacriticIndex } from './kitty-placeholder';
 import { isUrlListDelimiter, paneSchemeOwner, TERMINAL_URL_TOKEN_SEPARATOR, WEB_SCHEME } from "./terminal-url-syntax";
-import { findTerminalCodeBlock, terminalCodeBlockRowEnd } from "./terminal-code-fence";
+import { findTerminalCodeBlock, terminalCodeBlockRowEnd, type TerminalCodeBlock } from "./terminal-code-fence";
 import {
   KITTY_KEYBOARD_STACK_LIMIT,
   KITTY_KEYBOARD_SUPPORTED_FLAGS,
@@ -137,7 +137,7 @@ function alreadyRedrawn(cell: Cell, claims: PathAncestry | PathAncestry[]) {
 }
 function markUnprovenSnapshotRow(
   row: Cell[], start = 0, end = row.length, guard = lostPathAncestry,
-  table = rowPathAncestry, refreshing?: PathAncestry | PathAncestry[],
+  table = rowPathAncestry, refreshing?: PathAncestry | PathAncestry[], preserveBroken = false,
 ) {
   let ancestry = table.get(row);
   for (let col = start; col < end; col++) {
@@ -146,6 +146,7 @@ function markUnprovenSnapshotRow(
     if (refreshing && alreadyRedrawn(cell, refreshing)) continue;
     if (!ancestry) table.set(row, ancestry = new WeakMap());
     const prior = ancestry.get(cell);
+    if (preserveBroken && prior?.broken) continue;
     if (prior !== lostPathAncestry && (guard.broken || !prior?.broken)) ancestry.set(cell, guard);
   }
 }
@@ -233,6 +234,11 @@ function copyUnprovenSnapshotRow(source: Cell[], target: Cell[], start = 0, end 
   if (reflowIncomingCells.has(source) && !hasCompleteReflowIncomingContent(source)) {
     markUnprovenSnapshotRow(source);
   }
+  copyRenderedRowProvenance(source, target, start, end);
+}
+// Copying provenance for a frame comparison is read-only. In particular,
+// don't mark the live row (or its shared ancestry) as a cropped display row.
+function copyRenderedRowProvenance(source: Cell[], target: Cell[], start: number, end: number) {
   const ancestry = rowPathAncestry.get(source);
   if (ancestry) rowPathAncestry.set(target, ancestry);
   const urlAncestry = rowUrlAncestry.get(source);
@@ -305,18 +311,48 @@ function visiblePathDivider(cell: Cell | undefined): boolean {
     !cell.style.hidden && !cell.hyperlink;
 }
 
+// Herdr draws its scroll track as ▕ and the thumb as ▐ in the last column.
+// A half block in the body of a pane can be literal content, not a wall.
+function paneDividerAt(row: Cell[] | undefined, col: number): boolean {
+  if (!row) return false;
+  const cell = row[col];
+  return visiblePathDivider(cell) || (cell?.char === "▐" && col === row.length - 1 && col > 0 &&
+    literalPathSpace(row[col - 1]) && !cell.style.hidden && !cell.hyperlink && !cell.textSizing &&
+    !cell.imagePlaceholder && !hasReflowOutgoingContent(row) && !hasReflowIncomingContent(row));
+}
+
+// Block graphics can reach the right edge too. A thumb must connect to
+// a thin track in that same column, without crossing other text or a wall.
+function hasScrollTrack(rows: Cell[][], y: number, col: number): boolean {
+  for (let step = -1; step <= 1; step += 2) {
+    for (let i = y + step; Math.abs(i - y) <= PATH_EDGE_BUDGET && rows[i]?.length === col + 1 && paneDividerAt(rows[i], col); i += step) {
+      const ch = rows[i][col].char;
+      if (ch === "▕" && col > 0 && literalPathSpace(rows[i][col - 1])) return true;
+      if (ch !== "▐") break;
+    }
+  }
+  return false;
+}
+
+function paneDividerWitness(rows: Cell[][], y: number, col: number, allowThumb: boolean): boolean {
+  return paneDividerAt(rows[y], col) && (rows[y][col].char !== "▐" || (allowThumb && hasScrollTrack(rows, y, col)));
+}
+
 const heightClippedDividers = new WeakSet<Cell>();
 /** Use the same three-row pane boundary for matching and partial mutation guards. */
 export function isTerminalPathDividerColumn(buffer: Cell[][], row: number, col: number): boolean {
   const cell = buffer[row]?.[col];
-  if (!cell || !visiblePathDivider(cell)) return false;
+  if (!cell || !paneDividerAt(buffer[row], col)) return false;
   // In a one/two-row viewport, shrinking may have removed the three-row
   // witness while retaining this exact, still-unrepainted divider.
   if (buffer.length < 3) return heightClippedDividers.has(cell);
-  const above = visiblePathDivider(buffer[row - 1]?.[col]);
-  const below = visiblePathDivider(buffer[row + 1]?.[col]);
-  return (above && (below || visiblePathDivider(buffer[row - 2]?.[col]))) ||
-    (below && visiblePathDivider(buffer[row + 2]?.[col]));
+  if (cell.char === "▐" && !hasScrollTrack(buffer, row, col)) return false;
+  // A scrollbar may start below a title ending in a literal box glyph. Only a
+  // separated rail cell can borrow a thumb as its additional wall witness.
+  const rail = col === buffer[row].length - 1 && col > 0 && literalPathSpace(buffer[row][col - 1]);
+  const above = paneDividerWitness(buffer, row - 1, col, rail), below = paneDividerWitness(buffer, row + 1, col, rail);
+  return (above && (below || paneDividerWitness(buffer, row - 2, col, rail))) ||
+    (below && paneDividerWitness(buffer, row + 2, col, rail));
 }
 
 function mightSpanBoundary(before: Cell[] | undefined, after: Cell[] | undefined): boolean {
@@ -327,7 +363,7 @@ function mightSpanBoundary(before: Cell[] | undefined, after: Cell[] | undefined
   // that an otherwise identical pane continuation was a complete standalone path.
   let start = 0, bounded = false;
   for (let col = 0; col < Math.min(before.length, after.length); col++) {
-    if (!visiblePathDivider(before[col]) || !visiblePathDivider(after[col])) continue;
+    if (!paneDividerAt(before, col) || !paneDividerAt(after, col)) continue;
     if (mightSpanPathRange(before, after, start, col, col, true)) return true;
     start = col + 1;
     bounded = true;
@@ -409,15 +445,16 @@ const BOX_ROOF_RIGHT = /^[┐-┓╕-╗╮]$/u;
 const BOX_FLOOR_LEFT = /^[└-┗╘-╚╰]$/u;
 const BOX_FLOOR_RIGHT = /^[┘-┛╛-╝╯]$/u;
 
-function firstUnprovenFrameColumn(buffer: Cell[][], y: number, start: number, end: number): number {
+function firstUnprovenFrameColumn(buffer: Cell[][], y: number, start: number, end: number, plainUrl = false): number {
   const row = buffer[y], before = buffer[y - 1], after = buffer[y + 1];
   if (unknownPredecessorRows.has(row) || hasReflowIncomingContent(row) || hasReflowOutgoingContent(row) ||
     (before && isReflowContinuation(before, row)) || (after && isReflowContinuation(row, after))) return start;
   const paths = rowPathAncestry.get(row), urls = rowUrlAncestry.get(row);
   for (let col = start; col < end; col++) {
     const cell = row[col];
+    const path = paths?.get(cell);
     if (cell.style.hidden || cell.hyperlink || cell.textSizing || cell.imagePlaceholder ||
-      paths?.get(cell)?.broken || urls?.get(cell)?.broken) return col;
+      (plainUrl ? path === lostPathAncestry : path?.broken) || urls?.get(cell)?.broken) return col;
   }
   return end;
 }
@@ -640,6 +677,90 @@ interface CoveredPane {
   blockedFrom: Uint32Array;
 }
 
+interface FencedPaint {
+  first: number; last: number; left: number; right: number;
+  prefix?: string; guard: PathAncestry;
+}
+interface SynchronizedPaint {
+  next: number; full: boolean; box?: BoxRepaint; covered?: CoveredPane;
+  newTicks?: WeakSet<Cell>; ink?: WeakSet<Cell>; fences?: FencedPaint[];
+  // Snapshot a row before its first link-relevant change. Build the previous
+  // viewport only if we actually need proof for a fenced link.
+  before?: Map<number, Cell[]>; original?: Cell[][];
+  moved?: Map<Cell, TerminalCodeBlock>;
+}
+
+function newOpening(paint: SynchronizedPaint, row: Cell[], left: number): boolean {
+  const ticks = paint.newTicks;
+  return !!ticks && (ticks.has(row[left + 1]) || ticks.has(row[left + 2]) || ticks.has(row[left + 3]));
+}
+
+// A forward compositor diff can move an existing answer up and leave equal
+// glyphs unwritten. Read the old target below the new roof *before* touching
+// those rows; a transient block assembled halfway through a frame is not proof.
+function rememberMovingFence(rows: Cell[][], y: number, col: number, tick: Cell, paint: SynchronizedPaint) {
+  const left = col - 1;
+  if (left < 0 || !literalPathSpace(rows[y][left]) || (left > 0 && !isTerminalPathDividerColumn(rows, y, left - 1)) ||
+    (paint.moved?.size ?? 0) >= 32) return;
+  const right = nextPathWall(rows, y, left, rows[y].length);
+  if (right - left < 12) return;
+  const limit = Math.min(rows.length - 3, y + 32, y + Math.floor(PATH_EDGE_BUDGET / (right - left)));
+  for (let roof = y + 1; roof <= limit; roof++) {
+    if (rows[roof][left + 1]?.char !== "`" || !/^[hH]$/.test(rows[roof + 1][left]?.char ?? "")) continue;
+    const previous = originalFenceRows(rows, paint);
+    const source = findTerminalCodeBlock(previous, roof + 1, left, right, left > 0 && right === rows[y].length, true);
+    if (!source || source.first !== roof + 1) continue;
+    if (!trustedFencedBlock(previous, source, left, right) || !trustedFencedBlock(rows, source, left, right)) return;
+    (paint.moved ??= new Map()).set(tick, source);
+    return;
+  }
+}
+
+// Only release this frame's guard, never one inherited from a crop or prior
+// edit. A fresh fence does not own unwritten body cells from unrelated text.
+function presentFencedPaint(rows: Cell[][], paint: SynchronizedPaint) {
+  for (const prior of paint.fences!) {
+    const { first, last, left, right, prefix, guard } = prior;
+    const start = prefix === undefined ? first : Math.max(1, first - 32);
+    const stop = prefix === undefined ? first : Math.min(rows.length - 2, last + 1);
+    for (let y = start; y <= stop; y++) {
+      if (!/^[hH]$/.test(rows[y][left]?.char ?? "") ||
+        (y !== first && !newOpening(paint, rows[y - 1], left))) continue;
+      const block = findTerminalCodeBlock(rows, y, left, right, left > 0 && right === rows[y].length);
+      if (!block || block.first !== y || (prefix !== undefined && !block.uri.startsWith(prefix))) continue;
+      const source = paint.moved?.get(rows[y - 1][left + 1]);
+      const moved = source && block.uri.startsWith(source.uri) ? source : undefined;
+      let whole = true, offset = 0;
+      for (let line = y - 1; line <= block.last + 1 && whole; line++) {
+        const row = rows[line];
+        if (!isWholePane(rows, line, left, right)) { whole = false; break; }
+        if (line < y || line > block.last) continue;
+        const end = line === block.last ? block.lastEnd : block.end;
+        for (let x = left; x < end; x++) {
+          offset += row[x].char.length;
+          if (paint.ink?.has(row[x]) || (prefix !== undefined && offset <= prefix.length)) continue;
+          // The old answer moved within the pane. A reused glyph must still
+          // belong to that answer, not to a neighboring message. Beyond its
+          // known prefix only an unchanged glyph between two new ones is
+          // evidence of a sparse diff, never an unwritten tail.
+          if (!moved || line < moved.first || line > moved.last || x >= (line === moved.last ? moved.lastEnd : moved.end) ||
+            (offset > moved.uri.length && !(x > left && x + 1 < end && paint.ink?.has(row[x - 1]) && paint.ink.has(row[x + 1])))) {
+            whole = false; break;
+          }
+        }
+      }
+      if (!whole) continue;
+      for (let line = y - 1; line <= block.last + 1; line++) {
+        const row = rows[line], used = terminalCodeBlockRowEnd(row, line, left, right, block);
+        for (const table of renderedAncestryTables) {
+          const map = table.get(row);
+          if (map) for (let x = left; x < used; x++) if (map.get(row[x]) === guard) map.delete(row[x]);
+        }
+      }
+    }
+  }
+}
+
 // East Asian W/F widths used for both painting and validating a wide tail.
 function isWideChar(char: string): boolean {
   const code = char.codePointAt(0)!;
@@ -732,12 +853,31 @@ function presentUncoveredPane(rows: Cell[][], pane: CoveredPane) {
   }
 }
 
+function originalFenceRows(rows: Cell[][], paint: SynchronizedPaint): Cell[][] {
+  if (!paint.before) return rows;
+  if (!paint.original) {
+    paint.original = rows.slice();
+    for (const [y, row] of paint.before) paint.original[y] = row;
+  }
+  return paint.original;
+}
+
+function trustedFencedBlock(rows: Cell[][], block: TerminalCodeBlock, left: number, right: number) {
+  for (let y = block.first - 1; y <= block.last + 1; y++) {
+    const row = rows[y], used = terminalCodeBlockRowEnd(row, y, left, right, block);
+    if (!isWholePane(rows, y, left, right) || firstUnprovenFrameColumn(rows, y, left, used, true) !== used) return false;
+    if (y > block.first && y <= block.last && (pathLeadingMarginInRange(rows[y - 1], row, left, right, right) < 0 ||
+      retainedHardPathBoundary(rows[y - 1], row, left, right, right, 0, true))) return false;
+  }
+  return true;
+}
+
 // The Markdown gutter is a real separator everywhere except an intact,
 // single-target code block. Claim that *old* block before the edit can remove
 // its fence, a middle row, or a nested scheme's predecessor.
-type FenceGeometryChange = "cut" | "resize" | "ink";
+type FenceGeometryChange = "cut" | "resize" | "ink" | "append";
 function markFencedUrlDamage(
-  rows: Cell[][], y: number, left: number, right: number, from: number, to: number, geometry?: FenceGeometryChange,
+  rows: Cell[][], y: number, left: number, right: number, from: number, to: number, geometry?: FenceGeometryChange, paint?: SynchronizedPaint,
 ) {
   const row = rows[y];
   if (!row || right - left < 12) return;
@@ -752,19 +892,42 @@ function markFencedUrlDamage(
     let line = block.first - 1;
     while (line <= block.last + 1 && isWholePane(rows, line, left, right)) line++;
     if (line <= block.last + 1) continue;
-    const guard = { broken: true };
+    let guard: PathAncestry | undefined;
+    if (paint) {
+      const fresh = newOpening(paint, rows[block.first - 1], left);
+      const growth = geometry === "append" && ((y === block.last && from === block.lastEnd && from < block.end) ||
+        (from === left && (y === block.first - 1 || y === block.last + 1)));
+      if (fresh || growth) {
+        const pending = paint.fences ??= [];
+        guard = pending.find(item => item.first === block.first && item.left === left && item.right === right)?.guard;
+        if (!guard && pending.length < 32) {
+          guard = { broken: true };
+          let prefix: string | undefined;
+          if (!fresh) {
+            const previous = originalFenceRows(rows, paint);
+            const source = findTerminalCodeBlock(previous, block.first, left, right, left > 0 && right === row.length);
+            if (source?.first === block.first && source.uri === block.uri && trustedFencedBlock(previous, source, left, right) &&
+              trustedFencedBlock(rows, block, left, right)) prefix = source.uri;
+          }
+          pending.push({ first: block.first, last: block.last, left, right, prefix, guard });
+          paint.ink ??= new WeakSet();
+        }
+      }
+    }
+    const pendingGuard = guard !== undefined;
+    guard ??= { broken: true };
     for (line = block.first - 1; line <= block.last + 1; line++) {
       const cells = rows[line], used = terminalCodeBlockRowEnd(cells, line, left, right, block);
-      for (const table of renderedAncestryTables) markUnprovenSnapshotRow(cells, left, used, guard, table);
+      for (const table of renderedAncestryTables) markUnprovenSnapshotRow(cells, left, used, guard, table, undefined, pendingGuard);
     }
   }
 }
 
-function markFencedRowDamage(rows: Cell[][], y: number, from: number, to: number, geometry?: FenceGeometryChange) {
+function markFencedRowDamage(rows: Cell[][], y: number, from: number, to: number, geometry?: FenceGeometryChange, paint?: SynchronizedPaint) {
   const width = rows[y].length;
   for (let left = 0; left < width;) {
     const right = nextPathWall(rows, y, left, width);
-    if (to > left - 1 && from <= right) markFencedUrlDamage(rows, y, left, right, from, to, geometry);
+    if (to > left - 1 && from <= right) markFencedUrlDamage(rows, y, left, right, from, to, geometry, paint);
     left = right + 1;
     if (right >= to) return right;
   }
@@ -775,12 +938,13 @@ function markFencedRowDamage(rows: Cell[][], y: number, from: number, to: number
 // Return the next potentially affected token in this run, not the next cell.
 function guardPrintedPathPane(
   rows: Cell[][], y: number, start: number, end: number, changed: boolean, runStart: number, col: number,
-  table: typeof rowPathAncestry, refreshing?: PathAncestry, box?: BoxRepaint,
+  table: typeof rowPathAncestry, refreshing?: PathAncestry, paint?: SynchronizedPaint,
 ) {
   if (end <= start || end - start > PATH_EDGE_BUDGET) return end;
   const plainUrl = table === rowUrlAncestry;
   const wall = col < start || col >= end;
-  if (changed && plainUrl) markFencedUrlDamage(rows, y, start, end, col, col + 1);
+  if (changed && plainUrl) markFencedUrlDamage(rows, y, start, end, col, col + 1, undefined, paint);
+  const box = paint?.box;
   let ink: PathInk[] | undefined, next = end;
   for (let step = -1; step <= 1; step += 2) {
     const budget = { left: PATH_EDGE_BUDGET };
@@ -1444,7 +1608,7 @@ export class AnsiParser {
   private changedPathEnd = 0;
   private changedUrlEnd = 0;
   private repaintRun: WeakSet<PathAncestry> | null = null;
-  private synchronizedPaint?: { next: number; full: boolean; box?: BoxRepaint; covered?: CoveredPane };
+  private synchronizedPaint?: SynchronizedPaint;
   private scrollback: Cell[][] = [];
   private fullBufferCache: Cell[][] = [];
   private fullBufferDirty = true;
@@ -5131,6 +5295,7 @@ export class AnsiParser {
         if (!enabled && paint?.full && paint.covered && paint.next === this.rows * this.cols) {
           presentUncoveredPane(this.buffer, paint.covered);
         }
+        if (!enabled && paint?.fences && !paint.covered) presentFencedPaint(this.buffer, paint);
         const box = paint?.box;
         if (!enabled && box?.closing && box.nextCol === -1 && box.pending) {
           for (const { map, row, start, end } of box.pending) {
@@ -5339,6 +5504,12 @@ export class AnsiParser {
   private guardPrintableReplacement(row: Cell[], col: number, replacement: Cell) {
     const old = row[col];
     if (this.synchronizedPaint) this.trackBoxRepaint(row, col, replacement);
+    const paint = this.synchronizedPaint;
+    if (paint && replacement.char === "`" && old.char !== "`") {
+      (paint.newTicks ??= new WeakSet()).add(replacement);
+      paint.ink ??= new WeakSet();
+      rememberMovingFence(this.buffer, this.cursorY, col, replacement, paint);
+    }
     if (replacement.char === "`") this.sawBacktick = true;
     if (this.inspectedPrintRow !== row || this.inspectedPrintNext !== col) {
       this.inspectedPrintRow = row;
@@ -5356,12 +5527,20 @@ export class AnsiParser {
       // The bottom row could only be the closing fence. A fresh shell line
       // cannot be one; do not materialize scrollback for append-only logs.
       if (this.cursorY < this.rows - 1 || row.some(cell => cell.char === "`")) {
-        next = this.damageFencedRow(this.cursorY, col, col + 1, addsInk ? "ink" : undefined);
+        const appendable = addsInk && literalPathSpace(old) && !replacement.style.hidden && !replacement.hyperlink &&
+          !replacement.imagePlaceholder && !replacement.textSizing && !TERMINAL_URL_TOKEN_SEPARATOR.test(replacement.char);
+        next = this.damageFencedRow(this.cursorY, col, col + 1, appendable ? "append" : addsInk ? "ink" : undefined);
       }
       this.inspectedBlankEnd = addsInk ? next : col + 1;
     }
     if (!literalPathSpace(old)) {
-      const changed = !sameLinkInk(old, replacement);
+      // Moving the thumb along an intact track changes paint, not pane geometry.
+      const sameRail = col === row.length - 1 && ((old.char === "▕" && replacement.char === "▐") ||
+        (old.char === "▐" && replacement.char === "▕")) && !old.style.hidden && !replacement.style.hidden &&
+        !old.hyperlink && !replacement.hyperlink && !old.textSizing && !replacement.textSizing &&
+        !old.imagePlaceholder && !replacement.imagePlaceholder && hasScrollTrack(this.buffer, this.cursorY, col) &&
+        isTerminalPathDividerColumn(this.buffer, this.cursorY, col);
+      const changed = !sameRail && !sameLinkInk(old, replacement);
       const path = rowPathAncestry.get(row)?.get(old);
       const url = rowUrlAncestry.get(row)?.get(old) ?? (path === lostPathAncestry ? path : undefined);
       // A new run can erase an already-broken owner after its successor has
@@ -5381,9 +5560,9 @@ export class AnsiParser {
             const plainUrl = table === rowUrlAncestry;
             if (!(plainUrl ? inspectUrl : inspectPath)) continue;
             const refreshing = plainUrl ? url : path;
-            if (wall) guardPrintedPathPane(rows, y, start, col, changed, this.printRunStart, col, table, refreshing, this.synchronizedPaint?.box);
+            if (wall) guardPrintedPathPane(rows, y, start, col, changed, this.printRunStart, col, table, refreshing, paint);
             const next = guardPrintedPathPane(rows, y, wall ? col + 1 : start, end, changed, this.printRunStart, col,
-              table, refreshing, this.synchronizedPaint?.box);
+              table, refreshing, paint);
             if (plainUrl) {
               this.inspectedUrlEnd = next;
               if (changed) this.changedUrlEnd = next;
@@ -5405,6 +5584,17 @@ export class AnsiParser {
         if (urlGuard?.broken) run.add(urlGuard);
       }
     }
+    if (paint && this.sawBacktick && !sameLinkInk(old, replacement)) {
+      const originals = paint.before ??= new Map();
+      if (!originals.has(this.cursorY)) {
+        const previous = row.slice();
+        copyRenderedRowProvenance(row, previous, 0, row.length);
+        if (reflowIncomingCells.has(row) && !hasCompleteReflowIncomingContent(row)) unknownPredecessorRows.add(previous);
+        originals.set(this.cursorY, previous);
+        if (paint.original) paint.original[this.cursorY] = previous;
+      }
+    }
+    if (paint?.ink && replacement !== this.emptyCell) paint.ink.add(replacement);
     if (this.repaintRun && replacement !== this.emptyCell) cellRepaintRuns.set(replacement, this.repaintRun);
   }
 
@@ -5414,7 +5604,7 @@ export class AnsiParser {
   private damageFencedRow(y: number, from: number, to: number, geometry?: FenceGeometryChange) {
     if (!this.sawBacktick) return this.cols;
     const history = this.scrollback.length, reach = 35;
-    if (!history || y >= reach) return markFencedRowDamage(this.buffer, y, from, to, geometry);
+    if (!history || y >= reach) return markFencedRowDamage(this.buffer, y, from, to, geometry, this.synchronizedPaint);
     if (!this.fullBufferDirty) return markFencedRowDamage(this.fullBufferCache, history + y, from, to, geometry);
     const start = Math.max(-history, y - reach), end = Math.min(this.buffer.length, y + reach + 1);
     const window = this.fenceWindow ??= [];
