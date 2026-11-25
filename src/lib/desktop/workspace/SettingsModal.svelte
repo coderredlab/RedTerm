@@ -1,11 +1,12 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, tick, untrack } from "svelte";
 
   import { settingsStore, terminalFontStack } from "$lib/stores/settings.svelte";
   import { isLightTheme, THEMES } from "$lib/styles/themes";
   import { getAppVersion, listSystemFonts } from "$lib/tauri/commands";
   import { desktopUpdateStore } from "./desktop-update.svelte";
   import { modalFocus } from "./modal-focus";
+  import { filterSystemFonts } from "./system-fonts";
 
   interface Props {
     open: boolean;
@@ -14,13 +15,19 @@
 
   let { open, onClose }: Props = $props();
   let appVersion = $state("");
-  let systemFonts = $state<string[]>([]);
+  let systemFonts = $state.raw<string[]>([]);
   let fontListStatus = $state<"idle" | "loading" | "ready" | "error">("idle");
+  let fontCandidates: Promise<string[]> | undefined;
+  let validatedFont = "";
   let fontPickerElement = $state<HTMLDivElement>();
   let fontTriggerElement = $state<HTMLButtonElement>();
   let fontListElement = $state<HTMLDivElement>();
   let fontMenuOpen = $state(false);
-  let highlightedFontIndex = $state(0);
+  let highlightedFont = $state("");
+  type FontNavigation = "ArrowDown" | "ArrowUp" | "Home" | "End" | { prefix: string };
+  const pendingFontNavigation: FontNavigation[] = [];
+  let pendingNavigationStart = "";
+  let confirmForSelection: string | null = null;
   let fontTypeahead = "";
   let fontTypeaheadTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -45,13 +52,12 @@
   let activeSection = $state<SettingsSection>("terminal");
   let fontOptions = $derived([
     "",
-    ...(fontListStatus !== "ready" &&
-    settingsStore.terminalFontFamily &&
-    !systemFonts.includes(settingsStore.terminalFontFamily)
+    ...(fontListStatus !== "ready" && settingsStore.terminalFontFamily
       ? [settingsStore.terminalFontFamily]
       : []),
     ...systemFonts,
   ]);
+  let highlightedFontIndex = $derived(Math.max(0, fontOptions.indexOf(highlightedFont)));
 
   onMount(() => {
     void getAppVersion().then((version) => {
@@ -64,7 +70,7 @@
         event.target instanceof Node &&
         !fontPickerElement?.contains(event.target)
       ) {
-        fontMenuOpen = false;
+        closeFontMenu();
       }
     };
 
@@ -112,47 +118,71 @@
     return `terminal-font-option-${index}`;
   }
 
-  function scrollHighlightedFontIntoView() {
-    requestAnimationFrame(() => {
-      document
-        .getElementById(fontOptionId(highlightedFontIndex))
-        ?.scrollIntoView({ block: "nearest" });
-    });
+  async function scrollHighlightedFontIntoView() {
+    await tick();
+    fontListElement?.querySelector(`#${fontOptionId(highlightedFontIndex)}`)
+      ?.scrollIntoView({ block: "nearest" });
   }
 
-  function moveFontHighlight(delta: number) {
-    if (fontOptions.length === 0) return;
-    highlightedFontIndex =
-      (highlightedFontIndex + delta + fontOptions.length) % fontOptions.length;
-    scrollHighlightedFontIntoView();
+  function isFontNavigationKey(key: string): key is Extract<FontNavigation, string> {
+    return key === "ArrowDown" || key === "ArrowUp" || key === "Home" || key === "End";
   }
 
-  function openFontMenu(initialDelta = 0) {
-    const selectedIndex = fontOptions.indexOf(settingsStore.terminalFontFamily);
-    highlightedFontIndex = Math.max(0, selectedIndex);
-    if (initialDelta !== 0) moveFontHighlight(initialDelta);
+  function nextFontIndex(index: number, navigation: FontNavigation): number {
+    const count = fontOptions.length;
+    if (navigation === "ArrowDown") return (index + 1) % count;
+    if (navigation === "ArrowUp") return (index + count - 1) % count;
+    if (navigation === "Home") return 0;
+    if (navigation === "End") return count - 1;
+    const match = fontOptions.findIndex((family) =>
+      fontLabel(family).toLocaleLowerCase().startsWith(navigation.prefix),
+    );
+    return match < 0 ? index : match;
+  }
+
+  function clearPendingFontInput() {
+    pendingFontNavigation.length = 0;
+    confirmForSelection = null;
+  }
+
+  function navigateFonts(navigation: FontNavigation) {
+    // Navigating again revises the target and requires a fresh confirmation.
+    confirmForSelection = null;
+    if (fontListStatus === "idle" || fontListStatus === "loading") {
+      if (!pendingFontNavigation.length) pendingNavigationStart = highlightedFont;
+      pendingFontNavigation.push(navigation);
+    }
+    highlightedFont = fontOptions[nextFontIndex(highlightedFontIndex, navigation)];
+    void scrollHighlightedFontIntoView();
+  }
+
+  async function openFontMenu(initial?: FontNavigation) {
+    highlightedFont = settingsStore.terminalFontFamily;
     fontMenuOpen = true;
-    requestAnimationFrame(() => {
+    if (initial) navigateFonts(initial);
+    await tick();
+    if (fontMenuOpen) {
       fontListElement?.focus();
-      scrollHighlightedFontIntoView();
-    });
+      void scrollHighlightedFontIntoView();
+    }
   }
 
   function closeFontMenu(restoreFocus = false) {
     fontMenuOpen = false;
+    clearPendingFontInput();
     fontTypeahead = "";
     if (fontTypeaheadTimer !== null) {
       clearTimeout(fontTypeaheadTimer);
       fontTypeaheadTimer = null;
     }
-    if (restoreFocus) requestAnimationFrame(() => fontTriggerElement?.focus());
+    if (restoreFocus) fontTriggerElement?.focus();
   }
 
   function toggleFontMenu() {
     if (fontMenuOpen) {
       closeFontMenu(true);
     } else {
-      openFontMenu();
+      void openFontMenu();
     }
   }
 
@@ -162,15 +192,21 @@
   }
 
   function handleFontTriggerKeydown(event: KeyboardEvent) {
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    if (isFontNavigationKey(event.key)) {
       event.preventDefault();
-      openFontMenu(event.key === "ArrowDown" ? 1 : -1);
+      void openFontMenu(event.key);
+    } else if (event.key.length === 1 && event.key !== " " && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      event.preventDefault();
+      void openFontMenu();
+      handleFontListKeydown(event);
     }
   }
 
   function handleFontListKeydown(event: KeyboardEvent) {
     if (event.key === "Tab") {
-      closeFontMenu();
+      // Let the native Tab action continue from the trigger, not the removed list.
+      if (fontListElement) fontListElement.tabIndex = -1;
+      closeFontMenu(true);
       return;
     }
 
@@ -181,21 +217,18 @@
       return;
     }
 
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    if (isFontNavigationKey(event.key)) {
       event.preventDefault();
-      moveFontHighlight(event.key === "ArrowDown" ? 1 : -1);
-      return;
-    }
-
-    if (event.key === "Home" || event.key === "End") {
-      event.preventDefault();
-      highlightedFontIndex = event.key === "Home" ? 0 : fontOptions.length - 1;
-      scrollHighlightedFontIntoView();
+      navigateFonts(event.key);
       return;
     }
 
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
+      if (pendingFontNavigation.length) {
+        confirmForSelection = settingsStore.terminalFontFamily;
+        return;
+      }
       const fontFamily = fontOptions[highlightedFontIndex];
       if (fontFamily !== undefined) selectFontFamily(fontFamily);
       return;
@@ -215,45 +248,54 @@
       fontTypeaheadTimer = null;
     }, 700);
 
-    const matchingIndex = fontOptions.findIndex((fontFamily) =>
-      fontLabel(fontFamily).toLocaleLowerCase().startsWith(fontTypeahead),
-    );
-    if (matchingIndex >= 0) {
-      highlightedFontIndex = matchingIndex;
-      scrollHighlightedFontIntoView();
-    }
+    navigateFonts({ prefix: fontTypeahead });
   }
 
-  function filterMonospacedFonts(fontFamilies: string[]): string[] {
-    const context = document.createElement("canvas").getContext("2d");
-    if (!context) return [];
-
-    return fontFamilies.filter((fontFamily) => {
-      const escapedFontFamily = fontFamily
-        .replaceAll("\\", "\\\\")
-        .replaceAll('"', '\\"');
-      context.font = `16px "${escapedFontFamily}"`;
-      const narrowWidth = context.measureText("iiiiiiii").width;
-      const wideWidth = context.measureText("MMMMMMMM").width;
-      return Math.abs(narrowWidth - wideWidth) < 0.5;
+  function installedFamilies() {
+    return fontCandidates ??= listSystemFonts().catch((error) => {
+      fontCandidates = undefined;
+      throw error;
     });
   }
 
-  async function loadFonts() {
+  async function loadFonts(signal: AbortSignal) {
     fontListStatus = "loading";
     try {
-      const fontFamilies = await listSystemFonts();
-      await document.fonts.ready;
-      systemFonts = filterMonospacedFonts(fontFamilies);
+      const families = await installedFamilies();
+      const usable = await filterSystemFonts(families, signal);
+      if (signal.aborted || !open || !fontMenuOpen || activeSection !== "terminal") return;
+      systemFonts = usable;
       fontListStatus = "ready";
-      if (
-        settingsStore.terminalFontFamily &&
-        !systemFonts.includes(settingsStore.terminalFontFamily)
-      ) {
-        settingsStore.setTerminalFontFamily("");
+      if (pendingFontNavigation.length) {
+        // Resolve the same key sequence against the complete list, starting
+        // from the real selection/hover rather than its provisional movements.
+        let index = Math.max(0, fontOptions.indexOf(pendingNavigationStart));
+        for (const navigation of pendingFontNavigation) index = nextFontIndex(index, navigation);
+        const confirmed = confirmForSelection === settingsStore.terminalFontFamily;
+        clearPendingFontInput();
+        highlightedFont = fontOptions[index];
+        if (confirmed) selectFontFamily(highlightedFont);
+        else void scrollHighlightedFontIntoView();
       }
     } catch {
-      fontListStatus = "error";
+      if (!signal.aborted) {
+        clearPendingFontInput();
+        fontListStatus = "error";
+      }
+    }
+  }
+
+  async function validateSavedFont(family: string, signal: AbortSignal) {
+    try {
+      const families = await installedFamilies();
+      if (signal.aborted) return;
+      const usable = families.includes(family) &&
+        (await filterSystemFonts([family], signal)).length !== 0;
+      if (signal.aborted || settingsStore.terminalFontFamily !== family) return;
+      if (usable) validatedFont = family;
+      else settingsStore.setTerminalFontFamily("");
+    } catch {
+      // An unavailable catalogue is not evidence against the saved preference.
     }
   }
 
@@ -279,15 +321,31 @@
   });
 
   $effect(() => {
-    if (open && fontListStatus === "idle") {
-      void loadFonts();
-    } else if (!open && fontListStatus === "error") {
-      fontListStatus = "idle";
+    if (!open || !fontMenuOpen || activeSection !== "terminal") {
+      if (fontListStatus === "loading" || fontListStatus === "error") fontListStatus = "idle";
+      return;
+    }
+    if (untrack(() => fontListStatus === "ready")) return;
+    const controller = new AbortController();
+    void loadFonts(controller.signal);
+    return () => controller.abort();
+  });
+
+  $effect(() => {
+    if (!open) return;
+    const family = settingsStore.terminalFontFamily;
+    if (!family) return;
+    if (fontListStatus === "ready") {
+      if (!systemFonts.includes(family)) settingsStore.setTerminalFontFamily("");
+    } else if (!fontMenuOpen && validatedFont !== family) {
+      const controller = new AbortController();
+      void validateSavedFont(family, controller.signal);
+      return () => controller.abort();
     }
   });
 
   $effect(() => {
-    if (!open && fontMenuOpen) closeFontMenu();
+    if ((!open || activeSection !== "terminal") && fontMenuOpen) closeFontMenu();
   });
 
   let updatePhase = $derived(desktopUpdateStore.phase);
@@ -416,8 +474,12 @@
                         role="option"
                         aria-selected={settingsStore.terminalFontFamily === fontFamily}
                         tabindex="-1"
-                        style:font-family={terminalFontStack(fontFamily)}
-                        onpointerenter={() => (highlightedFontIndex = index)}
+                        style:font-family={highlightedFontIndex === index ? terminalFontStack(fontFamily) : undefined}
+                        onpointerdown={clearPendingFontInput}
+                        onpointermove={() => {
+                          clearPendingFontInput();
+                          highlightedFont = fontFamily;
+                        }}
                         onclick={() => selectFontFamily(fontFamily)}
                       >
                         <span>{fontLabel(fontFamily)}</span>
