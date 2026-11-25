@@ -402,6 +402,49 @@ const HORIZONTAL = /^[─━┄┅┈┉╌╍═┬-╋╤-╬]$/u;
 const RULE_JUNCTION = /^[┬-╋╤-╬]$/u;
 const RULE_START = /^[┌-┏└-┗├-┣╒-╔╘-╚╞-╠╭╰]$/u;
 const RULE_END = /^[┐-┓┘-┛┤-┫╕-╗╛-╝╡-╣╮╯]$/u;
+const RULE_STROKE = /^[─━┄┅┈┉╌╍═]$/u;
+const NOT_RULE_TITLE_INK = /[\p{C}\p{Z}\u2500-\u259f]/u;
+const BOX_FLOOR_LEFT = /^[└-┗╘-╚╰]$/u;
+const BOX_FLOOR_RIGHT = /^[┘-┛╛-╝╯]$/u;
+
+function provenFrameSpan(buffer: Cell[][], y: number, start: number, end: number): boolean {
+  const row = buffer[y], before = buffer[y - 1], after = buffer[y + 1];
+  for (let col = start; col < end; col++) {
+    const cell = row[col];
+    if (cell.style.hidden || cell.hyperlink || cell.textSizing || cell.imagePlaceholder) return false;
+  }
+  return !unknownPredecessorRows.has(row) && !hasUnprovenPathCells(row, start, end) &&
+    !hasUnprovenPathCells(row, start, end, true) && !hasReflowIncomingContent(row) && !hasReflowOutgoingContent(row) &&
+    !(before && isReflowContinuation(before, row)) && !(after && isReflowContinuation(row, after));
+}
+
+// A caption is not a terminator by itself. Its two caps must replace the
+// walls of this exact pane, with an unbroken stroke on each side of the title.
+function titledPaneRule(buffer: Cell[][], y: number, left: number, right: number): boolean | undefined {
+  const row = buffer[y];
+  if (left === 0 || right === row.length || !RULE_START.test(row[left - 1].char) ||
+    !RULE_END.test(row[right].char)) return undefined;
+  let head = left, tail = right;
+  while (head < right && RULE_STROKE.test(row[head].char)) head++;
+  while (tail > head && RULE_STROKE.test(row[tail - 1].char)) tail--;
+  if (head === left || tail === right || tail - head < 3 ||
+    row[head].char !== " " || row[tail - 1].char !== " ") return undefined;
+  let ink = false;
+  for (let col = head + 1; col < tail - 1; col++) {
+    const char = row[col].char;
+    if (char === "") {
+      if (!row[col - 1].char.trim()) return undefined; // Orphaned wide-cell tail.
+      continue;
+    }
+    if (char === " ") continue;
+    if (NOT_RULE_TITLE_INK.test(char)) return undefined;
+    if (!OSC_TEXT_ZERO_WIDTH_GRAPHEME.test(char)) ink = true;
+  }
+  if (!ink) return undefined;
+  if (!(isTerminalPathDividerColumn(buffer, y - 1, left - 1) && isTerminalPathDividerColumn(buffer, y - 1, right)) &&
+    !(isTerminalPathDividerColumn(buffer, y + 1, left - 1) && isTerminalPathDividerColumn(buffer, y + 1, right))) return undefined;
+  return provenFrameSpan(buffer, y, left - 1, right + 1);
+}
 
 /** Undefined means ordinary content; a concealed/linked rule is not a trusted terminator. */
 export function terminalPaneHorizontalRule(buffer: Cell[][], y: number, left: number, right: number): boolean | undefined {
@@ -411,7 +454,7 @@ export function terminalPaneHorizontalRule(buffer: Cell[][], y: number, left: nu
   for (let col = left; col < right; col++) {
     const cell = row[col];
     if (!HORIZONTAL.test(cell.char) && !(col === left && RULE_START.test(cell.char)) &&
-      !(col === right - 1 && RULE_END.test(cell.char))) return undefined;
+      !(col === right - 1 && RULE_END.test(cell.char))) return titledPaneRule(buffer, y, left, right);
     if (cell.style.hidden || cell.hyperlink) visible = false;
   }
   // The visible rule has to reach real endpoints on both sides, not be a
@@ -570,11 +613,20 @@ function markLostAlternateEdge(rows: Cell[][], retained: number, step: 1 | -1, s
   }
 }
 
+interface PendingBoxSpan {
+  map: WeakMap<Cell, PathAncestry>; row: Cell[]; start: number; end: number;
+}
+interface BoxRepaint {
+  left: number; right: number; top: number; end: number; nextCol: number; closing: boolean;
+  guard: PathAncestry;
+  pending?: PendingBoxSpan[];
+}
+
 // Claim an old token once, even if the redraw starts with identical ink.
 // Return the next potentially affected token in this run, not the next cell.
 function guardPrintedPathPane(
   rows: Cell[][], y: number, start: number, end: number, changed: boolean, runStart: number, col: number,
-  table: typeof rowPathAncestry, refreshing?: PathAncestry,
+  table: typeof rowPathAncestry, refreshing?: PathAncestry, box?: BoxRepaint,
 ) {
   if (end <= start || end - start > PATH_EDGE_BUDGET) return end;
   const plainUrl = table === rowUrlAncestry;
@@ -599,6 +651,38 @@ function guardPrintedPathPane(
     extendEdgeInk(rows, ink, index, step > 0 ? 1 : -1, step > 0 ? rows.length : -1, budget, plainUrl);
   }
   if (!ink) return next;
+  if (box && y >= box.end && col >= box.left && col <= box.right) {
+    // The old text below cannot own these fully painted body rows, but the
+    // repaint isn't proof until its new floor closes and the frame is presented.
+    let kept = 0;
+    for (const token of ink) {
+      if (token.y >= box.top && token.y < box.end &&
+        token.left === box.left + 1 && token.right === box.right) {
+        const row = rows[token.y];
+        let map = table.get(row);
+        let priorClaim = false;
+        if (map) {
+          for (let x = token.start; x < token.end; x++) {
+            const prior = map.get(row[x]);
+            if (prior && prior !== box.guard) { priorClaim = true; break; }
+          }
+        }
+        if (priorClaim) { ink[kept++] = token; continue; }
+        if (!map) table.set(row, map = new WeakMap());
+        let span: PendingBoxSpan | undefined;
+        for (let x = token.start; x < token.end; x++) {
+          const cell = row[x];
+          if (map.has(cell)) { span = undefined; continue; }
+          if (!span) (box.pending ??= []).push(span = { map, row, start: x, end: x });
+          span.end++;
+          map.set(cell, box.guard);
+        }
+        continue;
+      }
+      ink[kept++] = token;
+    }
+    ink.length = kept;
+  }
   let claimed: PathAncestry | undefined;
   let joinedClaims: PathAncestry[] | undefined;
   for (const token of ink) {
@@ -1207,6 +1291,7 @@ export class AnsiParser {
   private changedPathEnd = 0;
   private changedUrlEnd = 0;
   private repaintRun: WeakSet<PathAncestry> | null = null;
+  private synchronizedPaint?: { next: number; box?: BoxRepaint };
   private scrollback: Cell[][] = [];
   private fullBufferCache: Cell[][] = [];
   private fullBufferDirty = true;
@@ -1347,6 +1432,7 @@ export class AnsiParser {
   }
 
   private markFullBufferDirty() {
+    this.synchronizedPaint = undefined;
     this.fullBufferDirty = true;
     this.kittyVirtualOriginsDirty = true;
   }
@@ -4879,6 +4965,16 @@ export class AnsiParser {
       } else if (mode === 7) {
         this.autoWrapMode = enabled;
       } else if (mode === 2026) {
+        const box = this.synchronizedPaint?.box;
+        if (!enabled && box?.closing && box.nextCol === -1 && box.pending) {
+          for (const { map, row, start, end } of box.pending) {
+            for (let col = start; col < end; col++) {
+              const cell = row[col];
+              if (map.get(cell) === box.guard) map.delete(cell);
+            }
+          }
+        }
+        this.synchronizedPaint = enabled && !this.synchronizedOutput && this.usingAlternateScreen ? { next: 0 } : undefined;
         this.synchronizedOutput = enabled;
       } else if (mode === 9 || mode === 1000 || mode === 1002 || mode === 1003) {
         if (enabled) {
@@ -5019,8 +5115,52 @@ export class AnsiParser {
     this.markAllRowsDirty();
   }
 
+  // Only a forward synchronized sweep proves the old contents at untouched
+  // positions. Start at an intact bottom edge; count a new body row only when
+  // every column from its new left wall to its new right wall was printed.
+  private trackBoxRepaint(row: Cell[], col: number, replacement: Cell) {
+    const paint = this.synchronizedPaint!;
+    const y = this.cursorY, position = y * this.cols + col;
+    if (position < paint.next) { this.synchronizedPaint = undefined; return; }
+    paint.next = position + 1;
+    let box = paint.box;
+    if (!box) {
+      if (!BOX_FLOOR_LEFT.test(row[col].char) || !visiblePathDivider(replacement)) return;
+      let right = col + 1;
+      while (right < row.length && right - col <= PATH_EDGE_BUDGET && RULE_STROKE.test(row[right].char)) right++;
+      if (right === col + 1 || right >= row.length || right - col >= PATH_EDGE_BUDGET ||
+        !BOX_FLOOR_RIGHT.test(row[right].char) || !visiblePathDivider(this.buffer[y - 1]?.[col]) ||
+        !visiblePathDivider(this.buffer[y - 1]?.[right]) || !provenFrameSpan(this.buffer, y, col, right + 1)) return;
+      paint.box = box = { left: col, right, top: y, end: y, nextCol: col, closing: false, guard: { broken: true } };
+    }
+    if (box.nextCol === -1 || y < box.end || (y === box.end && col < box.left)) return;
+    if (y !== box.end || col !== box.nextCol || replacement.style.hidden || replacement.hyperlink ||
+      replacement.textSizing || replacement.imagePlaceholder) {
+      this.synchronizedPaint = undefined;
+      return;
+    }
+    const atWall = col === box.left || col === box.right;
+    if (col === box.left && y !== box.top) {
+      if (!literalPathSpace(row[col]) || !literalPathSpace(row[box.right]) ||
+        !provenFrameSpan(this.buffer, y, col, box.right + 1)) { this.synchronizedPaint = undefined; return; }
+      box.closing = BOX_FLOOR_LEFT.test(replacement.char);
+      if (!box.closing && (y - box.top + 1) * (box.right - col + 1) > PATH_EDGE_BUDGET) {
+        this.synchronizedPaint = undefined;
+        return;
+      }
+    }
+    const fits = box.closing
+      ? (col === box.left ? BOX_FLOOR_LEFT : col === box.right ? BOX_FLOOR_RIGHT : RULE_STROKE).test(replacement.char)
+      : visiblePathDivider(replacement) === atWall;
+    if (!fits) { this.synchronizedPaint = undefined; return; }
+    if (col === box.right && box.closing) box.nextCol = -1;
+    else if (col === box.right) { box.end++; box.nextCol = box.left; }
+    else box.nextCol++;
+  }
+
   private guardPrintableReplacement(row: Cell[], col: number, replacement: Cell) {
     const old = row[col];
+    if (this.synchronizedPaint) this.trackBoxRepaint(row, col, replacement);
     if (this.inspectedPrintRow !== row || this.inspectedPrintNext !== col) {
       this.inspectedPrintRow = row;
       this.printRunStart = this.inspectedPathEnd = this.inspectedUrlEnd = col;
@@ -5052,8 +5192,9 @@ export class AnsiParser {
             const plainUrl = table === rowUrlAncestry;
             if (!(plainUrl ? inspectUrl : inspectPath)) continue;
             const refreshing = plainUrl ? url : path;
-            if (wall) guardPrintedPathPane(rows, y, start, col, changed, this.printRunStart, col, table, refreshing);
-            const next = guardPrintedPathPane(rows, y, wall ? col + 1 : start, end, changed, this.printRunStart, col, table, refreshing);
+            if (wall) guardPrintedPathPane(rows, y, start, col, changed, this.printRunStart, col, table, refreshing, this.synchronizedPaint?.box);
+            const next = guardPrintedPathPane(rows, y, wall ? col + 1 : start, end, changed, this.printRunStart, col,
+              table, refreshing, this.synchronizedPaint?.box);
             if (plainUrl) {
               this.inspectedUrlEnd = next;
               if (changed) this.changedUrlEnd = next;
@@ -5079,6 +5220,7 @@ export class AnsiParser {
   }
 
   private preservePathRowBoundaries(rowIndex: number, from = 0, to = this.cols) {
+    this.synchronizedPaint = undefined;
     const row = this.buffer[rowIndex];
     if (row[from]?.char === "") from = Math.max(0, from - 1);
     if (row[to]?.char === "") to = Math.min(this.cols, to + 1);
@@ -5835,6 +5977,7 @@ export class AnsiParser {
   ) {
     const blockWidth = options.scale * width;
     if (blockWidth > this.cols || options.scale > this.rows) return;
+    this.synchronizedPaint = undefined;
     if (!this.prepareTextSizingWrite(text, blockWidth, options.scale)) return;
 
     const overflow = this.cursorY + options.scale - this.rows;
@@ -6033,6 +6176,7 @@ export class AnsiParser {
   }
 
   private lineFeed() {
+    this.synchronizedPaint = undefined;
     if (this.cursorY === this.scrollBottom) {
       const trackScrollback = !this.usingAlternateScreen && this.scrollTop === 0 && this.scrollBottom === this.rows - 1;
       this.scrollRegionUp(1, trackScrollback); // scrollRegionUp이 markAllRowsDirty 호출

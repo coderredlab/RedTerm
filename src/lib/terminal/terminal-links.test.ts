@@ -239,6 +239,71 @@ test("preserves a visible quote as a token separator on a proven soft wrap", () 
   expect(findUrlAtCell(parser.getFullBuffer(), { row: 1, col: 6 })?.url).toBe(url);
 });
 
+test("opens a wrapped quoted field with the complete query but without either quote", () => {
+  const url = "https://one.test/login?scope=read%20write&redirect_uri=https://api.test/return&prompt=select_account+consent";
+  for (const quote of ['"', "'"]) {
+    const prefix = `url: ${quote}`, chunks = `${prefix}${url}${quote}`.match(/.{1,40}/g)!;
+    const { buffer, left } = plainPane(["", ...chunks, ""], 40);
+    for (let i = 0; i < chunks.length; i++) {
+      const row = i + 1, startCol = left + (i === 0 ? prefix.length : 0);
+      const endCol = left + chunks[i].length - (i === chunks.length - 1 ? 2 : 1);
+      for (const col of [startCol, endCol]) {
+        expect(findUrlAtCell(buffer, { row, col })).toEqual({ url, startCol, endCol });
+      }
+    }
+    const last = chunks.length, closing = left + chunks.at(-1)!.length - 1;
+    expect(findUrlAtCell(buffer, { row: last, col: closing })).toBeNull();
+    buffer[last][closing].style = { ...DEFAULT_STYLE, hidden: true };
+    expect(findUrlAtCell(buffer, { row: 1, col: left + prefix.length })).toBeNull();
+  }
+});
+
+test("does not treat an escaped quote in serialized output as the end of the link", () => {
+  const rows = bufferFromRows(String.raw`url: "https://example.test/a\"b?scope=read"`);
+  expect(findUrlAtCell(rows, { row: 0, col: 12 })).toBeNull();
+});
+
+test("an inner quoted URL is not an independent wrapped field", () => {
+  const inner = "https://two.test/?scope=read%20write&view=list";
+  for (const marker of ["'", '\\"']) {
+    const printed = `url: "https://one.test/?filter=url(${marker}${inner}${marker})"`;
+    const width = 61, chunks = printed.match(/.{1,61}/g)!;
+    const { buffer, left } = plainPane(["", ...chunks, ""], width);
+    for (const index of [printed.indexOf("two.test"), printed.indexOf("view=list")]) {
+      const point = { row: 1 + Math.floor(index / width), col: left + index % width };
+      expect(findUrlAtCell(buffer, point)).toBeNull();
+    }
+  }
+});
+
+test("a closing quote across an actual soft wrap preserves the URL's final period", () => {
+  const url = "https://one.test/report.", field = `url: "${url}"`;
+  for (const width of [field.length, field.length - 1]) {
+    const parser = new AnsiParser(width, 3);
+    parser.write(field);
+    expect(findUrlAtCell(parser.getBuffer(), { row: 0, col: 14 })?.url).toBe(url);
+  }
+});
+
+test("does not infer a URL from an abbreviated label, but honors its explicit destination", () => {
+  const label = "https://display.test/auth?scope=read…", target = "https://actual.test/consent?scope=read%20write";
+  const parser = new AnsiParser(80, 3);
+  parser.write(`url: "${label}"\r\nurl: "\x1b]8;;${target}\x1b\\${label}\x1b]8;;\x1b\\"\r\n`);
+  const literal = "https://display.test/path/%E2%80%A6.";
+  parser.write(`"${literal}"`);
+  const rows = parser.getFullBuffer();
+  for (const col of [6, 6 + label.length - 1]) {
+    expect(findUrlAtCell(rows, { row: 0, col })).toMatchObject({ url: null });
+    expect(findUrlAtCell(rows, { row: 1, col })?.url).toBe(target);
+  }
+  expect(findUrlAtCell(rows, { row: 2, col: 10 })?.url).toBe(literal);
+  for (const text of [`url=${label}`, `"see ${label}"`]) {
+    // This is a web target with a missing suffix, not an unclaimed filesystem path.
+    expect(findUrlAtCell(bufferFromRows(text), { row: 0, col: text.indexOf("display") }))
+      .toMatchObject({ url: null });
+  }
+});
+
 test("does not attach a one-word status to a URL at or one column short of the pane edge", () => {
   const url = "https://example.test/report";
   for (const width of [url.length, url.length + 1]) {

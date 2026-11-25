@@ -31,6 +31,18 @@ test("requires reported cwd for relative paths and never uses a web URL as a fil
   expect(resolveTerminalPath("file:///home/me/%00bad")).toBeNull();
   expect(resolveTerminalPath("file:///home/me/a?b")).toBeNull();
 });
+
+test("an abbreviated web URL does not turn into a filesystem lookup on its wrapped slash", () => {
+  const parser = new AnsiParser(16, 5);
+  parser.write("https://one.test/docs/readme…\r\n/tmp/report.txt");
+  const buffer = parser.getBuffer(), wrapped = { row: 1, col: 6 };
+  expect(findUrlAtCell(buffer, wrapped)).toMatchObject({ url: null });
+  expect(findPathAtCell(buffer, wrapped, "file:///home/me")).toBeNull();
+  expect(findPathAtCell(buffer, { row: 2, col: 6 })?.path).toBe("/tmp/report.txt");
+  const separate = new AnsiParser(16, 3);
+  separate.write("https://one.test\r\n/tmp/report.txt");
+  expect(findPathAtCell(separate.getBuffer(), { row: 1, col: 6 })?.path).toBe("/tmp/report.txt");
+});
 test("rejects remote file URI authorities as outer-session filesystem paths", () => {
   expect(resolveTerminalPath("file://remote.example/home/user/project")).toBeNull();
   expect(resolveTerminalPath("src/config", "file://remote.example/home/user/project")).toBeNull();

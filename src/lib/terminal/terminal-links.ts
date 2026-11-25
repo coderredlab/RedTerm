@@ -2,8 +2,9 @@ import { hasCompleteReflowIncomingContent, hasReflowIncomingContent, hasReflowOu
 import { CONTINUATION_MARGIN_BITS, CONTINUATION_MARGIN_MASK, findInTerminalLinkPane, findRenderedTerminalLabel, terminalLinkContinuationGaps, touchesTerminalPaneCut, type TerminalLinkPane } from "./terminal-rendered-links";
 import { isUrlListDelimiter, paneSchemeOwner, WEB_SCHEME } from "./terminal-url-syntax";
 
-export interface TerminalUrlMatch {
-  url: string;
+interface TerminalUrlMatch {
+  /** Null claims an incomplete web link without offering a URL or a file lookup. */
+  url: string | null;
   startCol: number;
   endCol: number;
 }
@@ -93,6 +94,7 @@ export function validateTerminalUrl(candidate: string): SafeTerminalUrl | null {
 // A displayed destination on a new hard row is not query syntax belonging to
 // the previous row. Bare web schemes need a separate ownership decision.
 const DISPLAYED_TARGET = /^(?:!?\[[^\]\r\n]*\]\(|[([{]+)?([a-z][a-z\d+.-]*:(?:\/\/)?|(?:~|\.\.?)?\/)/i;
+const FIELD_PREFIX = /^ *(?:(?:[\w.-]+|"[\w.-]+"): *)?$/;
 
 // A suffix such as `p://host` or `/host` can look like a new URI/path when
 // this very boundary bisects the scheme of an explicit query value.
@@ -381,9 +383,33 @@ function findUrlInRows(
   }
   if (uncertain || offset < 0 || clickOffset < offset || offset >= limit) return null;
   const root = rowAt(offset);
+  const tail = rowAt(limit - 1);
   const firstLine = first + root;
   const candidate = text.slice(offset, limit);
-  const authority = panePadding && /^ *$/.test(text.slice(rowStarts[root], offset))
+  // A matching quote inside another URL is not the start of a field. Require
+  // an independent row (optionally "key: ") before using quotes as evidence.
+  const quote = text[offset - 1], startsQuoted = quote === '"' || quote === "'";
+  if (startsQuoted && candidate.includes("\\")) return null;
+  let quoted = false;
+  if (startsQuoted && text[limit] === quote) {
+    const head = rowAt(offset - 1), headLine = first + head;
+    const incoming = head > 0 ? joins[head - 1] : priorGap;
+    const independent = headLine === 0 ? !pane?.cutTop :
+      incoming < 0 || physicalBreak(headLine - 1, incoming);
+    const closeRow = rowAt(limit);
+    quoted = independent && (head === root ||
+      (root === head + 1 && isReflowContinuation(buffer[headLine], buffer[firstLine]))) &&
+      (closeRow === tail || (closeRow === tail + 1 && isReflowContinuation(buffer[first + tail], buffer[first + closeRow]))) &&
+      FIELD_PREFIX.test(text.slice(rowStarts[head], offset - 1)) &&
+      visibleText(rowStarts[head], offset) && visibleText(limit, limit + 1);
+  }
+  const url = quoted ? candidate : trimUrlCandidate(candidate);
+  const end = offset + url.length, stop = offset + candidate.length;
+  if (!url || clickOffset >= end) return null;
+  // The renderer omitted bytes, but this cell still belongs to a web link.
+  // Explicit OSC 8 destinations never enter text inference.
+  if (url.endsWith("…")) return { url: null, startCol: point.col, endCol: point.col };
+  const authority = panePadding && (quoted || /^ *$/.test(text.slice(rowStarts[root], offset)))
     ? /^https?:\/\/[^/\\?#]+[/#?]/i.exec(candidate) : null;
   const query = candidate.indexOf("?");
   let evidenceEnd: number | undefined, paneSpacing: number | undefined;
@@ -398,10 +424,8 @@ function findUrlInRows(
     paneSpacing = joins[i];
   }
   const closedParenthesis = close === limit;
-  const url = trimUrlCandidate(candidate);
-  const end = offset + url.length, stop = offset + candidate.length;
-  if (!url || clickOffset >= end || !visibleText(offset, stop)) return null;
-  const tail = rowAt(stop - 1), lastLine = first + tail;
+  if (!visibleText(offset, stop)) return null;
+  const lastLine = first + tail;
   if (!closedParenthesis && last === buffer.length - 1 && stop > rowStarts[last - first] &&
     touchesTerminalPaneCut(pane, buffer[last], columns[stop - 1], false)) return null;
   if (!closedParenthesis && !separatedEnd && stop < text.length && TOKEN_SEPARATOR.test(text[stop]) &&

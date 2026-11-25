@@ -1,5 +1,6 @@
 import { hasReflowIncomingContent, hasReflowOutgoingContent, hasUnprovenPathCells, isReflowContinuation, isUnprovenSnapshotRow, printedDirectoryUri, type Cell } from "./ansi-parser";
 import { CONTINUATION_MARGIN_BITS, CONTINUATION_MARGIN_MASK, findInTerminalLinkPane, findRenderedTerminalLabel, terminalLinkContinuationGaps, touchesTerminalPaneCut, type TerminalLinkPane } from "./terminal-rendered-links";
+import { WEB_SCHEME } from "./terminal-url-syntax";
 
 export interface TerminalPathMatch {
   path: string;
@@ -387,11 +388,14 @@ function findPathInRows(
     for (let line = firstTokenRow + 1; line < lastTokenRow && !tooManyCandidates; line++) {
       if (line >= clickTokenRow) addCandidate(offset, rowStarts[line + 1]);
     }
+    const webToken = WEB_SCHEME.test(candidate);
     for (let start = firstTokenRow + 1; start <= clickTokenRow && !tooManyCandidates; start++) {
       const rowStart = rowStarts[start];
       const wrapperLength = text.slice(rowStart, endOffset).match(/^[([{]+/)?.[0].length ?? 0;
       const startOffset = rowStart + wrapperLength;
       const suffix = text.slice(startOffset, endOffset);
+      // A proven soft wrap inside a web URL cannot start a filename.
+      if (webToken && isReflowContinuation(buffer[first + start - 1], buffer[first + start])) continue;
       if (!resolveTerminalPath(suffix, printedCwd(startOffset, endOffset)) &&
         !(requiresLookup && unresolvedRelativePath(suffix))) continue;
       for (let endRow = clickTokenRow; endRow <= lastTokenRow && !tooManyCandidates; endRow++) {

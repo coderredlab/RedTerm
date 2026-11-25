@@ -36,6 +36,8 @@ Android and iOS sources are included in the repository, but mobile binaries are 
 - Unicode, IME composition, native keyboard-layout mapping, and mobile virtual-keyboard handling
 - Installed monospaced font selection on desktop, with a bundled fallback font stack
 
+For terminal links, RedTerm uses the destination supplied by the application when one is present. If a tool shows only a shortened URL with `…` and supplies no link, expand the output before clicking; the missing text is not part of the terminal screen.
+
 ## Desktop workspace
 
 - Multiple workspace tabs and split terminal panes

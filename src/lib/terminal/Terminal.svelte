@@ -669,7 +669,7 @@
 
   function findTerminalLink(point: { row: number; col: number }) {
     const url = findUrlAtCell(buffer, point);
-    if (url) return { kind: "url" as const, value: url.url };
+    if (url) return url.url === null ? null : { kind: "url" as const, value: url.url };
     // The pane publishes its session after replay; never reveal before the
     // sidebar can bind the clicked path to that same session.
     const path = isDesktopTarget && onRevealPath && connected && sessionId === existingSessionId
