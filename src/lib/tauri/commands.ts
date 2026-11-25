@@ -108,8 +108,8 @@ export async function sendDesktopTerminalNotification(
 }
 
 
-export async function listSystemFonts(): Promise<string[]> {
-  return invoke<string[]>("list_system_fonts");
+export async function listSystemFonts(monospaceOnly = false): Promise<string[]> {
+  return invoke<string[]>("list_system_fonts", { monospaceOnly });
 }
 
 export async function confirmAction(message: string): Promise<boolean> {

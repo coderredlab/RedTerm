@@ -1,40 +1,41 @@
-import { isUsableMonospace } from "./font-metrics";
+import { listSystemFonts } from "$lib/tauri/commands";
 
-export async function filterSystemFonts(families: string[], signal: AbortSignal): Promise<string[]> {
-  signal.throwIfAborted();
-  let worker: Worker | undefined;
-  let onAbort: (() => void) | undefined;
+export async function loadSystemFonts(signal: AbortSignal): Promise<string[]> {
+  if (signal.aborted) throw signal.reason;
+  // WKWebView can hide user-installed fonts from OffscreenCanvas while the
+  // terminal's connected canvas can render them (WebKit bug 316777).
+  if (navigator.platform.startsWith("Mac") || navigator.userAgent.includes("Macintosh")) {
+    return listSystemFonts(true);
+  }
+  let worker: Worker;
   try {
     worker = new Worker(new URL("./system-fonts.worker.ts", import.meta.url), { type: "module" });
-    const active = worker;
+  } catch {
+    return listSystemFonts(true);
+  }
+
+  let onAbort: (() => void) | undefined;
+  try {
     const result = await new Promise<string[] | null>((resolve, reject) => {
       onAbort = () => reject(signal.reason);
       signal.addEventListener("abort", onAbort, { once: true });
-      active.onmessage = (event: MessageEvent<string[] | null>) => resolve(event.data);
-      active.onerror = () => resolve(null);
-      active.postMessage(families);
+      worker.onerror = worker.onmessageerror = () => resolve(null);
+      worker.onmessage = ({ data }: MessageEvent<"ready" | string[] | null>) => {
+        if (data !== "ready") { resolve(data); return; }
+        // Ask for the catalog only after we know this WebView has worker 2D.
+        listSystemFonts().then((families) => {
+          if (!signal.aborted) worker.postMessage(families);
+        }).catch(reject);
+      };
     });
     if (result !== null) return result;
-  } catch {
-    signal.throwIfAborted();
   } finally {
     if (onAbort) signal.removeEventListener("abort", onAbort);
-    worker?.terminate();
+    worker.terminate();
   }
 
-  // Older WebViews may not support a worker 2D context. Give input and paint
-  // a turn between small slices instead of scanning the catalog in one task.
-  const context = document.createElement("canvas").getContext("2d");
-  if (!context) throw new Error("Font measurements unavailable");
-  const matches: string[] = [];
-  for (let i = 0; i < families.length;) {
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-    signal.throwIfAborted();
-    const until = performance.now() + 4;
-    do {
-      const family = families[i++];
-      if (isUsableMonospace(context, family)) matches.push(family);
-    } while (i < families.length && performance.now() < until);
-  }
-  return matches;
+  // Worker 2D isn't available in every desktop WebView. Keep a full scan off
+  // the window thread there too: the native command checks installed faces.
+  if (signal.aborted) throw signal.reason;
+  return listSystemFonts(true);
 }
