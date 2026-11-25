@@ -1,6 +1,7 @@
-import { hasCompleteReflowIncomingContent, hasReflowIncomingContent, hasReflowOutgoingContent, hasRetainedPlainUrlBreak, hasUnprovenPathCells, isReflowContinuation, isUnprovenSnapshotRow, reflowContinuationEnd, TERMINAL_URL_TOKEN_SEPARATOR as TOKEN_SEPARATOR, type Cell } from "./ansi-parser";
+import { hasCompleteReflowIncomingContent, hasReflowIncomingContent, hasReflowOutgoingContent, hasRetainedPlainUrlBreak, hasUnprovenPathCells, isReflowContinuation, isUnprovenSnapshotRow, pathContinuationLeadingMargin, reflowContinuationEnd, type Cell } from "./ansi-parser";
 import { CONTINUATION_MARGIN_BITS, CONTINUATION_MARGIN_MASK, findInTerminalLinkPane, findRenderedTerminalLabel, terminalLinkContinuationGaps, touchesTerminalPaneCut, type TerminalLinkPane } from "./terminal-rendered-links";
-import { isUrlListDelimiter, paneSchemeOwner, WEB_SCHEME } from "./terminal-url-syntax";
+import { cutsQueryScheme, DISPLAYED_TARGET, isUrlListDelimiter, paneSchemeOwner, TERMINAL_URL_TOKEN_SEPARATOR as TOKEN_SEPARATOR, WEB_SCHEME } from "./terminal-url-syntax";
+import { findTerminalCodeBlock, terminalCodeBlockRowEnd } from "./terminal-code-fence";
 
 interface TerminalUrlMatch {
   /** Null claims an incomplete web link without offering a URL or a file lookup. */
@@ -91,21 +92,7 @@ export function validateTerminalUrl(candidate: string): SafeTerminalUrl | null {
   };
 }
 
-// A displayed destination on a new hard row is not query syntax belonging to
-// the previous row. Bare web schemes need a separate ownership decision.
-const DISPLAYED_TARGET = /^(?:!?\[[^\]\r\n]*\]\(|[([{]+)?([a-z][a-z\d+.-]*:(?:\/\/)?|(?:~|\.\.?)?\/)/i;
 const FIELD_PREFIX = /^ *(?:(?:[\w.-]+|"[\w.-]+"): *)?$/;
-
-// A suffix such as `p://host` or `/host` can look like a new URI/path when
-// this very boundary bisects the scheme of an explicit query value.
-function cutsQueryScheme(text: string, at: number, end: number): boolean {
-  const left = Math.max(0, at - 7); // Longest partial `https://` on either side.
-  const scheme = /https?:\/\//i.exec(text.slice(left, Math.min(end, at + 7)));
-  if (!scheme) return false;
-  const start = left + scheme.index;
-  return start < at && start + scheme[0].length > at &&
-    (text[start - 1] === "=" || text[start - 1] === "+" || text.slice(Math.max(0, start - 3), start) === "%20");
-}
 
 // A bare word after a URL could just be the next status line. Only infer a
 // plain pane wrap when the continuation participates in visible query syntax.
@@ -156,6 +143,29 @@ function visibleRange(row: Cell[], start: number, end: number, plainUrl: boolean
     if (cell.style.hidden || cell.hyperlink || (spacesOnly && cell.char !== " ")) return false;
   }
   return true;
+}
+
+/** A standalone URL in literal Markdown code has a different wrap width
+ * from the surrounding prose. Match the whole fenced token at that width;
+ * don't widen ordinary pane whitespace or reinterpret an OSC 8 destination. */
+function findFencedCodeUrl(buffer: Cell[][], point: { row: number; col: number }, pane?: TerminalLinkPane): TerminalUrlMatch | null | undefined {
+  const width = buffer[point.row].length;
+  const block = findTerminalCodeBlock(buffer, point.row, 0, width, !!(pane?.hasDivider && pane.endsAtViewportRight));
+  if (!block) return undefined;
+  const { first, last, end, lastEnd, uri } = block;
+  const hitEnd = point.row === last ? lastEnd : end;
+  if (point.col >= hitEnd) return null;
+  let trusted = true;
+  for (let y = first - 1; y <= last + 1; y++) {
+    const row = buffer[y];
+    if (row.length !== width || hasReflowIncomingContent(row) || hasReflowOutgoingContent(row)) return undefined;
+    if (y > first && y <= last && (pathContinuationLeadingMargin(buffer[y - 1], row) < 0 ||
+      hasRetainedPlainUrlBreak(buffer[y - 1], row))) return undefined;
+    const used = terminalCodeBlockRowEnd(row, y, 0, width, block);
+    trusted &&= visibleRange(row, 0, used, true) && !row.some((c, x) => x < used && (c.textSizing || c.imagePlaceholder));
+  }
+  const target = trusted && !uri.endsWith("…") ? validateTerminalUrl(uri) : null;
+  return { url: target?.url ?? null, startCol: 0, endCol: hitEnd - 1 };
 }
 
 function findUrlInRows(
@@ -483,6 +493,8 @@ export function findUrlAtCell(
   }
 
   return findInTerminalLinkPane(buffer, point, (rows, localPoint, pane) => {
+    const code = findFencedCodeUrl(rows, localPoint, pane);
+    if (code !== undefined) return code;
     const rendered = findRenderedTerminalLabel(rows, localPoint, pane?.hasDivider === true,
       target => findUrlInRows(rows, target, pane, true), pane?.cutBottom);
     return rendered === undefined ? findUrlInRows(rows, localPoint, pane) : rendered;

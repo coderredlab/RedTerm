@@ -110,6 +110,7 @@ export function findRenderedTerminalLabel<T extends TerminalTextMatch>(
 
 export interface TerminalLinkPane {
   hasDivider: boolean;
+  endsAtViewportRight: boolean;
   cutTop: boolean;
   cutBottom: boolean;
   cutTopStarts?: number[];
@@ -186,7 +187,7 @@ export function findInTerminalLinkPane<T extends TerminalTextMatch>(
     if (hasDivider || (!(previous && isReflowContinuation(previous, row)) &&
       !(next && isReflowContinuation(row, next)))) return null;
   }
-  const pane: TerminalLinkPane = { hasDivider, cutTop: false, cutBottom: false };
+  const pane: TerminalLinkPane = { hasDivider, endsAtViewportRight: right === row.length, cutTop: false, cutBottom: false };
 
   const samePane = (y: number, end: number) => {
     const line = buffer[y];

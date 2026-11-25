@@ -5,7 +5,8 @@ import { Unzlib } from 'fflate';
 import { decodeSixel } from './sixel-decoder';
 import { OscNotifications, type TerminalNotification } from './osc-notifications';
 import { kittyDiacriticIndex } from './kitty-placeholder';
-import { isUrlListDelimiter, paneSchemeOwner, WEB_SCHEME } from "./terminal-url-syntax";
+import { isUrlListDelimiter, paneSchemeOwner, TERMINAL_URL_TOKEN_SEPARATOR, WEB_SCHEME } from "./terminal-url-syntax";
+import { findTerminalCodeBlock, terminalCodeBlockRowEnd } from "./terminal-code-fence";
 import {
   KITTY_KEYBOARD_STACK_LIMIT,
   KITTY_KEYBOARD_SUPPORTED_FLAGS,
@@ -101,7 +102,6 @@ const renderedAncestryTables = [rowPathAncestry, rowUrlAncestry] as const;
 // A run that replaces members of a cohort is a refresh of those cells.
 // Ink added in a later run to a previously blank row does not share it.
 const cellRepaintRuns = new WeakMap<Cell, WeakSet<PathAncestry>>();
-export const TERMINAL_URL_TOKEN_SEPARATOR = /[\s<>"'`]/u;
 
 // Real padding discarded by a non-reflowing resize was a token separator,
 // not evidence for joining these two rows. Track the tokens on this specific
@@ -404,18 +404,26 @@ const RULE_START = /^[┌-┏└-┗├-┣╒-╔╘-╚╞-╠╭╰]$/u;
 const RULE_END = /^[┐-┓┘-┛┤-┫╕-╗╛-╝╡-╣╮╯]$/u;
 const RULE_STROKE = /^[─━┄┅┈┉╌╍═]$/u;
 const NOT_RULE_TITLE_INK = /[\p{C}\p{Z}\u2500-\u259f]/u;
+const BOX_ROOF_LEFT = /^[┌-┏╒-╔╭]$/u;
+const BOX_ROOF_RIGHT = /^[┐-┓╕-╗╮]$/u;
 const BOX_FLOOR_LEFT = /^[└-┗╘-╚╰]$/u;
 const BOX_FLOOR_RIGHT = /^[┘-┛╛-╝╯]$/u;
 
-function provenFrameSpan(buffer: Cell[][], y: number, start: number, end: number): boolean {
+function firstUnprovenFrameColumn(buffer: Cell[][], y: number, start: number, end: number): number {
   const row = buffer[y], before = buffer[y - 1], after = buffer[y + 1];
+  if (unknownPredecessorRows.has(row) || hasReflowIncomingContent(row) || hasReflowOutgoingContent(row) ||
+    (before && isReflowContinuation(before, row)) || (after && isReflowContinuation(row, after))) return start;
+  const paths = rowPathAncestry.get(row), urls = rowUrlAncestry.get(row);
   for (let col = start; col < end; col++) {
     const cell = row[col];
-    if (cell.style.hidden || cell.hyperlink || cell.textSizing || cell.imagePlaceholder) return false;
+    if (cell.style.hidden || cell.hyperlink || cell.textSizing || cell.imagePlaceholder ||
+      paths?.get(cell)?.broken || urls?.get(cell)?.broken) return col;
   }
-  return !unknownPredecessorRows.has(row) && !hasUnprovenPathCells(row, start, end) &&
-    !hasUnprovenPathCells(row, start, end, true) && !hasReflowIncomingContent(row) && !hasReflowOutgoingContent(row) &&
-    !(before && isReflowContinuation(before, row)) && !(after && isReflowContinuation(row, after));
+  return end;
+}
+
+function provenFrameSpan(buffer: Cell[][], y: number, start: number, end: number): boolean {
+  return firstUnprovenFrameColumn(buffer, y, start, end) === end;
 }
 
 // A caption is not a terminator by itself. Its two caps must replace the
@@ -591,6 +599,7 @@ function extendEdgeInk(
 // A changed wall joins the two layouts only up to their next shared wall.
 function markLostAlternateEdge(rows: Cell[][], retained: number, step: 1 | -1, stop: number) {
   const y = step > 0 ? retained - 1 : retained, limit = Math.min(rows[y].length, rows[y + 1].length);
+  markFencedRowDamage(rows, y, 0, limit, "cut");
   let left = 0;
   for (let right = 0; right <= limit; right++) {
     if (right < limit && !(isTerminalPathDividerColumn(rows, y, right) && isTerminalPathDividerColumn(rows, y + 1, right))) continue;
@@ -622,6 +631,146 @@ interface BoxRepaint {
   pending?: PendingBoxSpan[];
 }
 
+// A forward redraw can expose a single pane behind a closed overlay. Between
+// two row writes, edge detection sees *new* ink above *old* walls below. Keep
+// those guards unless the complete viewport is presented and a whole fenced
+// target crosses the removed walls. No per-cell frame history is needed.
+interface CoveredPane {
+  top: number; bottom: number; left: number; right: number; paneLeft: number; paneRight: number;
+  blockedFrom: Uint32Array;
+}
+
+// East Asian W/F widths used for both painting and validating a wide tail.
+function isWideChar(char: string): boolean {
+  const code = char.codePointAt(0)!;
+  return (code >= 0xac00 && code <= 0xd7af) || (code >= 0x1100 && code <= 0x11ff) ||
+    (code >= 0x3130 && code <= 0x318f) || (code >= 0x4e00 && code <= 0x9fff) ||
+    (code >= 0x3400 && code <= 0x4dbf) || (code >= 0x20000 && code <= 0x2a6df) ||
+    (code >= 0x2a700 && code <= 0x2ceaf) || (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0x3040 && code <= 0x309f) || (code >= 0x30a0 && code <= 0x30ff) ||
+    (code >= 0xff00 && code <= 0xffef);
+}
+
+function sameLinkInk(a: Cell, b: Cell): boolean {
+  return a.char === b.char && a.style.hidden === b.style.hidden && a.style.underline === b.style.underline &&
+    a.hyperlink?.uri === b.hyperlink?.uri && a.hyperlink?.id === b.hyperlink?.id;
+}
+
+function isWholePane(rows: Cell[][], y: number, left: number, right: number): boolean {
+  return (!left || isTerminalPathDividerColumn(rows, y, left - 1)) &&
+    (right === rows[y].length || isTerminalPathDividerColumn(rows, y, right)) && nextPathWall(rows, y, left, right) === right;
+}
+
+// The compositor can print a wide exterior glyph across the left wall. Its
+// genuine continuation cell is not a gap in both walls. Never use that row
+// itself to certify a target; the intact rows above/below remain independent.
+function wideTailAcrossWall(rows: Cell[][], y: number, x: number): boolean {
+  const head = rows[y]?.[x - 1], tail = rows[y]?.[x];
+  return !!head && tail?.char === "" && isWideChar(head.char) && head.style === tail.style &&
+    visiblePathDivider(rows[y - 1]?.[x]) && visiblePathDivider(rows[y + 1]?.[x]) &&
+    provenFrameSpan(rows, y, x - 1, x + 1);
+}
+
+function coveredPane(rows: Cell[][], top: number, left: number): CoveredPane | undefined {
+  const roof = rows[top];
+  let right = left + 1;
+  while (right < roof.length && right - left < PATH_EDGE_BUDGET && RULE_STROKE.test(roof[right].char)) right++;
+  if (right <= left + 1 || right >= roof.length || !BOX_ROOF_RIGHT.test(roof[right].char) ||
+    !provenFrameSpan(rows, top, left, right + 1)) return;
+  let bottom = top + 1;
+  while (visiblePathDivider(rows[bottom]?.[right]) &&
+    (visiblePathDivider(rows[bottom]?.[left]) || wideTailAcrossWall(rows, bottom, left))) {
+    if ((bottom - top + 1) * (right - left + 1) > PATH_EDGE_BUDGET) return;
+    bottom++;
+  }
+  const floor = rows[bottom];
+  if (bottom - top < 5 || !floor || !BOX_FLOOR_LEFT.test(floor[left].char) || !BOX_FLOOR_RIGHT.test(floor[right].char) ||
+    !provenFrameSpan(rows, bottom, left, right + 1)) return;
+  for (let x = left + 1; x < right; x++) if (!RULE_STROKE.test(floor[x].char)) return;
+  let paneLeft = left;
+  while (paneLeft && !isTerminalPathDividerColumn(rows, top + 1, paneLeft - 1)) paneLeft--;
+  const paneRight = nextPathWall(rows, top + 1, right + 1, roof.length);
+  if (paneRight - paneLeft > PATH_EDGE_BUDGET / 2) return;
+  const blockedFrom = new Uint32Array(bottom - top);
+  for (let y = top + 1; y < bottom; y++) {
+    if (!visiblePathDivider(rows[y][left]) ||
+      nextPathWall(rows, y, paneLeft, left) !== left || nextPathWall(rows, y, right + 1, paneRight) !== paneRight ||
+      (paneLeft && !isTerminalPathDividerColumn(rows, y, paneLeft - 1)) ||
+      (paneRight < roof.length && !isTerminalPathDividerColumn(rows, y, paneRight))) blockedFrom[y - top] = paneLeft;
+    else blockedFrom[y - top] = firstUnprovenFrameColumn(rows, y, paneLeft, paneRight);
+  }
+  return { top, bottom, left, right, paneLeft, paneRight, blockedFrom };
+}
+
+function presentUncoveredPane(rows: Cell[][], pane: CoveredPane) {
+  const { top, bottom, left, right, paneLeft, paneRight, blockedFrom } = pane;
+  for (let y = top + 2; y < bottom - 1; y++) {
+    if (!/^[hH]$/.test(rows[y][paneLeft].char)) continue;
+    const block = findTerminalCodeBlock(rows, y, paneLeft, paneRight, paneLeft > 0 && paneRight === rows[y].length);
+    if (!block || block.first !== y || block.last + 1 >= bottom || block.end <= right) continue;
+    let trusted = true, merged = true;
+    for (let line = y - 1; line <= block.last + 1; line++) {
+      const row = rows[line];
+      if (blockedFrom[line - top] < terminalCodeBlockRowEnd(row, line, paneLeft, paneRight, block)) trusted = false;
+      if (!isWholePane(rows, line, paneLeft, paneRight) || visiblePathDivider(row[left]) || visiblePathDivider(row[right])) {
+        merged = false; break;
+      }
+    }
+    if (!merged) continue;
+    const denied = trusted ? undefined : { broken: true };
+    for (let line = y - 1; line <= block.last + 1; line++) {
+      const row = rows[line];
+      const used = terminalCodeBlockRowEnd(row, line, paneLeft, paneRight, block);
+      for (const table of renderedAncestryTables) {
+        if (denied) { markUnprovenSnapshotRow(row, paneLeft, used, denied, table); continue; }
+        const map = table.get(row);
+        if (!map) continue;
+        for (let x = paneLeft; x < used; x++) if (map.get(row[x])?.broken) map.delete(row[x]);
+      }
+    }
+    y = block.last + 1;
+  }
+}
+
+// The Markdown gutter is a real separator everywhere except an intact,
+// single-target code block. Claim that *old* block before the edit can remove
+// its fence, a middle row, or a nested scheme's predecessor.
+type FenceGeometryChange = "cut" | "resize" | "ink";
+function markFencedUrlDamage(
+  rows: Cell[][], y: number, left: number, right: number, from: number, to: number, geometry?: FenceGeometryChange,
+) {
+  const row = rows[y];
+  if (!row || right - left < 12) return;
+  const fence = row[left]?.char === " ";
+  if (fence && (row[left + 1]?.char !== "`" || row[left + 2].char !== "`" || row[left + 3].char !== "`")) return;
+  for (let body = fence ? y - 1 : y; body <= (fence ? y + 1 : y); body += 2) {
+    if (!rows[body] || (geometry === "cut" && body < y)) continue;
+    const block = findTerminalCodeBlock(rows, body, left, right, left > 0 && right === row.length);
+    if (!block || y < block.first - 1 || y > block.last + (geometry === "cut" ? 0 : 1)) continue;
+    const wall = (left > 0 && from <= left - 1 && to >= left) || (right < row.length && from <= right && to > right);
+    if (!geometry && !wall && from >= terminalCodeBlockRowEnd(row, y, left, right, block)) continue;
+    let line = block.first - 1;
+    while (line <= block.last + 1 && isWholePane(rows, line, left, right)) line++;
+    if (line <= block.last + 1) continue;
+    const guard = { broken: true };
+    for (line = block.first - 1; line <= block.last + 1; line++) {
+      const cells = rows[line], used = terminalCodeBlockRowEnd(cells, line, left, right, block);
+      for (const table of renderedAncestryTables) markUnprovenSnapshotRow(cells, left, used, guard, table);
+    }
+  }
+}
+
+function markFencedRowDamage(rows: Cell[][], y: number, from: number, to: number, geometry?: FenceGeometryChange) {
+  const width = rows[y].length;
+  for (let left = 0; left < width;) {
+    const right = nextPathWall(rows, y, left, width);
+    if (to > left - 1 && from <= right) markFencedUrlDamage(rows, y, left, right, from, to, geometry);
+    left = right + 1;
+    if (right >= to) return right;
+  }
+  return width;
+}
+
 // Claim an old token once, even if the redraw starts with identical ink.
 // Return the next potentially affected token in this run, not the next cell.
 function guardPrintedPathPane(
@@ -631,6 +780,7 @@ function guardPrintedPathPane(
   if (end <= start || end - start > PATH_EDGE_BUDGET) return end;
   const plainUrl = table === rowUrlAncestry;
   const wall = col < start || col >= end;
+  if (changed && plainUrl) markFencedUrlDamage(rows, y, start, end, col, col + 1);
   let ink: PathInk[] | undefined, next = end;
   for (let step = -1; step <= 1; step += 2) {
     const budget = { left: PATH_EDGE_BUDGET };
@@ -1288,10 +1438,13 @@ export class AnsiParser {
   private inspectedPrintNext = 0;
   private inspectedPathEnd = 0;
   private inspectedUrlEnd = 0;
+  private sawBacktick = false;
+  private inspectedBlankEnd = 0;
+  private fenceWindow?: Cell[][];
   private changedPathEnd = 0;
   private changedUrlEnd = 0;
   private repaintRun: WeakSet<PathAncestry> | null = null;
-  private synchronizedPaint?: { next: number; box?: BoxRepaint };
+  private synchronizedPaint?: { next: number; full: boolean; box?: BoxRepaint; covered?: CoveredPane };
   private scrollback: Cell[][] = [];
   private fullBufferCache: Cell[][] = [];
   private fullBufferDirty = true;
@@ -1565,6 +1718,15 @@ export class AnsiParser {
     const oldScrollTop = this.scrollTop;
     const oldScrollBottom = this.scrollBottom;
     const oldScrollbackLength = oldScrollback.length;
+    if (cols !== oldCols && this.sawBacktick) {
+      // Only a pane intersecting the cut (or the old right edge on growth)
+      // changes content width. Inspect its fence before copying any cells.
+      for (let y = 0; y < oldBuffer.length; y++) {
+        if (oldBuffer[y].some(cell => cell.char === "`")) {
+          this.damageFencedRow(y, Math.min(cols, oldCols), Math.max(cols, oldCols), "resize");
+        }
+      }
+    }
     const priorRowCount = (this.usingAlternateScreen ? 0 : oldScrollbackLength) + oldBuffer.length;
     const priorRow = (index: number) => this.usingAlternateScreen ? oldBuffer[index]
       : index < oldScrollbackLength ? oldScrollback[index] : oldBuffer[index - oldScrollbackLength];
@@ -1681,7 +1843,7 @@ export class AnsiParser {
             end < contentLength &&
             row[end].char === '' &&
             row[end - 1].char !== '' &&
-            this.isWideChar(row[end - 1].char)
+            isWideChar(row[end - 1].char)
           ) {
             end -= 1;
           }
@@ -2389,7 +2551,7 @@ export class AnsiParser {
       const width = segment.includes('\ufe0e')
         ? 1
         : segment.includes('\ufe0f') ||
-            this.isWideChar(segment) ||
+            isWideChar(segment) ||
             OSC_TEXT_EMOJI_PRESENTATION.test(segment)
           ? 2
           : 1;
@@ -4965,7 +5127,11 @@ export class AnsiParser {
       } else if (mode === 7) {
         this.autoWrapMode = enabled;
       } else if (mode === 2026) {
-        const box = this.synchronizedPaint?.box;
+        const paint = this.synchronizedPaint;
+        if (!enabled && paint?.full && paint.covered && paint.next === this.rows * this.cols) {
+          presentUncoveredPane(this.buffer, paint.covered);
+        }
+        const box = paint?.box;
         if (!enabled && box?.closing && box.nextCol === -1 && box.pending) {
           for (const { map, row, start, end } of box.pending) {
             for (let col = start; col < end; col++) {
@@ -4974,7 +5140,7 @@ export class AnsiParser {
             }
           }
         }
-        this.synchronizedPaint = enabled && !this.synchronizedOutput && this.usingAlternateScreen ? { next: 0 } : undefined;
+        this.synchronizedPaint = enabled && !this.synchronizedOutput && this.usingAlternateScreen ? { next: 0, full: true } : undefined;
         this.synchronizedOutput = enabled;
       } else if (mode === 9 || mode === 1000 || mode === 1002 || mode === 1003) {
         if (enabled) {
@@ -5122,6 +5288,18 @@ export class AnsiParser {
     const paint = this.synchronizedPaint!;
     const y = this.cursorY, position = y * this.cols + col;
     if (position < paint.next) { this.synchronizedPaint = undefined; return; }
+    if (position !== paint.next) paint.full = false;
+    if (paint.full) {
+      const old = row[col];
+      if (!paint.covered && old.char !== replacement.char && BOX_ROOF_LEFT.test(old.char) && !BOX_ROOF_LEFT.test(replacement.char)) {
+        paint.covered = coveredPane(this.buffer, y, col);
+      }
+      const pane = paint.covered;
+      if (pane && y > pane.top && y < pane.bottom && col >= pane.paneLeft && col < pane.paneRight &&
+        (col < pane.left || col > pane.right) && !sameLinkInk(old, replacement)) {
+        pane.blockedFrom[y - pane.top] = Math.min(pane.blockedFrom[y - pane.top], col);
+      }
+    }
     paint.next = position + 1;
     let box = paint.box;
     if (!box) {
@@ -5161,18 +5339,29 @@ export class AnsiParser {
   private guardPrintableReplacement(row: Cell[], col: number, replacement: Cell) {
     const old = row[col];
     if (this.synchronizedPaint) this.trackBoxRepaint(row, col, replacement);
+    if (replacement.char === "`") this.sawBacktick = true;
     if (this.inspectedPrintRow !== row || this.inspectedPrintNext !== col) {
       this.inspectedPrintRow = row;
       this.printRunStart = this.inspectedPathEnd = this.inspectedUrlEnd = col;
+      this.inspectedBlankEnd = col;
       this.changedPathEnd = this.changedUrlEnd = col;
       this.repaintRun = null;
     }
     this.inspectedPrintNext = col + 1;
-    // Initial frame painting and ordinary append-only output have no old ink.
+    if (this.sawBacktick && col >= this.inspectedBlankEnd && old.char === " " && !literalPathSpace(replacement)) {
+      // New ink anywhere in the required blank tail invalidates the fence
+      // layout. A linked space beyond a real delimiter leaves it intact.
+      const addsInk = replacement.char !== " ";
+      let next = row.length;
+      // The bottom row could only be the closing fence. A fresh shell line
+      // cannot be one; do not materialize scrollback for append-only logs.
+      if (this.cursorY < this.rows - 1 || row.some(cell => cell.char === "`")) {
+        next = this.damageFencedRow(this.cursorY, col, col + 1, addsInk ? "ink" : undefined);
+      }
+      this.inspectedBlankEnd = addsInk ? next : col + 1;
+    }
     if (!literalPathSpace(old)) {
-      const changed = old.char !== replacement.char || old.style.hidden !== replacement.style.hidden ||
-        old.style.underline !== replacement.style.underline || old.hyperlink?.uri !== replacement.hyperlink?.uri ||
-        old.hyperlink?.id !== replacement.hyperlink?.id;
+      const changed = !sameLinkInk(old, replacement);
       const path = rowPathAncestry.get(row)?.get(old);
       const url = rowUrlAncestry.get(row)?.get(old) ?? (path === lostPathAncestry ? path : undefined);
       // A new run can erase an already-broken owner after its successor has
@@ -5219,11 +5408,28 @@ export class AnsiParser {
     if (this.repaintRun && replacement !== this.emptyCell) cellRepaintRuns.set(replacement, this.repaintRun);
   }
 
+  // A code block has at most 32 body rows, its fences, and two extra rows
+  // witnessing a pane wall. Do not rebuild up to 50,000 history rows to
+  // inspect an erase or a cursor-positioned write at the top of the screen.
+  private damageFencedRow(y: number, from: number, to: number, geometry?: FenceGeometryChange) {
+    if (!this.sawBacktick) return this.cols;
+    const history = this.scrollback.length, reach = 35;
+    if (!history || y >= reach) return markFencedRowDamage(this.buffer, y, from, to, geometry);
+    if (!this.fullBufferDirty) return markFencedRowDamage(this.fullBufferCache, history + y, from, to, geometry);
+    const start = Math.max(-history, y - reach), end = Math.min(this.buffer.length, y + reach + 1);
+    const window = this.fenceWindow ??= [];
+    for (let i = start; i < end; i++) window.push(i < 0 ? this.scrollback[history + i] : this.buffer[i]);
+    const next = markFencedRowDamage(window, y - start, from, to, geometry);
+    window.length = 0;
+    return next;
+  }
+
   private preservePathRowBoundaries(rowIndex: number, from = 0, to = this.cols) {
     this.synchronizedPaint = undefined;
     const row = this.buffer[rowIndex];
     if (row[from]?.char === "") from = Math.max(0, from - 1);
     if (row[to]?.char === "") to = Math.min(this.cols, to + 1);
+    this.damageFencedRow(rowIndex, from, to);
     let partial = from > 0 || to < this.cols;
     if (partial) {
       for (let col = from; col < to; col++) {
@@ -5245,6 +5451,13 @@ export class AnsiParser {
     }
     markChangedContinuation(this.buffer[rowIndex - 1] ?? this.scrollback.at(-1), row);
     markChangedContinuation(row, this.buffer[rowIndex + 1]);
+  }
+
+  private preserveVerticalBoundary(below: number) {
+    const before = this.buffer[below - 1] ?? this.scrollback.at(-1), after = this.buffer[below];
+    if (!before || !after) return;
+    markChangedContinuation(before, after);
+    this.damageFencedRow(below - 1, 0, before.length, "cut");
   }
 
   private preservePathPaneBoundary(rowIndex: number, start: number, end: number, from: number, to: number) {
@@ -5316,11 +5529,9 @@ export class AnsiParser {
     if (this.cursorY < this.scrollTop || this.cursorY > this.scrollBottom) return;
 
     const amount = Math.min(Math.max(1, count), this.scrollBottom - this.cursorY + 1);
-    markChangedContinuation(this.buffer[this.cursorY - 1] ?? this.scrollback.at(-1),
-      this.buffer[this.cursorY]);
-    markChangedContinuation(this.buffer[this.scrollBottom], this.buffer[this.scrollBottom + 1]);
-    markChangedContinuation(this.buffer[this.scrollBottom - amount],
-      this.buffer[this.scrollBottom - amount + 1]);
+    this.preserveVerticalBoundary(this.cursorY);
+    this.preserveVerticalBoundary(this.scrollBottom + 1);
+    this.preserveVerticalBoundary(this.scrollBottom - amount + 1);
     const splitTargets: number[] = [];
     for (let col = 0; col < this.cols; col++) {
       const sizing = this.buffer[this.cursorY][col].textSizing;
@@ -5346,11 +5557,9 @@ export class AnsiParser {
     if (this.cursorY < this.scrollTop || this.cursorY > this.scrollBottom) return;
 
     const amount = Math.min(Math.max(1, count), this.scrollBottom - this.cursorY + 1);
-    markChangedContinuation(this.buffer[this.cursorY - 1] ?? this.scrollback.at(-1),
-      this.buffer[this.cursorY]);
-    markChangedContinuation(this.buffer[this.cursorY + amount - 1],
-      this.buffer[this.cursorY + amount]);
-    markChangedContinuation(this.buffer[this.scrollBottom], this.buffer[this.scrollBottom + 1]);
+    this.preserveVerticalBoundary(this.cursorY);
+    this.preserveVerticalBoundary(this.cursorY + amount);
+    this.preserveVerticalBoundary(this.scrollBottom + 1);
     this.eraseTextSizingCrossingRowBoundary(this.scrollBottom + 1);
     this.eraseTextSizingIntersecting(
       this.cursorY,
@@ -5384,11 +5593,9 @@ export class AnsiParser {
   private scrollRegionUp(count: number, trackScrollback = false) {
     const amount = this.boundedCsiCount(count, this.scrollBottom - this.scrollTop + 1);
     if (!trackScrollback) {
-      markChangedContinuation(this.buffer[this.scrollTop - 1] ?? this.scrollback.at(-1),
-        this.buffer[this.scrollTop]);
-      markChangedContinuation(this.buffer[this.scrollTop + amount - 1],
-        this.buffer[this.scrollTop + amount]);
-      markChangedContinuation(this.buffer[this.scrollBottom], this.buffer[this.scrollBottom + 1]);
+      this.preserveVerticalBoundary(this.scrollTop);
+      this.preserveVerticalBoundary(this.scrollTop + amount);
+      this.preserveVerticalBoundary(this.scrollBottom + 1);
     }
     if (!trackScrollback) {
       this.eraseTextSizingCrossingRowBoundary(this.scrollBottom + 1);
@@ -5575,11 +5782,9 @@ export class AnsiParser {
 
   private scrollRegionDown(count: number) {
     const amount = this.boundedCsiCount(count, this.scrollBottom - this.scrollTop + 1);
-    markChangedContinuation(this.buffer[this.scrollTop - 1] ?? this.scrollback.at(-1),
-      this.buffer[this.scrollTop]);
-    markChangedContinuation(this.buffer[this.scrollBottom], this.buffer[this.scrollBottom + 1]);
-    markChangedContinuation(this.buffer[this.scrollBottom - amount],
-      this.buffer[this.scrollBottom - amount + 1]);
+    this.preserveVerticalBoundary(this.scrollTop);
+    this.preserveVerticalBoundary(this.scrollBottom + 1);
+    this.preserveVerticalBoundary(this.scrollBottom - amount + 1);
     this.eraseTextSizingCrossingRowBoundary(this.scrollTop);
     this.eraseTextSizingIntersecting(
       this.scrollBottom - amount + 1,
@@ -5709,27 +5914,6 @@ export class AnsiParser {
     return this.paletteColors[index];
   }
 
-  // Check if character is wide (CJK, Korean, etc.)
-  // East Asian Width "W"/"F"인 문자만 wide 처리. Emoji/PUA/기호는 narrow 유지 (터미널 표준)
-  private isWideChar(char: string): boolean {
-    const code = char.codePointAt(0)!;
-    // Korean Hangul
-    if (code >= 0xAC00 && code <= 0xD7AF) return true;
-    if (code >= 0x1100 && code <= 0x11FF) return true;
-    if (code >= 0x3130 && code <= 0x318F) return true;
-    // CJK
-    if (code >= 0x4E00 && code <= 0x9FFF) return true;
-    if (code >= 0x3400 && code <= 0x4DBF) return true;
-    if (code >= 0x20000 && code <= 0x2A6DF) return true; // CJK Ext-B
-    if (code >= 0x2A700 && code <= 0x2CEAF) return true; // CJK Ext-C/D/E/F
-    if (code >= 0xF900 && code <= 0xFAFF) return true;   // CJK Compatibility Ideographs
-    // Japanese
-    if (code >= 0x3040 && code <= 0x309F) return true;
-    if (code >= 0x30A0 && code <= 0x30FF) return true;
-    // Fullwidth
-    if (code >= 0xFF00 && code <= 0xFFEF) return true;
-    return false;
-  }
 
   private normalizeTextSizingRows(rows: Cell[][]) {
     const groups = new Map<string, Array<{ row: number; col: number }>>();
@@ -5878,10 +6062,10 @@ export class AnsiParser {
     const cells = this.buffer[row];
     const cell = cells?.[col];
     if (!cell) return;
-    if (cell.char === '' && col > 0 && this.isWideChar(cells[col - 1].char)) {
+    if (cell.char === '' && col > 0 && isWideChar(cells[col - 1].char)) {
       cells[col - 1] = this.createEmptyCell();
     }
-    if (this.isWideChar(cell.char) && cells[col + 1]?.char === '') {
+    if (isWideChar(cell.char) && cells[col + 1]?.char === '') {
       cells[col + 1] = this.createEmptyCell();
     }
   }
@@ -6067,7 +6251,7 @@ export class AnsiParser {
       }
     }
 
-    const isWide = this.isWideChar(char);
+    const isWide = isWideChar(char);
     if (this.cursorX >= this.cols || (isWide && this.cursorX >= this.cols - 1)) {
       if (this.autoWrapMode) {
         const previousRow = this.buffer[this.cursorY];
@@ -6187,15 +6371,14 @@ export class AnsiParser {
   }
 
   private eraseInDisplay(mode: number) {
-    this.markFullBufferDirty();
     if (mode === 0 && this.cursorY + 1 < this.rows) {
-      markChangedContinuation(this.buffer[this.cursorY], this.buffer[this.cursorY + 1]);
+      this.preserveVerticalBoundary(this.cursorY + 1);
     }
     if (mode === 1 && this.cursorY > 0) {
-      markChangedContinuation(this.buffer[this.cursorY - 1], this.buffer[this.cursorY]);
+      this.preserveVerticalBoundary(this.cursorY);
     }
     if (mode === 2 || (mode === 1 && this.cursorY > 0)) {
-      markChangedContinuation(this.scrollback.at(-1), this.buffer[0]);
+      this.preserveVerticalBoundary(0);
     }
     if (mode === 0) {
       this.eraseTextSizingIntersecting(this.cursorY, this.cursorY, this.cursorX, this.cols - 1);
@@ -6234,6 +6417,7 @@ export class AnsiParser {
       this.pendingITerm2File = null;
       this.markAllRowsDirty();
     }
+    this.markFullBufferDirty();
   }
 
   private eraseInLine(mode: number) {
