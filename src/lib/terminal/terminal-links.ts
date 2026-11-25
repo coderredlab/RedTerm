@@ -1,5 +1,6 @@
-import { hasCompleteReflowIncomingContent, hasReflowIncomingContent, hasReflowOutgoingContent, isReflowContinuation, isUnprovenSnapshotRow, reflowContinuationEnd, type Cell } from "./ansi-parser";
-import { CONTINUATION_MARGIN_BITS, CONTINUATION_MARGIN_MASK, findInTerminalLinkPane, findRenderedTerminalLabel, terminalLinkContinuationGaps } from "./terminal-rendered-links";
+import { hasCompleteReflowIncomingContent, hasReflowIncomingContent, hasReflowOutgoingContent, hasRetainedPlainUrlBreak, hasUnprovenPathCells, isReflowContinuation, isUnprovenSnapshotRow, reflowContinuationEnd, TERMINAL_URL_TOKEN_SEPARATOR as TOKEN_SEPARATOR, type Cell } from "./ansi-parser";
+import { CONTINUATION_MARGIN_BITS, CONTINUATION_MARGIN_MASK, findInTerminalLinkPane, findRenderedTerminalLabel, terminalLinkContinuationGaps, touchesTerminalPaneCut, type TerminalLinkPane } from "./terminal-rendered-links";
+import { isUrlListDelimiter, paneSchemeOwner, WEB_SCHEME } from "./terminal-url-syntax";
 
 export interface TerminalUrlMatch {
   url: string;
@@ -12,7 +13,7 @@ export interface SafeTerminalUrl {
   origin: string;
 }
 
-const URL_PATTERN = /https?:\/\/[^\s<>"'`]+/gi;
+const URL_START = /https?:\/\//gi;
 const TRAILING_PROSE_PUNCTUATION: Record<string, true> = {
   ".": true,
   ",": true,
@@ -89,16 +90,76 @@ export function validateTerminalUrl(candidate: string): SafeTerminalUrl | null {
   };
 }
 
-// A scheme at the start of a pane row normally starts a separate link. A URI
-// value or list (e.g. `?next=https://…` or `%20https://…`) can wrap there too.
-function startsSeparatePaneUrl(text: string, boundary: number): boolean {
-  return /^https?:\/\//i.test(text.slice(boundary, boundary + 8)) &&
-    !/(?:[=+,;]|%[\da-f]{2})$/i.test(text.slice(boundary - 3, boundary));
+// A displayed destination on a new hard row is not query syntax belonging to
+// the previous row. Bare web schemes need a separate ownership decision.
+const DISPLAYED_TARGET = /^(?:!?\[[^\]\r\n]*\]\(|[([{]+)?([a-z][a-z\d+.-]*:(?:\/\/)?|(?:~|\.\.?)?\/)/i;
+
+// A suffix such as `p://host` or `/host` can look like a new URI/path when
+// this very boundary bisects the scheme of an explicit query value.
+function cutsQueryScheme(text: string, at: number, end: number): boolean {
+  const left = Math.max(0, at - 7); // Longest partial `https://` on either side.
+  const scheme = /https?:\/\//i.exec(text.slice(left, Math.min(end, at + 7)));
+  if (!scheme) return false;
+  const start = left + scheme.index;
+  return start < at && start + scheme[0].length > at &&
+    (text[start - 1] === "=" || text[start - 1] === "+" || text.slice(Math.max(0, start - 3), start) === "%20");
+}
+
+// A bare word after a URL could just be the next status line. Only infer a
+// plain pane wrap when the continuation participates in visible query syntax.
+// Do not count the query of a subsequent, independently displayed URL as proof.
+function queryEvidenceEnd(uri: string): number {
+  const query = uri.search(/[?#]/);
+  if (query < 0 || uri[query] !== "?") return -1;
+  // Do not count a nested URI's own query or fragment as outer field syntax.
+  const stop = uri.slice(query + 1).search(/[?#]/);
+  const fields = stop < 0 ? uri.slice(query) : uri.slice(query, query + 1 + stop);
+  const field = /[?&][\w~.-]+=([^&]*)/y;
+  const valueSyntax = /%[\da-f]{2}|[\w~.-]\+(?=[\w~.-])/gi;
+  let end = -1;
+  while (field.lastIndex < fields.length) {
+    const match = field.exec(fields);
+    if (!match) return -1;
+    const value = match[1];
+    // Plain values may be encoded words or lists of HTTP(S) URIs. A slash
+    // or colon in an unrelated filename/scheme does not prove a query wrap.
+    const nested = /(?:^|%20|\+)https?:\/\//i.exec(value);
+    if (!/^(?:[\w~.+-]|%[\da-f]{2})*$/i.test(nested ? value.slice(0, nested.index) : value)) return -1;
+    const valueStart = query + field.lastIndex - value.length;
+    end = valueStart;
+    while (valueSyntax.exec(value)) end = valueStart + valueSyntax.lastIndex;
+  }
+  return end;
+}
+
+function hasRenderedUrlLabel(buffer: Cell[][], row: number, col: number, pane?: TerminalLinkPane): boolean {
+  for (let y = Math.max(0, row - 1); y <= row; y++) {
+    const cells = buffer[y];
+    for (let x = 0; x < cells.length; x++) {
+      const cell = cells[x], previous = cells[x - 1];
+      if (!cell.style.underline || cell.style.hidden || cell.hyperlink ||
+        (previous?.style.underline && !previous.style.hidden && !previous.hyperlink)) continue;
+      if (findRenderedTerminalLabel(buffer, { row: y, col: x }, pane?.hasDivider === true, target =>
+        target.row === row && target.col === col ? { startCol: col, endCol: col } : null, pane?.cutBottom)) return true;
+    }
+  }
+  return false;
+}
+
+function visibleRange(row: Cell[], start: number, end: number, plainUrl: boolean, spacesOnly = false, newOwner?: Cell): boolean {
+  if (start >= end) return true;
+  if (isUnprovenSnapshotRow(row) || hasUnprovenPathCells(row, start, end, plainUrl, newOwner)) return false;
+  for (let col = start; col < end; col++) {
+    const cell = row[col];
+    if (cell.style.hidden || cell.hyperlink || (spacesOnly && cell.char !== " ")) return false;
+  }
+  return true;
 }
 
 function findUrlInRows(
-  buffer: Cell[][], point: { row: number; col: number }, panePadding: boolean,
+  buffer: Cell[][], point: { row: number; col: number }, pane?: TerminalLinkPane, fromLabel = false,
 ): TerminalUrlMatch | null {
+  const panePadding = pane?.hasDivider === true;
   const row = buffer[point.row];
   if (!row?.[point.col] || row.length > 4096 || isUnprovenSnapshotRow(row)) return null;
   const gaps = (before: Cell[], after: Cell[], ignoreHyperlinks = false) => {
@@ -110,34 +171,42 @@ function findUrlInRows(
     }
     return terminalLinkContinuationGaps(before, after, panePadding, ignoreHyperlinks);
   };
-  let pointTextEnd = 0;
-  for (let col = 0; col <= point.col; col++) pointTextEnd += row[col].char.length;
+  let textEndCol = point.col + 1;
   let first = point.row, last = point.row, length = row.length;
   while (first > 0 && length + buffer[first - 1].length <= 4096 &&
     point.row - first + 1 < 32) {
     const spacing = gaps(buffer[first - 1], buffer[first]);
     if (spacing < 0) break;
-    // Pane padding isn't a token separator before a row-initial embedded URI.
-    const margin = panePadding ? spacing & CONTINUATION_MARGIN_MASK : 0;
-    const boundary = buffer[first].map(cell => cell.char).join("").slice(margin).search(/\s\(?https?:\/\//i);
-    if (boundary >= 0 && (first < point.row || margin + boundary < pointTextEnd)) break;
+    // A literal token separator makes earlier rows irrelevant. Trim only the
+    // geometric margins here, not a real space inside a soft-wrapped token.
+    const margin = spacing & CONTINUATION_MARGIN_MASK;
+    let separated = false;
+    for (let col = margin; col < textEndCol; col++) {
+      if (TOKEN_SEPARATOR.test(buffer[first][col].char)) { separated = true; break; }
+    }
+    if (separated) break;
+    textEndCol = buffer[first - 1].length - (spacing >> CONTINUATION_MARGIN_BITS);
     first--;
     length += buffer[first].length;
   }
-  const paneHead = panePadding && first > 0 ? gaps(buffer[first - 1], buffer[first], true) : -1;
+  const priorGap = first > 0 ? gaps(buffer[first - 1], buffer[first], true) : -1;
   while (last + 1 < buffer.length && length + buffer[last + 1].length <= 4096 &&
     last - first + 1 < 32 && gaps(buffer[last], buffer[last + 1]) >= 0) {
     last++;
     length += buffer[last].length;
   }
   let text = "", clickOffset = -1;
-  const columns: number[] = [], rowStarts: number[] = [];
+  const columns: number[] = [], rowStarts: number[] = [], joins: number[] = [];
   for (let line = first; line <= last; line++) {
     rowStarts.push(text.length);
-    const leading = line === first ? 0 : gaps(buffer[line - 1], buffer[line]) & CONTINUATION_MARGIN_MASK;
-    const trailing = line === last ? 0 : gaps(buffer[line], buffer[line + 1]) >> CONTINUATION_MARGIN_BITS;
-    for (let col = leading; col < buffer[line].length - trailing; col++) {
-      const cell = buffer[line][col];
+    const leading = line === first ? 0 : joins[line - first - 1] & CONTINUATION_MARGIN_MASK;
+    const spacing = line === last ? 0 : gaps(buffer[line], buffer[line + 1]);
+    if (line < last) joins.push(spacing);
+    const trailing = spacing >> CONTINUATION_MARGIN_BITS;
+    const cells = buffer[line];
+    for (let col = leading; col < cells.length - trailing; col++) {
+      const cell = cells[col];
+      if (text.length + cell.char.length > 4096) return null;
       if (line === point.row && col === point.col) {
         clickOffset = cell.char ? text.length :
           col > 0 && buffer[line][col - 1].char ? text.length - buffer[line][col - 1].char.length : -1;
@@ -147,130 +216,224 @@ function findUrlInRows(
     }
   }
   rowStarts.push(text.length);
-  URL_PATTERN.lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = URL_PATTERN.exec(text)) !== null) {
-    const offset = match.index!;
-    let candidate = match[0];
-    if (clickOffset < offset || clickOffset >= offset + candidate.length) continue;
-    // If the scan starts mid-token, a later `https://` can belong to its query.
-    // Only a literal separator, not the clipped pane margin, starts a new token.
-    if (paneHead >= 0 && !/[\s<>"'`]/.test(text.slice(paneHead & CONTINUATION_MARGIN_MASK, offset))) return null;
-    const root = rowStarts.findIndex((_, index) => offset < rowStarts[index + 1]);
-    const firstLine = first + root;
-    const tokenEnd = offset + candidate.length;
-    // Infer wrapping only for a standalone URL in a clipped pane. Its scheme
-    // and authority must already be complete before the first inferred join.
-    const authority = panePadding && tokenEnd > rowStarts[root + 1] && /^ *$/.test(text.slice(rowStarts[root], offset))
-      ? /^https?:\/\/[^/\\?#]+[/#?]/i.exec(candidate) : null;
-    let paneSpacing: number | undefined;
-    let literalWhitespaceEnd = false;
-    let renderedTarget: boolean | undefined;
-    for (let line = first; line < last; line++) {
-      const boundary = rowStarts[line - first + 1];
-      if (boundary <= offset || boundary >= offset + candidate.length ||
-        isReflowContinuation(buffer[line], buffer[line + 1])) continue;
-      if (renderedTarget === undefined) {
-        renderedTarget = false;
-        if (text[offset - 1] === "(") {
-          for (let labelRow = Math.max(0, firstLine - 1); labelRow <= firstLine && !renderedTarget; labelRow++) {
-            const label = buffer[labelRow];
-            for (let col = 0; col < label.length && !renderedTarget; col++) {
-              const cell = label[col], previous = label[col - 1];
-              if (!cell.style.underline || cell.style.hidden || cell.hyperlink ||
-                (previous?.style.underline && !previous.style.hidden && !previous.hyperlink)) continue;
-              renderedTarget = !!findRenderedTerminalLabel(buffer, { row: labelRow, col }, panePadding,
-                target => target.row === firstLine && target.col === columns[offset]
-                  ? { startCol: target.col, endCol: target.col } : null);
-            }
+  if (clickOffset < 0 || TOKEN_SEPARATOR.test(text[clickOffset])) return null;
+  let start = clickOffset, limit = clickOffset + 1;
+  while (start > 0 && !TOKEN_SEPARATOR.test(text[start - 1])) start--;
+  while (limit < text.length && !TOKEN_SEPARATOR.test(text[limit])) limit++;
+  const rowAt = (index: number) => rowStarts.findIndex((_, line) => index < rowStarts[line + 1]);
+  const visibleText = (from: number, to: number, newOwner?: Cell): boolean => {
+    if (from >= to) return true;
+    for (let i = rowAt(from); i >= 0 && rowStarts[i] < to; i++) {
+      const cells = buffer[first + i];
+      const left = columns[Math.max(from, rowStarts[i])];
+      let right = columns[Math.min(to, rowStarts[i + 1]) - 1] + 1;
+      while (right < cells.length && cells[right].char === "") right++;
+      if (!visibleRange(cells, left, right, !renderedTarget, false, newOwner)) return false;
+    }
+    return true;
+  };
+  const firstScheme = (from: number): number => {
+    URL_START.lastIndex = from;
+    const match = URL_START.exec(text);
+    return match && match.index < limit ? match.index : -1;
+  };
+  let offset = fromLabel ? clickOffset : firstScheme(start);
+  if (offset < 0 || (fromLabel && !WEB_SCHEME.test(text.slice(offset, offset + 8)))) return null;
+  const initialStart = start, initialOffset = offset;
+  let renderedTarget = fromLabel, opener = -1, close = -1, afterClosedTarget = false;
+  // A visible `( URL )` belongs to this target, not to the next row's
+  // heuristic. Partition on its balanced closer before interpreting wraps.
+  const delimitTarget = (): boolean => {
+    while (offset >= 0) {
+      opener = offset - 1;
+      while (opener >= 0 && text[opener] === " ") opener--;
+      if (text[opener] !== "(") opener = -1;
+      renderedTarget = fromLabel || (opener >= 0 && hasRenderedUrlLabel(buffer, first + rowAt(offset), columns[offset], pane));
+      close = -1;
+      if (opener < 0 && !fromLabel) return true;
+      if (opener >= 0 && !visibleText(opener, offset)) return false;
+      let depth = 0;
+      for (let pos = offset; pos < limit; pos++) {
+        if (text[pos] !== "(" && text[pos] !== ")") continue;
+        if (!visibleText(pos, pos + 1)) return false;
+        if (text[pos] === "(") depth++;
+        else if (depth-- === 0) { close = pos; break; }
+      }
+      if (close < 0) return true;
+      if (clickOffset < close) { limit = close; return true; }
+      if (fromLabel || clickOffset === close) return false;
+      const following = firstScheme(close + 1);
+      if (following < 0 || !rowStarts.some((boundary, i) => i > 0 && boundary > close && boundary <= following &&
+        !isReflowContinuation(buffer[first + i - 1], buffer[first + i]))) return false;
+      start = close + 1;
+      afterClosedTarget = true;
+      offset = following;
+    }
+    return false;
+  };
+  if (!delimitTarget()) return null;
+  let rightGutter = 2;
+  if (panePadding && !renderedTarget) {
+    // A visible inked column cannot be common padding, even when that ink
+    // belongs to an unrelated OSC 8 link. Concealed/stale ink is not proof.
+    for (let line = first; line <= last && rightGutter; line++) {
+      const cells = buffer[line];
+      if (isUnprovenSnapshotRow(cells)) continue;
+      for (let n = 0; n < rightGutter && n < cells.length; n++) {
+        const col = cells.length - 1 - n, head = cells[col].char === "" ? col - 1 : col;
+        if (head >= 0 && cells[head].char.trim() && !cells[head].style.hidden && !cells[col].style.hidden &&
+          !hasUnprovenPathCells(cells, head, col + 1, true)) rightGutter = n;
+      }
+    }
+  }
+  const physicalBreak = (line: number, spacing: number): boolean => {
+    const before = buffer[line], after = buffer[line + 1];
+    if (renderedTarget || isReflowContinuation(before, after)) return false;
+    const leading = spacing & CONTINUATION_MARGIN_MASK;
+    return hasRetainedPlainUrlBreak(before, after) || (panePadding && spacing >= 0 &&
+      (spacing >> CONTINUATION_MARGIN_BITS) > Math.min(rightGutter, Math.max(1, leading)));
+  };
+  const visibleMargins = (line: number, spacing: number): boolean =>
+    spacing < 0 || (visibleRange(buffer[line], buffer[line].length - (spacing >> CONTINUATION_MARGIN_BITS), buffer[line].length, !renderedTarget, true) &&
+      visibleRange(buffer[line + 1], 0, spacing & CONTINUATION_MARGIN_MASK, !renderedTarget, true));
+  let separatedStart = first > 0 && physicalBreak(first - 1, priorGap);
+  let separatedEnd = false, uncertain = separatedStart && !visibleMargins(first - 1, priorGap);
+  // A clipped prefix can own a later row-initial scheme, even if no part of
+  // the outer scheme is left. Carry that uncertainty until a visible break.
+  if (!separatedStart && initialStart < rowStarts[1]) {
+    if (first === 0) {
+      uncertain = touchesTerminalPaneCut(pane, buffer[0], columns[Math.min(initialOffset, rowStarts[1] - 1)], true);
+    } else if (priorGap >= 0 && initialStart <= (priorGap & CONTINUATION_MARGIN_MASK) &&
+      (panePadding || isReflowContinuation(buffer[first - 1], buffer[first]))) {
+      uncertain = true;
+    }
+  }
+  if (initialStart > 0 && !visibleText(initialStart - 1, initialStart)) uncertain = true;
+  if (afterClosedTarget && !uncertain) separatedStart = true;
+  // Partition the clicked token before using any query evidence. A bad or
+  // ambiguous pair cannot disable a later, independently separated target.
+  let nestedValueJoins = 0;
+  for (let i = 0; !renderedTarget && i < joins.length; i++) {
+    const at = rowStarts[i + 1], line = first + i, spacing = joins[i];
+    if (at < start || at >= limit || isReflowContinuation(buffer[line], buffer[line + 1])) continue;
+    let split = physicalBreak(line, spacing);
+    if (at === start && !split) continue;
+    let valid = visibleMargins(line, spacing);
+    let nonWebTarget = false;
+    if (!split && panePadding) {
+      const next = text.slice(at, rowStarts[i + 2]);
+      const web = WEB_SCHEME.exec(next);
+      if (web) {
+        // A list delimiter separates this link even if the preceding pair
+        // was ambiguous. An unknown head is not itself a usable outer URI.
+        if (isUrlListDelimiter(text[at - 1])) {
+          split = true;
+          valid &&= spacing > 0 && visibleText(at - 1, at + web[0].length);
+        } else if (!uncertain && offset >= 0 && offset < at) {
+          const owner = paneSchemeOwner(text.slice(offset, at), next.slice(0, limit - at));
+          if (owner === "unknown") { uncertain = true; continue; }
+          if (owner === "outer") { nestedValueJoins |= 1 << i; continue; }
+          split = true;
+          const newOwner = clickOffset >= at ? buffer[line + 1][columns[at]] : undefined;
+          valid &&= spacing > 0 && visibleText(offset, at, newOwner) && visibleText(at, at + web[0].length);
+        } else continue;
+      } else {
+        const target = DISPLAYED_TARGET.exec(next);
+        if (target) {
+          if (cutsQueryScheme(text, at, limit)) continue;
+          nonWebTarget = !WEB_SCHEME.test(target[1]);
+          if (target[0] === target[1] && nonWebTarget && target[1].endsWith(":")) {
+            // The apparent scheme may be the rest of host:port inside a redirect.
+            const prefix = offset < at && offset >= 0 ? text.slice(offset, at) : "";
+            if (/(?:=|\+|%20)https?:\/\/[\w.-]*$/i.test(prefix) &&
+              /^[\w.-]+:\d+(?:[/?#&]|$)/.test(next)) continue;
+            if (prefix.includes("?") && !/^\w[\w.+-]*:\s/.test(next)) { uncertain = true; continue; }
           }
+          // A bare path at this position might be the rest of a URI-valued
+          // field. Neither its path escapes nor its first slash settle that.
+          const attached = target[0] === target[1] && offset >= 0 && offset < at &&
+            (target[1] === "/" ? text.slice(offset, at).includes("?") :
+              paneSchemeOwner(text.slice(offset, at), target[0]) !== "separate");
+          if (attached) { uncertain = true; continue; }
+          split = true;
+          valid &&= spacing > 0 && visibleText(at, at + target[0].length);
         }
       }
-      if (renderedTarget) continue;
-      const spacing = gaps(buffer[line], buffer[line + 1]);
-      const nextEnd = rowStarts[line - first + 2];
-      const separateUrl = panePadding && startsSeparatePaneUrl(text, boundary);
-      if (authority && offset + authority[0].length <= boundary && !separateUrl &&
-        (paneSpacing === undefined || paneSpacing === spacing) &&
-        (tokenEnd >= nextEnd || /^ *$/.test(text.slice(tokenEnd, nextEnd)))) {
-        paneSpacing = spacing;
-        continue;
-      }
-      // Unlabelled hard lines outside that layout keep their literal separation.
-      if (spacing <= 0 && !separateUrl) return null;
-      const leading = spacing & CONTINUATION_MARGIN_MASK;
-      for (let col = 0; col < leading; col++) {
-        const cell = buffer[line + 1][col];
-        if (cell.style.hidden || cell.hyperlink) return null;
-      }
-      candidate = candidate.slice(0, boundary - offset);
-      URL_PATTERN.lastIndex = boundary;
-      literalWhitespaceEnd = true;
+    }
+    if (!split && !uncertain && offset >= 0 && offset < at && (!panePadding || !text.slice(offset, at).includes("?"))) {
+      // Without a query (or without a pane), only a real terminal soft wrap
+      // can extend the URL. Preserve ordinary visibly spaced hard newlines.
+      split = true;
+      valid &&= spacing > 0;
+    }
+    if (!split) continue;
+    if (at > clickOffset) {
+      separatedEnd = true;
+      limit = at;
+      uncertain ||= !valid;
       break;
     }
-    let unsafeDelimiter = false;
-    // A rendered `(URL)` terminates at its outer delimiter, not the following row.
-    if (text[offset - 1] === "(") {
-      const openerRow = first + rowStarts.findIndex((_, index) => offset - 1 < rowStarts[index + 1]);
-      const opener = buffer[openerRow][columns[offset - 1]];
-      unsafeDelimiter = opener.style.hidden || !!opener.hyperlink;
-      let depth = 0;
-      for (let index = 0; index < candidate.length; index++) {
-        if (candidate[index] === "(") depth++;
-        else if (candidate[index] === ")" && depth-- === 0) {
-          const delimiterOffset = offset + index;
-          const delimiterRow = first + rowStarts.findIndex((_, line) => delimiterOffset < rowStarts[line + 1]);
-          const delimiter = buffer[delimiterRow][columns[delimiterOffset]];
-          unsafeDelimiter ||= delimiter.style.hidden || !!delimiter.hyperlink;
-          candidate = candidate.slice(0, index);
-          break;
-        }
-      }
-    }
-    const url = trimUrlCandidate(candidate);
-    const end = offset + url.length;
-    if (!url || clickOffset < offset || clickOffset >= end) continue;
-    if (unsafeDelimiter) return null;
-    const lastLine = first + rowStarts.findIndex((_, index) => end <= rowStarts[index + 1]);
-    // Never offer a prefix/suffix after truncation, lost ancestry, or a blocked OSC 8 span.
-    const before = firstLine > 0 ? gaps(buffer[firstLine - 1], buffer[firstLine], true) : -1;
-    const after = lastLine + 1 < buffer.length ? gaps(buffer[lastLine], buffer[lastLine + 1], true) : -1;
-    const lineEnd = rowStarts[lastLine - first + 1];
-    const preceding = offset > rowStarts[firstLine - first] ? buffer[firstLine][columns[offset - 1]] : undefined;
-    const literalWhitespaceStart = preceding?.char === " " && !preceding.style.hidden && !preceding.hyperlink;
-    if ((!literalWhitespaceStart && firstLine === first && before >= 0 && /^[ ([{"'`]*$/.test(text.slice(0, offset))) ||
-      (!literalWhitespaceEnd && lastLine === last && after >= 0 && /^ *$/.test(text.slice(offset + candidate.length, lineEnd)))) return null;
-    if (hasReflowIncomingContent(buffer[firstLine]) &&
-      (firstLine === 0 || !isReflowContinuation(buffer[firstLine - 1], buffer[firstLine]) ||
-        gaps(buffer[firstLine - 1], buffer[firstLine]) < 0)) return null;
-    if (hasReflowOutgoingContent(buffer[lastLine]) &&
-      (lastLine + 1 === buffer.length || !isReflowContinuation(buffer[lastLine], buffer[lastLine + 1]) ||
-        gaps(buffer[lastLine], buffer[lastLine + 1]) < 0)) return null;
-    for (let line = firstLine; line <= lastLine; line++) {
-      const current = buffer[line];
-      if (isUnprovenSnapshotRow(current)) return null;
-      const leading = line === first ? 0 : gaps(buffer[line - 1], current) & CONTINUATION_MARGIN_MASK;
-      const trailing = line === last ? 0 : gaps(current, buffer[line + 1]) >> CONTINUATION_MARGIN_BITS;
-      for (let col = 0; col < leading; col++) {
-        if (current[col].style.hidden || current[col].hyperlink) return null;
-      }
-      for (let col = current.length - trailing; col < current.length; col++) {
-        if (current[col].style.hidden || current[col].hyperlink || current[col].char !== " ") return null;
-      }
-      const from = Math.max(offset, rowStarts[line - first]);
-      const to = Math.min(end, rowStarts[line - first + 1]);
-      for (let col = columns[from]; col <= columns[to - 1]; col++) {
-        if (current[col].style.hidden || current[col].hyperlink) return null;
-      }
-    }
-    const pointStart = rowStarts[point.row - first], pointEnd = rowStarts[point.row - first + 1];
-    const startCol = columns[Math.max(offset, pointStart)];
-    let endCol = columns[Math.min(end, pointEnd) - 1];
-    while (endCol + 1 < row.length && row[endCol + 1].char === "") endCol++;
-    const safeUrl = validateTerminalUrl(url);
-    return safeUrl ? { url: safeUrl.url, startCol, endCol } : null;
+    separatedStart = true;
+    start = at;
+    uncertain = !valid || nonWebTarget;
+    offset = firstScheme(start);
+    if (!uncertain && offset >= 0 && !delimitTarget()) return null;
   }
-  return null;
+  if (uncertain || offset < 0 || clickOffset < offset || offset >= limit) return null;
+  const root = rowAt(offset);
+  const firstLine = first + root;
+  const candidate = text.slice(offset, limit);
+  const authority = panePadding && /^ *$/.test(text.slice(rowStarts[root], offset))
+    ? /^https?:\/\/[^/\\?#]+[/#?]/i.exec(candidate) : null;
+  const query = candidate.indexOf("?");
+  let evidenceEnd: number | undefined, paneSpacing: number | undefined;
+  for (let i = root; !renderedTarget && i < joins.length; i++) {
+    const at = rowStarts[i + 1] - offset;
+    if (at >= candidate.length) break;
+    if (isReflowContinuation(buffer[first + i], buffer[first + i + 1])) continue;
+    if (!authority || authority[0].length > at || query < 0 || query >= at ||
+      (paneSpacing !== undefined && paneSpacing !== joins[i])) return null;
+    evidenceEnd ??= queryEvidenceEnd(candidate);
+    if (evidenceEnd < 0 || (evidenceEnd <= at && !(nestedValueJoins & (1 << i)))) return null;
+    paneSpacing = joins[i];
+  }
+  const closedParenthesis = close === limit;
+  const url = trimUrlCandidate(candidate);
+  const end = offset + url.length, stop = offset + candidate.length;
+  if (!url || clickOffset >= end || !visibleText(offset, stop)) return null;
+  const tail = rowAt(stop - 1), lastLine = first + tail;
+  if (!closedParenthesis && last === buffer.length - 1 && stop > rowStarts[last - first] &&
+    touchesTerminalPaneCut(pane, buffer[last], columns[stop - 1], false)) return null;
+  if (!closedParenthesis && !separatedEnd && stop < text.length && TOKEN_SEPARATOR.test(text[stop]) &&
+    !visibleText(stop, stop + 1)) return null;
+  // A window edge or a blocked OSC 8 span is not a terminator. The same
+  // physical break that partitions retained rows also terminates at the limit.
+  const literalStart = offset > rowStarts[root] && TOKEN_SEPARATOR.test(text[offset - 1]) &&
+    visibleText(offset - 1, offset);
+  if (root === 0 && priorGap >= 0 && !separatedStart && !literalStart &&
+    /^[ ([{"'`]*$/.test(text.slice(0, offset))) return null;
+  if (lastLine === last && last + 1 < buffer.length && !separatedEnd && !closedParenthesis &&
+    /^ *$/.test(text.slice(stop, rowStarts[tail + 1]))) {
+    const after = gaps(buffer[last], buffer[last + 1], true);
+    if (after >= 0 && (!physicalBreak(last, after) || !visibleMargins(last, after))) return null;
+  }
+  if (hasReflowIncomingContent(buffer[firstLine]) &&
+    (firstLine === 0 || !isReflowContinuation(buffer[firstLine - 1], buffer[firstLine]) ||
+      gaps(buffer[firstLine - 1], buffer[firstLine]) < 0)) return null;
+  if (hasReflowOutgoingContent(buffer[lastLine]) &&
+    (lastLine + 1 === buffer.length || !isReflowContinuation(buffer[lastLine], buffer[lastLine + 1]) ||
+      gaps(buffer[lastLine], buffer[lastLine + 1]) < 0)) return null;
+  const syntaxStart = opener >= 0 ? rowAt(opener) : root;
+  const syntaxEnd = closedParenthesis ? rowAt(stop) : tail;
+  for (let i = syntaxStart; i < syntaxEnd; i++) {
+    if (!visibleMargins(first + i, joins[i])) return null;
+  }
+  const pointStart = rowStarts[point.row - first], pointEnd = rowStarts[point.row - first + 1];
+  const startCol = columns[Math.max(offset, pointStart)];
+  let endCol = columns[Math.min(end, pointEnd) - 1];
+  while (endCol + 1 < row.length && row[endCol + 1].char === "") endCol++;
+  const safeUrl = validateTerminalUrl(url);
+  return safeUrl ? { url: safeUrl.url, startCol, endCol } : null;
 }
 
 
@@ -295,9 +458,9 @@ export function findUrlAtCell(
     return safeUrl ? { url: safeUrl.url, startCol, endCol } : null;
   }
 
-  return findInTerminalLinkPane(buffer, point, (rows, localPoint, panePadding) => {
-    const rendered = findRenderedTerminalLabel(rows, localPoint, panePadding,
-      target => findUrlInRows(rows, target, panePadding));
-    return rendered === undefined ? findUrlInRows(rows, localPoint, panePadding) : rendered;
+  return findInTerminalLinkPane(buffer, point, (rows, localPoint, pane) => {
+    const rendered = findRenderedTerminalLabel(rows, localPoint, pane?.hasDivider === true,
+      target => findUrlInRows(rows, target, pane, true), pane?.cutBottom);
+    return rendered === undefined ? findUrlInRows(rows, localPoint, pane) : rendered;
   });
 }

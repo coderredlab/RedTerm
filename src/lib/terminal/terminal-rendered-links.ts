@@ -1,4 +1,4 @@
-import { hasReflowIncomingContent, hasReflowOutgoingContent, isReflowContinuation, isReflowTail, isTerminalPathDividerColumn, isUnprovenSnapshotRow, pathContinuationLeadingMargin, reflowContinuationEnd, sliceTerminalPathRow, type Cell } from "./ansi-parser";
+import { hasReflowIncomingContent, hasReflowOutgoingContent, hasUnprovenPathCells, isReflowContinuation, isReflowTail, isTerminalPathDividerColumn, isUnprovenSnapshotRow, pathContinuationLeadingMargin, reflowContinuationEnd, sliceTerminalPathRow, terminalPaneHorizontalRule as horizontalRule, type Cell } from "./ansi-parser";
 
 export interface TerminalTextPoint { row: number; col: number }
 export interface TerminalTextMatch { startCol: number; endCol: number }
@@ -41,6 +41,7 @@ export function terminalLinkContinuationGaps(
 export function findRenderedTerminalLabel<T extends TerminalTextMatch>(
   buffer: Cell[][], point: TerminalTextPoint, panePadding: boolean,
   findTarget: (point: TerminalTextPoint) => T | null,
+  cutBottom = false,
 ): T | null | undefined {
   const row = buffer[point.row];
   const isLabelCell = (cell: Cell | undefined) => cell?.style.underline &&
@@ -53,7 +54,7 @@ export function findRenderedTerminalLabel<T extends TerminalTextMatch>(
   let targetRow = point.row, targetCol = end + 1, scanned = end - start + 1;
   const advanceRow = (): number | null | undefined => {
     const before = buffer[targetRow], after = buffer[targetRow + 1];
-    if (!after) return undefined;
+    if (!after) return cutBottom ? null : undefined;
     const known = isReflowContinuation(before, after);
     if (targetRow - point.row >= 32 || isUnprovenSnapshotRow(after) ||
       (before.length !== after.length && !known) ||
@@ -61,6 +62,7 @@ export function findRenderedTerminalLabel<T extends TerminalTextMatch>(
     const gaps = terminalLinkContinuationGaps(before, after, panePadding);
     targetRow++;
     targetCol = gaps >= 0 ? gaps & CONTINUATION_MARGIN_MASK : 0;
+    if (hasUnprovenPathCells(after, 0, targetCol)) return null;
     for (let col = 0; col < targetCol; col++) {
       if (after[col].style.hidden || after[col].hyperlink) return null;
     }
@@ -79,6 +81,7 @@ export function findRenderedTerminalLabel<T extends TerminalTextMatch>(
       targetCol++;
       if (++scanned > 4096) return null;
     }
+    if (hasUnprovenPathCells(current, targetRow === point.row ? start : 0, targetCol)) return null;
     if (targetCol < current.length) break;
     if (!labelOnRow) return undefined;
     const gaps = advanceRow();
@@ -89,12 +92,14 @@ export function findRenderedTerminalLabel<T extends TerminalTextMatch>(
   const opener = buffer[targetRow]?.[targetCol];
   if (opener?.char !== "(") return undefined;
   if (opener.style.hidden || opener.hyperlink) return null;
+  const openerCol = targetCol;
   targetCol++;
   const targetLine = buffer[targetRow];
   while (targetCol < targetLine.length && targetLine[targetCol].char === " ") {
     if (targetLine[targetCol].style.hidden || targetLine[targetCol].hyperlink) return null;
     targetCol++;
   }
+  if (hasUnprovenPathCells(targetLine, openerCol, targetCol)) return null;
   if (targetCol === targetLine.length) {
     const gaps = advanceRow();
     if (gaps === undefined || gaps === null || gaps < 0) return null;
@@ -103,35 +108,158 @@ export function findRenderedTerminalLabel<T extends TerminalTextMatch>(
   return match ? { ...match, startCol: start, endCol: end } : null;
 }
 
+export interface TerminalLinkPane {
+  hasDivider: boolean;
+  cutTop: boolean;
+  cutBottom: boolean;
+  cutTopStarts?: number[];
+  cutBottomEnds?: number[];
+}
+
+/** At a split/merge, sidebar text beyond a former divider does not delimit a token. */
+export function touchesTerminalPaneCut(
+  pane: TerminalLinkPane | undefined, row: Cell[], col: number, incoming: boolean,
+): boolean {
+  if (incoming) {
+    if (!pane?.cutTop) return false;
+    let left = 0;
+    if (pane.cutTopStarts) {
+      for (const start of pane.cutTopStarts) {
+        if (start === col + 1) return true; // The token starts on the former wall.
+        if (start > col) break;
+        left = start;
+      }
+    }
+    let sawSpace = false;
+    for (let x = col - 1; x >= left; x--) {
+      const cell = row[x];
+      if (!cell.style.hidden && cell.char !== " " && sawSpace) return false;
+      if (cell.style.hidden || cell.hyperlink) return true;
+      if (cell.char === " ") sawSpace = true;
+      else if (/[\s<>"'`]/u.test(cell.char)) return false;
+    }
+  } else {
+    if (!pane?.cutBottom) return false;
+    let right = row.length;
+    if (pane.cutBottomEnds) {
+      for (const end of pane.cutBottomEnds) {
+        if (end === col) return true;
+        if (end > col) { right = end; break; }
+      }
+    }
+    if (col + 1 < right && row[col + 1].char === "") {
+      const tail = row[++col];
+      if (tail.style.hidden || tail.hyperlink) return true;
+    }
+    for (let x = col + 1; x < right; x++) {
+      const cell = row[x];
+      if (cell.style.hidden || cell.hyperlink) return true;
+      if (cell.char !== " " || x - col > 2) return false;
+    }
+  }
+  return true;
+}
+
+const PANE_CELLS = 4096;
+
 /** Keep the neighboring sidebar/gutter outside both URL and file-path targets. */
 export function findInTerminalLinkPane<T extends TerminalTextMatch>(
   buffer: Cell[][], point: TerminalTextPoint,
-  findInRows: (rows: Cell[][], point: TerminalTextPoint, panePadding: boolean) => T | null,
+  findInRows: (rows: Cell[][], point: TerminalTextPoint, pane?: TerminalLinkPane) => T | null,
 ): T | null {
   const row = buffer[point.row];
   if (!row?.[point.col]) return null;
-  const divider = (line: Cell[] | undefined, col: number) => {
-    const cell = line?.[col];
-    return !!cell && /^[│┃║▕]$/.test(cell.char) && !cell.style.hidden && !cell.hyperlink;
+  const divider = (y: number, x: number) => isTerminalPathDividerColumn(buffer, y, x);
+  if (divider(point.row, point.col)) return null;
+  let left = point.col, right = point.col + 1;
+  while (left > 0 && !divider(point.row, left - 1)) {
+    if (right - left >= PANE_CELLS) return null;
+    left--;
+  }
+  while (right < row.length && !divider(point.row, right)) {
+    if (right - left >= PANE_CELLS) return null;
+    right++;
+  }
+  const hasDivider = left > 0 || right < row.length;
+  if (horizontalRule(buffer, point.row, left, right) !== undefined) {
+    const previous = buffer[point.row - 1], next = buffer[point.row + 1];
+    if (hasDivider || (!(previous && isReflowContinuation(previous, row)) &&
+      !(next && isReflowContinuation(row, next)))) return null;
+  }
+  const pane: TerminalLinkPane = { hasDivider, cutTop: false, cutBottom: false };
+
+  const samePane = (y: number, end: number) => {
+    const line = buffer[y];
+    if (end - left > PANE_CELLS || line.length < end ||
+      (left > 0 && !divider(y, left - 1)) ||
+      (right < row.length ? !divider(y, right) : hasDivider && line.length !== row.length)) return false;
+    // The outer walls may still be there even though this row splits the pane.
+    for (let col = left; col < end; col++) if (divider(y, col)) return false;
+    return true;
   };
-  const continuousDivider = (col: number) => isTerminalPathDividerColumn(buffer, point.row, col);
-  if (continuousDivider(point.col)) return null;
-  let left = 0, right = row.length;
-  for (let col = point.col - 1; col >= 0; col--) {
-    if (continuousDivider(col)) { left = col + 1; break; }
+  const cutMayContinue = (y: number, incoming: boolean, retainedEnd: number) => {
+    const line = buffer[y];
+    if (line.length <= left) return true;
+    // A merged pane can start earlier or end later; a split pane can end
+    // inside our old rectangle. Ignore panes separated by an unchanged wall.
+    let start = left, end = Math.min(retainedEnd, line.length);
+    let cuts: number[] | undefined;
+    for (let col = start; col < end; col++) {
+      if (divider(y, col)) (cuts ??= []).push(col - left + (incoming ? 1 : 0));
+    }
+    if (incoming) pane.cutTopStarts = cuts;
+    else pane.cutBottomEnds = cuts;
+    while (start > 0 && !divider(y, start - 1)) {
+      if (end - start >= PANE_CELLS) return true;
+      start--;
+    }
+    while (end < line.length && !divider(y, end)) {
+      if (end - start >= PANE_CELLS) return true;
+      end++;
+    }
+    let lastInk = -Infinity;
+    for (let col = start; col <= end; col++) {
+      const wall = col === end || divider(y, col);
+      // At most two trailing spaces can be compositor padding.
+      if (incoming && (wall || col === retainedEnd) && lastInk >= col - 3) return true;
+      if (wall) { lastInk = -Infinity; continue; }
+      const cell = line[col];
+      if (cell.char !== " " || cell.style.hidden || cell.hyperlink) {
+        if (!incoming) return true;
+        lastInk = col;
+      }
+    }
+    return false;
+  };
+  const extent = (step: -1 | 1) => {
+    let y = point.row, scanned = 0;
+    for (let count = 0; ; count++) {
+      const next = y + step, line = buffer[next];
+      if (!line) break;
+      const end = hasDivider ? right : line.length;
+      const retainedEnd = hasDivider ? right : buffer[y].length;
+      let rule = hasDivider || end === retainedEnd ? horizontalRule(buffer, next, left, end) : undefined;
+      // A borderless row of box glyphs can also be literal soft-wrapped text.
+      if (rule !== undefined && !hasDivider &&
+        (step < 0 ? isReflowContinuation(line, buffer[y]) : isReflowContinuation(buffer[y], line))) rule = undefined;
+      if (rule === true) break;
+      if (rule === false || count === 33 || scanned >= PANE_CELLS || !samePane(next, end)) {
+        const cut = rule === false || cutMayContinue(next, step < 0, retainedEnd);
+        if (step < 0) pane.cutTop = cut;
+        else pane.cutBottom = cut;
+        break;
+      }
+      scanned += end - left;
+      y = next;
+    }
+    return y;
+  };
+  const top = extent(-1), bottom = extent(1);
+  if (!hasDivider && top === 0 && bottom + 1 === buffer.length) return findInRows(buffer, point);
+  const rows = buffer.slice(top, bottom + 1);
+  if (hasDivider) {
+    for (let y = 0; y < rows.length; y++) rows[y] = sliceTerminalPathRow(rows[y], left, right);
   }
-  for (let col = point.col + 1; col < row.length; col++) {
-    if (continuousDivider(col)) { right = col; break; }
-  }
-  if (left === 0 && right === row.length) return findInRows(buffer, point, false);
-  const withinPane = (line: Cell[]) => line.length >= right &&
-    (left === 0 || divider(line, left - 1)) &&
-    (right === row.length ? line.length === row.length : divider(line, right));
-  const reach = Math.min(33, Math.ceil(4096 / Math.max(1, right - left)) + 1);
-  let top = point.row, bottom = point.row;
-  while (top > 0 && point.row - top < reach && withinPane(buffer[top - 1])) top--;
-  while (bottom + 1 < buffer.length && bottom - point.row < reach && withinPane(buffer[bottom + 1])) bottom++;
-  const pane = buffer.slice(top, bottom + 1).map(line => sliceTerminalPathRow(line, left, right));
-  const match = findInRows(pane, { row: point.row - top, col: point.col - left }, true);
-  return match ? { ...match, startCol: match.startCol + left, endCol: match.endCol + left } : null;
+  const match = findInRows(rows, { row: point.row - top, col: point.col - left }, pane);
+  return match && left ? { ...match, startCol: match.startCol + left, endCol: match.endCol + left } : match;
 }

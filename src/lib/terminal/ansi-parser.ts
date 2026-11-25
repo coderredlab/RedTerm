@@ -5,6 +5,7 @@ import { Unzlib } from 'fflate';
 import { decodeSixel } from './sixel-decoder';
 import { OscNotifications, type TerminalNotification } from './osc-notifications';
 import { kittyDiacriticIndex } from './kitty-placeholder';
+import { isUrlListDelimiter, paneSchemeOwner, WEB_SCHEME } from "./terminal-url-syntax";
 import {
   KITTY_KEYBOARD_STACK_LIMIT,
   KITTY_KEYBOARD_SUPPORTED_FLAGS,
@@ -89,28 +90,118 @@ const printedDirectoryUris = new WeakMap<Cell, string>();
 export function printedDirectoryUri(cell: Cell): string | null {
   return printedDirectoryUris.get(cell) ?? null;
 }
-// Snapshot rows retain their cells but not soft-wrap ancestry. A padded row
-// restored next to unrelated text cannot safely yield a boundary path.
-const unprovenSnapshotRows = new WeakMap<Cell[], Set<Cell>>();
+// A printable redraw claims the old cells of an inferred continuation before
+// replacing any of them. Identical ink alone doesn't break the link; once a
+// different cell is painted, only the surviving members are uncertain.
+interface PathAncestry { broken: boolean }
+const lostPathAncestry: PathAncestry = { broken: true };
+const rowPathAncestry = new WeakMap<Cell[], WeakMap<Cell, PathAncestry>>();
+const rowUrlAncestry = new WeakMap<Cell[], WeakMap<Cell, PathAncestry>>();
+const renderedAncestryTables = [rowPathAncestry, rowUrlAncestry] as const;
+// A run that replaces members of a cohort is a refresh of those cells.
+// Ink added in a later run to a previously blank row does not share it.
+const cellRepaintRuns = new WeakMap<Cell, WeakSet<PathAncestry>>();
+export const TERMINAL_URL_TOKEN_SEPARATOR = /[\s<>"'`]/u;
+
+// Real padding discarded by a non-reflowing resize was a token separator,
+// not evidence for joining these two rows. Track the tokens on this specific
+// edge (not the whole row) until both have been repainted.
+interface BoundaryTokens { ends: WeakSet<Cell>; starts: WeakSet<Cell> }
+interface HardPathBoundary extends BoundaryTokens { plainUrl?: BoundaryTokens }
+const hardPathEnds = new WeakMap<Cell[], HardPathBoundary>();
+const hardPathStarts = new WeakMap<Cell[], HardPathBoundary>();
 
 export function isUnprovenSnapshotRow(row: Cell[]): boolean {
-  const original = unprovenSnapshotRows.get(row);
-  // Insert/delete-character sequences move existing cells between columns.
-  // Uncertainty ends only after all pre-snapshot content has been replaced.
-  return unknownPredecessorRows.has(row) ||
-    (original ? row.some(cell => original.has(cell)) : false);
+  const ancestry = rowPathAncestry.get(row);
+  return unknownPredecessorRows.has(row) || !!ancestry && row.some(cell => ancestry.get(cell) === lostPathAncestry);
 }
-function markUnprovenSnapshotRow(row: Cell[], start = 0, end = row.length) {
-  const previous = unprovenSnapshotRows.get(row);
-  let original: Set<Cell> | null = null;
-  for (let col = 0; col < row.length; col++) {
+/** A damaged rendered edge belongs to its old token, not to neighboring words. */
+export function hasUnprovenPathCells(row: Cell[], start: number, end: number, plainUrl = false, newOwner?: Cell): boolean {
+  const ancestry = (plainUrl ? rowUrlAncestry : rowPathAncestry).get(row);
+  if (!ancestry) return false;
+  // A fresh, separately printed scheme may delimit the old token its own
+  // redraw invalidated. The old cells still cannot be used as a destination.
+  const replaced = newOwner && cellRepaintRuns.get(newOwner);
+  for (let col = start; col < end; col++) {
+    const guard = ancestry.get(row[col]);
+    if (guard?.broken && !replaced?.has(guard)) return true;
+  }
+  return false;
+}
+function alreadyRedrawn(cell: Cell, claims: PathAncestry | PathAncestry[]) {
+  const run = cellRepaintRuns.get(cell);
+  if (!run) return false;
+  if (!Array.isArray(claims)) return run.has(claims);
+  for (const claim of claims) if (run.has(claim)) return true;
+  return false;
+}
+function markUnprovenSnapshotRow(
+  row: Cell[], start = 0, end = row.length, guard = lostPathAncestry,
+  table = rowPathAncestry, refreshing?: PathAncestry | PathAncestry[],
+) {
+  let ancestry = table.get(row);
+  for (let col = start; col < end; col++) {
     const cell = row[col];
-    if ((col >= start && col < end && (cell.char.trim() || cell.char === "")) || previous?.has(cell)) {
-      (original ??= new Set()).add(cell);
+    if (!cell.char.trim() && cell.char !== "") continue;
+    if (refreshing && alreadyRedrawn(cell, refreshing)) continue;
+    if (!ancestry) table.set(row, ancestry = new WeakMap());
+    const prior = ancestry.get(cell);
+    if (prior !== lostPathAncestry && (guard.broken || !prior?.broken)) ancestry.set(cell, guard);
+  }
+}
+function copyHardPathBoundaries(source: Cell[], target: Cell[], cloneCells: boolean) {
+  const outgoing = hardPathEnds.get(source), incoming = hardPathStarts.get(source);
+  if (outgoing) hardPathEnds.set(target, outgoing);
+  if (incoming) hardPathStarts.set(target, incoming);
+  if (cloneCells && (outgoing || incoming)) {
+    for (let col = 0; col < Math.min(source.length, target.length); col++) {
+      if (outgoing?.ends.has(source[col])) outgoing.ends.add(target[col]);
+      if (incoming?.starts.has(source[col])) incoming.starts.add(target[col]);
+      if (outgoing?.plainUrl?.ends.has(source[col])) outgoing.plainUrl.ends.add(target[col]);
+      if (incoming?.plainUrl?.starts.has(source[col])) incoming.plainUrl.starts.add(target[col]);
     }
   }
-  if (original) unprovenSnapshotRows.set(row, original);
-  else unprovenSnapshotRows.delete(row);
+}
+function retainHardPathBoundary(
+  before: Cell[], after: Cell[], start: number, end: number, nextEnd: number, plainUrl = false,
+) {
+  let boundary = hardPathEnds.get(before);
+  if (!boundary || hardPathStarts.get(after) !== boundary) {
+    boundary = { ends: new WeakSet(), starts: new WeakSet() };
+    hardPathEnds.set(before, boundary);
+    hardPathStarts.set(after, boundary);
+  }
+  const tokens = plainUrl ? boundary.plainUrl ??= { ends: new WeakSet(), starts: new WeakSet() } : boundary;
+  let col = end - 1;
+  while (col >= start && before[col].char === " ") col--;
+  for (; col >= start && before[col].char !== " "; col--) tokens.ends.add(before[col]);
+  col = start;
+  while (col < nextEnd && after[col].char === " ") col++;
+  for (; col < nextEnd && after[col].char !== " "; col++) tokens.starts.add(after[col]);
+}
+function retainedHardPathBoundary(
+  before: Cell[], after: Cell[], start: number, beforeEnd: number, afterEnd: number, leading: number, plainUrl = false,
+) {
+  const boundary = hardPathEnds.get(before);
+  if (!boundary || hardPathStarts.get(after) !== boundary) return false;
+  const tokens = plainUrl ? boundary.plainUrl : boundary;
+  if (!tokens) return false;
+  let col = beforeEnd - 1;
+  while (col >= start && before[col].char === " ") col--;
+  for (; col >= start && before[col].char !== " "; col--) {
+    if (tokens.ends.has(before[col])) return true;
+  }
+  for (col = start + leading; col < afterEnd && after[col].char !== " "; col++) {
+    if (tokens.starts.has(after[col])) return true;
+  }
+  return false;
+}
+/** Two compositor spaces can still join a file/label but separate a plain URL with a smaller leading margin. */
+export function hasRetainedPlainUrlBreak(before: Cell[], after: Cell[]): boolean {
+  if (!hardPathEnds.get(before)?.plainUrl) return false;
+  let leading = 0;
+  while (leading < after.length && after[leading].char === " ") leading++;
+  return retainedHardPathBoundary(before, after, 0, before.length, after.length, leading, true);
 }
 function markUnprovenSnapshotRows(rows: Cell[][]) {
   for (const row of rows) markUnprovenSnapshotRow(row);
@@ -126,27 +217,27 @@ function transferUnprovenSnapshotRow(source: Cell[], target: Cell[]) {
     }
     if (transferred) reflowIncomingCells.set(target, transferred);
   }
-  const original = unprovenSnapshotRows.get(source);
-  if (!original) return;
-  let transferred: Set<Cell> | null = null;
+  const paths = rowPathAncestry.get(source), urls = rowUrlAncestry.get(source);
+  if (!paths && !urls) return;
   for (let col = 0; col < Math.min(source.length, target.length); col++) {
-    if (original.has(source[col])) (transferred ??= new Set()).add(target[col]);
+    const old = source[col], copy = target[col];
+    const path = paths?.get(old), url = urls?.get(old), run = cellRepaintRuns.get(old);
+    if (path) paths!.set(copy, path);
+    if (url) urls!.set(copy, url);
+    if (run) cellRepaintRuns.set(copy, run);
   }
-  if (transferred) unprovenSnapshotRows.set(target, transferred);
+  if (paths) rowPathAncestry.set(target, paths);
+  if (urls) rowUrlAncestry.set(target, urls);
 }
 function copyUnprovenSnapshotRow(source: Cell[], target: Cell[], start = 0, end = source.length) {
   if (reflowIncomingCells.has(source) && !hasCompleteReflowIncomingContent(source)) {
     markUnprovenSnapshotRow(source);
   }
-  const original = unprovenSnapshotRows.get(source);
-  if (original) {
-    let retained: Set<Cell> | null = null;
-    for (let col = start; col < end; col++) {
-      const cell = source[col];
-      if (original.has(cell)) (retained ??= new Set()).add(cell);
-    }
-    if (retained) unprovenSnapshotRows.set(target, retained);
-  }
+  const ancestry = rowPathAncestry.get(source);
+  if (ancestry) rowPathAncestry.set(target, ancestry);
+  const urlAncestry = rowUrlAncestry.get(source);
+  if (urlAncestry) rowUrlAncestry.set(target, urlAncestry);
+  copyHardPathBoundaries(source, target, false);
   if (unknownPredecessorRows.has(source)) unknownPredecessorRows.add(target);
   const outgoing = reflowOutgoingCells.get(source);
   if (outgoing) {
@@ -186,6 +277,7 @@ function pathLeadingMarginInRange(
   let leading = 0;
   while (start + leading < afterEnd && after[start + leading].char === " ") leading++;
   if (start + leading >= afterEnd || !after[start + leading].char.trim()) return -1;
+  if (retainedHardPathBoundary(before, after, start, beforeEnd, afterEnd, leading)) return -1;
   if (leading <= 1) return leading;
   let indentation = 0;
   while (start + indentation < beforeEnd && before[start + indentation].char === " ") indentation++;
@@ -213,12 +305,18 @@ function visiblePathDivider(cell: Cell | undefined): boolean {
     !cell.style.hidden && !cell.hyperlink;
 }
 
+const heightClippedDividers = new WeakSet<Cell>();
 /** Use the same three-row pane boundary for matching and partial mutation guards. */
 export function isTerminalPathDividerColumn(buffer: Cell[][], row: number, col: number): boolean {
-  if (buffer.length < 3) return false;
-  const top = Math.max(0, Math.min(row - 1, buffer.length - 3));
-  return visiblePathDivider(buffer[top]?.[col]) && visiblePathDivider(buffer[top + 1]?.[col]) &&
-    visiblePathDivider(buffer[top + 2]?.[col]);
+  const cell = buffer[row]?.[col];
+  if (!cell || !visiblePathDivider(cell)) return false;
+  // In a one/two-row viewport, shrinking may have removed the three-row
+  // witness while retaining this exact, still-unrepainted divider.
+  if (buffer.length < 3) return heightClippedDividers.has(cell);
+  const above = visiblePathDivider(buffer[row - 1]?.[col]);
+  const below = visiblePathDivider(buffer[row + 1]?.[col]);
+  return (above && (below || visiblePathDivider(buffer[row - 2]?.[col]))) ||
+    (below && visiblePathDivider(buffer[row + 2]?.[col]));
 }
 
 function mightSpanBoundary(before: Cell[] | undefined, after: Cell[] | undefined): boolean {
@@ -256,6 +354,357 @@ function markChangedPathRange(
   markUnprovenSnapshotRow(before, start, beforeEnd);
   markUnprovenSnapshotRow(after, start, afterEnd);
 }
+
+interface PathInk { y: number; start: number; end: number; left: number; right: number }
+interface PathEdge { before: PathInk[]; after: PathInk[] }
+const lostEdgeInk: PathAncestry = { broken: true };
+const PATH_EDGE_BUDGET = 4096;
+
+function literalPathSpace(cell: Cell) {
+  return cell.char === " " && !cell.style.hidden && !cell.hyperlink;
+}
+function edgeTokenSeparator(cell: Cell, plainUrl: boolean) {
+  return !cell.style.hidden && !cell.hyperlink &&
+    (plainUrl ? TERMINAL_URL_TOKEN_SEPARATOR.test(cell.char) : cell.char === " ");
+}
+
+// Only the last token above and the first token below can cross an edge.
+// At a split or merge the old wall may now contain real ink: project both
+// rows' walls, but finish each affected token in its own actual pane.
+function appendEdgeInk(
+  result: PathInk[], rows: Cell[][], y: number, left: number, right: number,
+  start: number, end: number, incoming: boolean, maxTrailing: number, plainUrl: boolean,
+) {
+  const row = rows[y];
+  let at = incoming ? start : end - 1;
+  if (incoming) {
+    while (at < end && literalPathSpace(row[at])) at++;
+  } else {
+    while (at >= start && literalPathSpace(row[at])) at--;
+    if (end - at - 1 > maxTrailing) return;
+  }
+  if (at < start || at >= end || edgeTokenSeparator(row[at], plainUrl)) return;
+  const last = result.at(-1);
+  if (last && at >= last.start && at < last.end) return;
+  let from = at, to = at + 1;
+  while (from > left && !edgeTokenSeparator(row[from - 1], plainUrl)) from--;
+  while (to < right && !edgeTokenSeparator(row[to], plainUrl)) to++;
+  result.push({ y, start: from, end: to, left, right });
+}
+
+function nextPathWall(rows: Cell[][], y: number, col: number, limit: number) {
+  while (col < limit && !isTerminalPathDividerColumn(rows, y, col)) col++;
+  return col;
+}
+
+// Box glyphs with a stroke through both sides, or an inward stroke at an endpoint.
+const HORIZONTAL = /^[─━┄┅┈┉╌╍═┬-╋╤-╬]$/u;
+const RULE_JUNCTION = /^[┬-╋╤-╬]$/u;
+const RULE_START = /^[┌-┏└-┗├-┣╒-╔╘-╚╞-╠╭╰]$/u;
+const RULE_END = /^[┐-┓┘-┛┤-┫╕-╗╛-╝╡-╣╮╯]$/u;
+
+/** Undefined means ordinary content; a concealed/linked rule is not a trusted terminator. */
+export function terminalPaneHorizontalRule(buffer: Cell[][], y: number, left: number, right: number): boolean | undefined {
+  const row = buffer[y];
+  if (right <= left || right > row.length || right - left > PATH_EDGE_BUDGET) return undefined;
+  let visible = true;
+  for (let col = left; col < right; col++) {
+    const cell = row[col];
+    if (!HORIZONTAL.test(cell.char) && !(col === left && RULE_START.test(cell.char)) &&
+      !(col === right - 1 && RULE_END.test(cell.char))) return undefined;
+    if (cell.style.hidden || cell.hyperlink) visible = false;
+  }
+  // The visible rule has to reach real endpoints on both sides, not be a
+  // segment of a wider text row clipped to the current pane.
+  let checked = right - left;
+  for (let step = -1; step <= 1; step += 2) {
+    const cap = step < 0 ? RULE_START : RULE_END;
+    const inside = step < 0 ? left : right - 1;
+    if (cap.test(row[inside].char)) continue;
+    for (let x = inside + step; x >= 0 && x < row.length; x += step) {
+      if (++checked > PATH_EDGE_BUDGET + 2) return undefined;
+      const cell = row[x];
+      if (cell.style.hidden || cell.hyperlink) visible = false;
+      if (cap.test(cell.char) || RULE_JUNCTION.test(cell.char) || isTerminalPathDividerColumn(buffer, y, x)) break;
+      if (!HORIZONTAL.test(cell.char)) return undefined;
+    }
+  }
+  return visible;
+}
+
+// Do not manufacture shared ancestry for two independently displayed URLs.
+// A partial row that could itself be nested is not a known outer prefix.
+function separatePlainWebEdge(rows: Cell[][], y: number, left: number, right: number, end: number, leading: number) {
+  const before = rows[y], after = rows[y + 1], head = left + leading;
+  if (right - end + leading === 0 || head >= right || !/^[hH]$/.test(after[head].char)) return false;
+  let scheme = "";
+  for (let x = head; x < right && x < head + 8; x++) {
+    const cell = after[x];
+    if (cell.style.hidden || cell.hyperlink) return false;
+    scheme += cell.char;
+    if (WEB_SCHEME.test(scheme)) break;
+  }
+  if (!WEB_SCHEME.test(scheme) || end <= left || isUnprovenSnapshotRow(after) ||
+    hasUnprovenPathCells(after, head, head + scheme.length, true) || isUnprovenSnapshotRow(before)) return false;
+  const last = before[end - 1];
+  if (last.style.hidden || last.hyperlink) return false;
+  if (isUrlListDelimiter(last.char)) return !hasUnprovenPathCells(before, end - 1, end, true);
+  let start = end;
+  while (start > left && !edgeTokenSeparator(before[start - 1], true)) start--;
+  if (start === end || !/^[hH]$/.test(before[start].char) || hasUnprovenPathCells(before, start, end, true)) return false;
+  let inkBefore = start;
+  while (inkBefore > left && literalPathSpace(before[inkBefore - 1])) inkBefore--;
+  if (inkBefore === left && y > 0 && mightSpanPathRange(rows[y - 1], before, left,
+    Math.min(right, rows[y - 1].length), right, true) && terminalPaneHorizontalRule(rows, y - 1, left, right) !== true) return false;
+  let prefix = "";
+  for (let x = start; x < end; x++) {
+    const cell = before[x];
+    if (cell.style.hidden || cell.hyperlink) return false;
+    prefix += cell.char;
+  }
+  return WEB_SCHEME.test(prefix) && paneSchemeOwner(prefix, "") === "separate";
+}
+
+function pathEdge(rows: Cell[][], y: number, left: number, right: number, plainUrl: boolean): PathEdge | null {
+  if (right <= left) return null;
+  const before = rows[y], after = rows[y + 1];
+  let beforeLeft = left, afterLeft = left;
+  let beforeRight = nextPathWall(rows, y, left, right), afterRight = nextPathWall(rows, y + 1, left, right);
+  const split = beforeRight < right || afterRight < right;
+  if (!split) {
+    const bounded = left > 0 || right < before.length || right < after.length;
+    if (!mightSpanPathRange(before, after, left, right, right, bounded)) return null;
+    if (plainUrl) {
+      let leading = 0;
+      while (left + leading < right && literalPathSpace(after[left + leading])) leading++;
+      if (retainedHardPathBoundary(before, after, left, right, right, leading, true)) return null;
+      if (bounded && after[left + leading].char !== " ") {
+        let end = right;
+        while (end > left && literalPathSpace(before[end - 1])) end--;
+        if (right - end > Math.max(1, leading)) return null;
+        if (separatePlainWebEdge(rows, y, left, right, end, leading)) return null;
+      }
+    }
+  }
+  const tails: PathInk[] = [], heads: PathInk[] = [];
+  let beforeStart = left, afterStart = left;
+  for (;;) {
+    const cut = Math.min(beforeRight, afterRight);
+    const beforeWall = cut === beforeRight, afterWall = cut === afterRight;
+    appendEdgeInk(tails, rows, y, beforeLeft, beforeRight, beforeStart, cut + (beforeWall ? 0 : 1), false,
+      split ? 2 : right - left, plainUrl);
+    appendEdgeInk(heads, rows, y + 1, afterLeft, afterRight, afterStart, cut + (afterWall ? 0 : 1), true, 0, plainUrl);
+    if (cut === right) break;
+    if (beforeWall) { beforeLeft = cut + 1; beforeRight = nextPathWall(rows, y, beforeLeft, right); }
+    if (afterWall) { afterLeft = cut + 1; afterRight = nextPathWall(rows, y + 1, afterLeft, right); }
+    beforeStart = cut + (beforeWall ? 1 : 0);
+    afterStart = cut + (afterWall ? 1 : 0);
+  }
+  return tails.length && heads.length ? { before: tails, after: heads } : null;
+}
+
+function adjacentPathEdge(
+  rows: Cell[][], origin: number, step: number, left: number, right: number, budget: { left: number },
+  plainUrl: boolean,
+): PathEdge | null {
+  const neighbor = origin + step, y = Math.min(origin, neighbor);
+  const before = rows[y], after = rows[y + 1];
+  if (!before || !after || budget.left <= 0) return null;
+  // Exact soft wraps already have their own source/suffix cell provenance.
+  if (reflowSuccessors.get(before) === after &&
+    (isReflowContinuation(before, after) || hasReflowOutgoingContent(before) || hasReflowIncomingContent(after))) return null;
+  const limit = Math.min(before.length, after.length);
+  right = Math.min(right, limit);
+  if (left >= right || right - left > budget.left) { budget.left = 0; return null; }
+  while (left > 0 && !isTerminalPathDividerColumn(rows, neighbor, left - 1)) {
+    if (right - left >= budget.left) { budget.left = 0; return null; }
+    left--;
+  }
+  while (right < limit && !isTerminalPathDividerColumn(rows, neighbor, right)) {
+    if (right - left >= budget.left) { budget.left = 0; return null; }
+    right++;
+  }
+  budget.left -= right - left;
+  return pathEdge(rows, y, left, right, plainUrl);
+}
+
+function extendEdgeInk(
+  rows: Cell[][], ink: PathInk[], index: number, step: 1 | -1, stop: number, budget: { left: number }, plainUrl: boolean,
+) {
+  let previousY = -1, previousLeft = 0, previousRight = 0;
+  for (; index < ink.length && budget.left > 0; index++) {
+    const token = ink[index];
+    if (token.y + step === stop || (token.y === previousY && token.left === previousLeft && token.right === previousRight)) continue;
+    const edge = adjacentPathEdge(rows, token.y, step, token.left, token.right, budget, plainUrl);
+    if (!edge) continue;
+    const local = step > 0 ? edge.before : edge.after;
+    if (!local.some(other => token.start < other.end && other.start < token.end)) continue;
+    previousY = token.y; previousLeft = token.left; previousRight = token.right;
+    for (const other of step > 0 ? edge.after : edge.before) ink.push(other);
+  }
+}
+
+// Read both rows' original walls before the alternate viewport drops either.
+// A changed wall joins the two layouts only up to their next shared wall.
+function markLostAlternateEdge(rows: Cell[][], retained: number, step: 1 | -1, stop: number) {
+  const y = step > 0 ? retained - 1 : retained, limit = Math.min(rows[y].length, rows[y + 1].length);
+  let left = 0;
+  for (let right = 0; right <= limit; right++) {
+    if (right < limit && !(isTerminalPathDividerColumn(rows, y, right) && isTerminalPathDividerColumn(rows, y + 1, right))) continue;
+    for (const table of renderedAncestryTables) {
+      const plainUrl = table === rowUrlAncestry;
+      const edge = pathEdge(rows, y, left, right, plainUrl);
+      if (!edge) continue;
+      const ink = step > 0 ? edge.after : edge.before;
+      const lost = step > 0 ? edge.before : edge.after;
+      let kept = 0, i = 0;
+      for (const token of ink) {
+        while (i < lost.length && lost[i].right <= token.left) i++;
+        if (i < lost.length && lost[i].left < token.right) ink[kept++] = token;
+      }
+      ink.length = kept;
+      extendEdgeInk(rows, ink, 0, step, stop, { left: PATH_EDGE_BUDGET }, plainUrl);
+      for (const token of ink) markUnprovenSnapshotRow(rows[token.y], token.start, token.end, lostEdgeInk, table);
+    }
+    left = right + 1;
+  }
+}
+
+// Claim an old token once, even if the redraw starts with identical ink.
+// Return the next potentially affected token in this run, not the next cell.
+function guardPrintedPathPane(
+  rows: Cell[][], y: number, start: number, end: number, changed: boolean, runStart: number, col: number,
+  table: typeof rowPathAncestry, refreshing?: PathAncestry,
+) {
+  if (end <= start || end - start > PATH_EDGE_BUDGET) return end;
+  const plainUrl = table === rowUrlAncestry;
+  const wall = col < start || col >= end;
+  let ink: PathInk[] | undefined, next = end;
+  for (let step = -1; step <= 1; step += 2) {
+    const budget = { left: PATH_EDGE_BUDGET };
+    const edge = adjacentPathEdge(rows, y, step, start, end, budget, plainUrl);
+    if (!edge) continue;
+    const local = step > 0 ? edge.before : edge.after;
+    let hit = false;
+    for (const token of local) {
+      if (token.start >= end || token.end <= start) continue;
+      if (!wall && token.start > col) { next = Math.min(next, token.start); continue; }
+      if (!wall && token.end <= col) continue;
+      (ink ??= []).push(token);
+      hit = true;
+    }
+    if (!hit || !ink) continue;
+    const index = ink.length;
+    for (const token of step > 0 ? edge.after : edge.before) ink.push(token);
+    extendEdgeInk(rows, ink, index, step > 0 ? 1 : -1, step > 0 ? rows.length : -1, budget, plainUrl);
+  }
+  if (!ink) return next;
+  let claimed: PathAncestry | undefined;
+  let joinedClaims: PathAncestry[] | undefined;
+  for (const token of ink) {
+    const row = rows[token.y], ancestry = table.get(row);
+    const legacy = plainUrl ? rowPathAncestry.get(row) : undefined;
+    if (!ancestry && !legacy) continue;
+    for (let x = token.start; x < token.end; x++) {
+      const cell = row[x];
+      const prior = ancestry?.get(cell) ?? (legacy?.get(cell) === lostPathAncestry ? lostPathAncestry : undefined);
+      if (!prior) continue;
+      if (changed && !prior.broken) {
+        if (!refreshing) refreshing = prior;
+        else if (refreshing !== prior) (joinedClaims ??= [refreshing]).push(prior);
+        prior.broken = true;
+      }
+      claimed ??= prior;
+    }
+  }
+  const guard = refreshing ?? (claimed === lostPathAncestry ? lostEdgeInk : claimed ?? { broken: changed });
+  const redraw = joinedClaims ?? refreshing;
+  for (const token of ink) {
+    if (token.y !== y) {
+      // Neither end of a previously joined token is a standalone link just
+      // because the other end changed. A fresh predecessor ending well
+      // inside its own pane cannot depend on the projected edge, however.
+      const endsInside = token.y < y && token.end + 2 < token.right && literalPathSpace(rows[token.y][token.end]);
+      const lostEdge = changed && !endsInside;
+      if (!claimed || refreshing || lostEdge) markUnprovenSnapshotRow(rows[token.y], token.start, token.end, guard, table,
+        lostEdge ? undefined : redraw);
+    } else {
+      if (!claimed || refreshing) markUnprovenSnapshotRow(rows[y], token.start, Math.min(token.end, runStart), guard, table, redraw);
+      markUnprovenSnapshotRow(rows[y], Math.max(token.start, col), token.end, guard, table, redraw);
+    }
+  }
+  return next;
+}
+
+// A non-reflowing resize drops columns instead of wrapping them. Only the
+// pane intersecting the cut can lose text; a divider or a whole pane to its
+// right is not part of its target. Check joins at both widths before copying
+// cells so neither a surviving prefix nor a detached suffix becomes a link.
+function markClippedPathRows(rows: Cell[][], firstClipped: number, cols: number) {
+  const paneStart = (y: number) => {
+    let col = Math.min(cols, rows[y].length);
+    while (col > 0 && !isTerminalPathDividerColumn(rows, y, col - 1)) col--;
+    return col;
+  };
+  const paneEnd = (y: number) => {
+    let col = Math.min(cols, rows[y].length);
+    while (col < rows[y].length && !isTerminalPathDividerColumn(rows, y, col)) col++;
+    return col;
+  };
+  const joins = (y: number, start: number) => {
+    const before = rows[y], after = rows[y + 1];
+    const end = paneEnd(y), nextEnd = paneEnd(y + 1);
+    const bounded = start > 0 || end < before.length || nextEnd < after.length;
+    const keptEnd = y < firstClipped ? end : Math.min(cols, end);
+    const keptNextEnd = y + 1 < firstClipped ? nextEnd : Math.min(cols, nextEnd);
+    return isReflowContinuation(before, after) ||
+      mightSpanPathRange(before, after, start, end, nextEnd, bounded) ||
+      ((keptEnd !== end || keptNextEnd !== nextEnd) &&
+        mightSpanPathRange(before, after, start, keptEnd, keptNextEnd, bounded));
+  };
+  for (let y = firstClipped; y < rows.length; y++) {
+    const end = paneEnd(y);
+    let x = cols;
+    while (x < end && rows[y][x].char === " " && !rows[y][x].hyperlink && !rows[y][x].style.hidden) x++;
+    const start = paneStart(y);
+    if (x >= end) {
+      const after = rows[y + 1];
+      if (!after || cols >= end || start >= cols || paneStart(y + 1) !== start ||
+        isReflowContinuation(rows[y], after)) continue;
+      const nextEnd = paneEnd(y + 1);
+      const bounded = start > 0 || end < rows[y].length || nextEnd < after.length;
+      const keptNextEnd = Math.min(cols, nextEnd);
+      if (mightSpanPathRange(rows[y], after, start, cols, keptNextEnd, bounded)) {
+        if (!mightSpanPathRange(rows[y], after, start, end, nextEnd, bounded)) {
+          retainHardPathBoundary(rows[y], after, start, cols, keptNextEnd);
+        } else if (bounded) {
+          const leading = pathLeadingMarginInRange(rows[y], after, start, end, nextEnd);
+          let inkEnd = end;
+          while (inkEnd > start && rows[y][inkEnd - 1].char === " " &&
+            !rows[y][inkEnd - 1].style.hidden && !rows[y][inkEnd - 1].hyperlink) inkEnd--;
+          if (end - inkEnd > Math.max(1, leading) && cols - inkEnd <= Math.max(1, leading)) {
+            retainHardPathBoundary(rows[y], after, start, cols, keptNextEnd, true);
+          }
+        }
+      }
+      continue;
+    }
+    if (start === cols) continue;
+    let first = y, last = y;
+    // Scrollback keeps its original width. Beyond the matcher's 4096-cell
+    // search window a click there cannot observe the cropped boundary.
+    let historyCells = 0;
+    while (first > 0 && historyCells < 4096 && paneStart(first - 1) === start && joins(first - 1, start)) {
+      if (--first < firstClipped) historyCells += paneEnd(first) - start;
+    }
+    while (last + 1 < rows.length && paneStart(last + 1) === start && joins(last, start)) last++;
+    for (let line = first; line <= last; line++) {
+      markUnprovenSnapshotRow(rows[line], start, line < firstClipped ? paneEnd(line) : cols);
+    }
+    y = last;
+  }
+}
+
 function markReflowTail(row: Cell[]) {
   reflowTails.set(row, row.slice());
 }
@@ -320,8 +769,18 @@ export function hasCompleteReflowIncomingContent(row: Cell[]): boolean {
 }
 
 function replaceRepaintedCell(row: Cell[], col: number, oldCell: Cell, updated: Cell) {
-  const unproven = unprovenSnapshotRows.get(row);
-  if (unproven?.delete(oldCell)) unproven.add(updated);
+  if (heightClippedDividers.has(oldCell)) heightClippedDividers.add(updated);
+  const ancestry = rowPathAncestry.get(row);
+  const guard = ancestry?.get(oldCell);
+  if (guard) ancestry!.set(updated, guard);
+  const urls = rowUrlAncestry.get(row), url = urls?.get(oldCell), run = cellRepaintRuns.get(oldCell);
+  if (url) urls!.set(updated, url);
+  if (run) cellRepaintRuns.set(updated, run);
+  const hardEnd = hardPathEnds.get(row), hardStart = hardPathStarts.get(row);
+  if (hardEnd?.ends.has(oldCell)) hardEnd.ends.add(updated);
+  if (hardStart?.starts.has(oldCell)) hardStart.starts.add(updated);
+  if (hardEnd?.plainUrl?.ends.has(oldCell)) hardEnd.plainUrl.ends.add(updated);
+  if (hardStart?.plainUrl?.starts.has(oldCell)) hardStart.plainUrl.starts.add(updated);
   const outgoing = reflowOutgoingCells.get(row);
   if (outgoing?.delete(oldCell)) outgoing.add(updated);
   const incoming = reflowIncomingCells.get(row);
@@ -740,6 +1199,14 @@ const DEFAULT_OSC_COLORS: TerminalOscColors = {
 
 export class AnsiParser {
   private buffer: Cell[][];
+  private inspectedPrintRow: Cell[] | null = null;
+  private printRunStart = 0;
+  private inspectedPrintNext = 0;
+  private inspectedPathEnd = 0;
+  private inspectedUrlEnd = 0;
+  private changedPathEnd = 0;
+  private changedUrlEnd = 0;
+  private repaintRun: WeakSet<PathAncestry> | null = null;
   private scrollback: Cell[][] = [];
   private fullBufferCache: Cell[][] = [];
   private fullBufferDirty = true;
@@ -1189,14 +1656,23 @@ export class AnsiParser {
     // Fit the reflowed screen into the viewport while keeping provenance in
     // lockstep. Rows above the cursor enter scrollback; rows below it drop.
     if (finalRows.length > rows) {
-      const droppedBottom = finalRows.length > finalCursorY + 1;
-      if (droppedBottom && finalRows[finalCursorY + 1]?.some(cell => cell.char.trim() || cell.char === "")) {
-        markUnprovenSnapshotRow(finalRows[finalCursorY]);
-      }
       const keptCount = Math.min(finalRows.length, finalCursorY + 1);
+      const overflowCount = Math.max(0, keptCount - rows);
+      if (this.usingAlternateScreen) {
+        if (overflowCount > 0) markLostAlternateEdge(finalRows, overflowCount, 1, keptCount);
+        if (keptCount < finalRows.length) markLostAlternateEdge(finalRows, keptCount - 1, -1, overflowCount - 1);
+        if (rows < 3) {
+          for (let y = overflowCount; y < keptCount; y++) {
+            for (let x = 0; x < finalRows[y].length; x++) {
+              if (isTerminalPathDividerColumn(finalRows, y, x)) heightClippedDividers.add(finalRows[y][x]);
+            }
+          }
+        }
+      } else if (finalRows[keptCount]?.some(cell => cell.char.trim() || cell.char === "")) {
+        markUnprovenSnapshotRow(finalRows[keptCount - 1]);
+      }
       finalRows = finalRows.slice(0, keptCount);
       finalOrigins = finalOrigins.slice(0, keptCount);
-      const overflowCount = Math.max(0, finalRows.length - rows);
       if (overflowCount > 0) {
         if (!this.usingAlternateScreen) {
           const combined = nextScrollback.concat(finalRows.slice(0, overflowCount));
@@ -1219,6 +1695,11 @@ export class AnsiParser {
         finalRows.push([]);
         finalOrigins.push(null);
       }
+    }
+
+    if (!canReflowMainScreen && cols < oldCols) {
+      const retained = nextScrollback.length ? nextScrollback.concat(finalRows) : finalRows;
+      markClippedPathRows(retained, nextScrollback.length, cols);
     }
 
     if (oldScrollback.length && nextScrollback.length && oldScrollback[0] !== nextScrollback[0]) {
@@ -1335,6 +1816,7 @@ export class AnsiParser {
     let offset = 0;
     while (offset < data.length) {
       if (data.charCodeAt(offset) < 0x20) {
+        this.inspectedPrintRow = null;
         this.processChar(data[offset]);
         offset++;
         continue;
@@ -4418,7 +4900,9 @@ export class AnsiParser {
     const originalRows = this.scrollback.concat(this.buffer);
     const savedRows = this.mainScreenScrollback.concat(this.mainScreenBuffer);
     for (let index = 0; index < originalRows.length; index++) {
-      if (isUnprovenSnapshotRow(originalRows[index])) {
+      copyHardPathBoundaries(originalRows[index], savedRows[index], true);
+      if (rowPathAncestry.has(originalRows[index]) || rowUrlAncestry.has(originalRows[index]) ||
+        unknownPredecessorRows.has(originalRows[index])) {
         transferUnprovenSnapshotRow(originalRows[index], savedRows[index]);
       }
       if (isReflowTail(originalRows[index]) ||
@@ -4483,9 +4967,10 @@ export class AnsiParser {
     for (let index = 0; index < visibleRows.length; index++) {
       const saved = savedRows[index + restoredMainScreen.removedTopRows];
       if (!saved) continue;
+      copyHardPathBoundaries(saved, visibleRows[index], true);
       if (saved.length !== visibleRows[index].length) {
         markUnprovenSnapshotRow(visibleRows[index]);
-      } else if (isUnprovenSnapshotRow(saved)) {
+      } else if (rowPathAncestry.has(saved) || rowUrlAncestry.has(saved) || unknownPredecessorRows.has(saved)) {
         transferUnprovenSnapshotRow(saved, visibleRows[index]);
       }
     }
@@ -4532,6 +5017,65 @@ export class AnsiParser {
     this.usingAlternateScreen = false;
     this.markFullBufferDirty();
     this.markAllRowsDirty();
+  }
+
+  private guardPrintableReplacement(row: Cell[], col: number, replacement: Cell) {
+    const old = row[col];
+    if (this.inspectedPrintRow !== row || this.inspectedPrintNext !== col) {
+      this.inspectedPrintRow = row;
+      this.printRunStart = this.inspectedPathEnd = this.inspectedUrlEnd = col;
+      this.changedPathEnd = this.changedUrlEnd = col;
+      this.repaintRun = null;
+    }
+    this.inspectedPrintNext = col + 1;
+    // Initial frame painting and ordinary append-only output have no old ink.
+    if (!literalPathSpace(old)) {
+      const changed = old.char !== replacement.char || old.style.hidden !== replacement.style.hidden ||
+        old.style.underline !== replacement.style.underline || old.hyperlink?.uri !== replacement.hyperlink?.uri ||
+        old.hyperlink?.id !== replacement.hyperlink?.id;
+      const path = rowPathAncestry.get(row)?.get(old);
+      const url = rowUrlAncestry.get(row)?.get(old) ?? (path === lostPathAncestry ? path : undefined);
+      // A new run can erase an already-broken owner after its successor has
+      // been repainted. Reinspect that edge once; a broken flag is not proof
+      // that the current neighbours were members of the old claim.
+      const inspectPath = col >= this.inspectedPathEnd || (changed && col >= this.changedPathEnd);
+      const inspectUrl = col >= this.inspectedUrlEnd || (changed && col >= this.changedUrlEnd);
+      if (inspectPath || inspectUrl) {
+        const rows = this.scrollback.length ? this.getFullBuffer() : this.buffer;
+        const y = this.scrollback.length + this.cursorY;
+        const wall = isTerminalPathDividerColumn(rows, y, col);
+        if (!wall || changed) {
+          let start = col, end = col + 1;
+          while (start > 0 && col - start <= PATH_EDGE_BUDGET && !isTerminalPathDividerColumn(rows, y, start - 1)) start--;
+          while (end < row.length && end - col <= PATH_EDGE_BUDGET && !isTerminalPathDividerColumn(rows, y, end)) end++;
+          for (const table of renderedAncestryTables) {
+            const plainUrl = table === rowUrlAncestry;
+            if (!(plainUrl ? inspectUrl : inspectPath)) continue;
+            const refreshing = plainUrl ? url : path;
+            if (wall) guardPrintedPathPane(rows, y, start, col, changed, this.printRunStart, col, table, refreshing);
+            const next = guardPrintedPathPane(rows, y, wall ? col + 1 : start, end, changed, this.printRunStart, col, table, refreshing);
+            if (plainUrl) {
+              this.inspectedUrlEnd = next;
+              if (changed) this.changedUrlEnd = next;
+            } else {
+              this.inspectedPathEnd = next;
+              if (changed) this.changedPathEnd = next;
+            }
+            if (refreshing && changed) refreshing.broken = true;
+          }
+        }
+      }
+      const fileGuard = path ?? rowPathAncestry.get(row)?.get(old);
+      const urlGuard = url ?? rowUrlAncestry.get(row)?.get(old);
+      if (fileGuard || urlGuard) {
+        // A run of identical ink is still the old target. Give the run a
+        // recovery exemption only if this run actually refreshes a broken edge.
+        const run = this.repaintRun ??= new WeakSet();
+        if (fileGuard?.broken) run.add(fileGuard);
+        if (urlGuard?.broken) run.add(urlGuard);
+      }
+    }
+    if (this.repaintRun && replacement !== this.emptyCell) cellRepaintRuns.set(replacement, this.repaintRun);
   }
 
   private preservePathRowBoundaries(rowIndex: number, from = 0, to = this.cols) {
@@ -5416,6 +5960,11 @@ export class AnsiParser {
     if (this.buffer[this.cursorY][this.cursorX].imagePlaceholder) {
       this.kittyVirtualOriginsDirty = true;
     }
+    const row = this.buffer[this.cursorY];
+    const wideTail = isWide && this.cursorX + 1 < this.cols
+      ? { char: '', hyperlink: cell.hyperlink, style } : undefined;
+    this.guardPrintableReplacement(row, this.cursorX, cell);
+    if (wideTail) this.guardPrintableReplacement(row, this.cursorX + 1, wideTail);
     this.buffer[this.cursorY][this.cursorX] = cell;
     if (this.oscCurrentDirectoryUri && cell !== this.emptyCell) {
       printedDirectoryUris.set(cell, this.oscCurrentDirectoryUri);
@@ -5442,15 +5991,11 @@ export class AnsiParser {
     this.lastPrintedChar = char;
     this.cursorX++;
 
-    if (isWide && this.cursorX < this.cols) {
+    if (wideTail) {
       if (this.buffer[this.cursorY][this.cursorX].imagePlaceholder) {
         this.kittyVirtualOriginsDirty = true;
       }
-      this.buffer[this.cursorY][this.cursorX] = {
-        char: '',
-        hyperlink: this.activeHyperlink ?? undefined,
-        style: this.getInternedStyle(this.style),
-      };
+      this.buffer[this.cursorY][this.cursorX] = wideTail;
       this.cursorX++;
     }
   }

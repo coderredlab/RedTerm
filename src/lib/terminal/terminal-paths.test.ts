@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { expect, test } from "bun:test";
-import { AnsiParser, DEFAULT_STYLE } from "./ansi-parser";
+import { AnsiParser, DEFAULT_STYLE, isTerminalPathDividerColumn } from "./ansi-parser";
+import { findUrlAtCell } from "./terminal-links";
 import { findPathAtCell, resolveTerminalPath } from "./terminal-paths";
 
 const row = (text: string) => [[...text].map(char => ({ char, style: DEFAULT_STYLE }))];
@@ -336,6 +337,161 @@ test("narrowing inside a TUI cannot reveal a truncated saved shell path", () => 
   parser.resize(10, 3);
   parser.write("\x1b[?1049l");
   expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 3 })).toBeNull();
+});
+
+test("non-reflowing narrowing rejects old- and new-width path fragments until their pane is redrawn", () => {
+  const sidebar = "/aside".padEnd(10) + "│";
+  const oldWidth = 22, keptWidth = 13;
+  for (const mode of ["\x1b[?1049h", "\x1b[2;5r"]) {
+    for (const first of [
+      "/tmp/old".padEnd(17) + "abcde", // Only the old edge can join abcde/tail.
+      "/tmp/abcdefghij", // Clipping creates a new edge next to /tail.
+    ]) {
+      const lines = [first, "/tail", "", "/live", ""];
+      const parser = new AnsiParser(sidebar.length + oldWidth + 1, lines.length);
+      parser.write(`\x1b[?7l${mode}`);
+      lines.forEach((line, y) =>
+        parser.write(`\x1b[${y + 1};1H${sidebar}${line.padEnd(oldWidth)}▕`));
+      parser.resize(sidebar.length + keptWidth, lines.length);
+      const hit = (y: number) => findPathAtCell(parser.getBuffer(), { row: y, col: sidebar.length + 2 });
+      expect(hit(0)).toBeNull();
+      expect(hit(1)).toBeNull();
+      expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 2 })?.path).toBe("/aside");
+      expect(hit(3)?.path).toBe("/live");
+
+      parser.write(`\x1b[1;${sidebar.length + 1}H${"/fresh".padEnd(keptWidth)}`);
+      expect(hit(1)).toBeNull();
+      parser.write(`\x1b[2;${sidebar.length + 1}H${"/new".padEnd(keptWidth)}`);
+      expect(hit(0)?.path).toBe("/fresh");
+      expect(hit(1)?.path).toBe("/new");
+    }
+  }
+});
+
+test("both ends of a three-row pane divider stay bounded at a frame junction", () => {
+  for (const junction of ["├", "\x1b[8m│\x1b[0m", "\x1b]8;;/divider\x1b\\│\x1b]8;;\x1b\\"]) {
+    const parser = new AnsiParser(8, 7);
+    parser.write([junction, "│", "│", "│", junction, "│", "│"].join("\r\n"));
+    const buffer = parser.getBuffer();
+    expect(buffer.map((_, y) => isTerminalPathDividerColumn(buffer, y, 0)))
+      .toEqual([false, true, true, true, false, false, false]);
+  }
+});
+
+test("a pane split cannot supply a query field or sidebar text to the row above", () => {
+  const prefix = "https://origin.test/auth?scope=";
+  const side = "https://other.test/report";
+  const split = "&client_id=x│SIDEBAR";
+  const lines = ["", prefix, split, split, split].map((text, index) =>
+    row(`│${text.padEnd(prefix.length)}▕${(index === 2 ? side : "").padEnd(32)}│`)[0]);
+  expect(findUrlAtCell(lines, { row: 1, col: 8 })).toBeNull();
+  const sideCol = prefix.length + 2;
+  expect(findUrlAtCell(lines, { row: 2, col: sideCol + 8 })).toEqual({
+    url: side, startCol: sideCol, endCol: sideCol + side.length - 1,
+  });
+});
+
+test("a merged row cannot expose a prior pane's nested URL, even if a sidebar precedes it", () => {
+  const outer = "https://origin.test/r?to=";
+  const inner = "https://inner.test/doc";
+  const width = outer.length + 1 + inner.length + 6;
+  const sidebar = "sidebar".padEnd(outer.length);
+  for (const merged of [inner, `scope=${inner}`, sidebar + inner, `${sidebar}  ${inner}`]) {
+    const lines = ["", "", outer].map(text => `${text.padEnd(outer.length)}│`);
+    const buffer = [...lines, merged, "", ""].map(text => row(`│${text.padEnd(width)}▕`)[0]);
+    expect(findUrlAtCell(buffer, { row: 3, col: 1 + merged.indexOf(inner) + 8 })).toBeNull();
+  }
+});
+
+test("a complete quoted filename and visibly separate plain URL survive an incoming merge", () => {
+  const left = "https://origin.test/r?to=", path = "/tmp/a", url = "https://two.test/doc";
+  const before = ["", "", left].map(text => text.padEnd(left.length) + "│");
+  const merged = (text: string) => [...before, text, "", ""].map(line => row(`│${line.padEnd(50)}▕`)[0]);
+  const quoted = merged(`"${path}"`);
+  expect(findPathAtCell(quoted, { row: 3, col: 4 })?.path).toBe(path);
+  quoted[3][1].style = { ...DEFAULT_STYLE, hidden: true };
+  expect(findPathAtCell(quoted, { row: 3, col: 4 })).toBeNull();
+
+  const links = merged("A  " + url);
+  links[3][1].hyperlink = { uri: "https://explicit.test/" };
+  expect(findUrlAtCell(links, { row: 3, col: 1 })?.url).toBe("https://explicit.test/");
+  expect(findUrlAtCell(links, { row: 3, col: 10 })?.url).toBe(url);
+});
+
+test("a visible closing parenthesis proves the file target at an outgoing split", () => {
+  const path = "/tmp/a", label = "Open", last = `${label} (${path})`;
+  const split = "/tail│side".padEnd(last.length);
+  const buffer = ["", "", last, split, split, split].map(line => row(`│${line.padEnd(last.length)}▕`)[0]);
+  for (const cell of buffer[2].slice(1, 1 + label.length)) cell.style = { ...DEFAULT_STYLE, underline: true };
+  for (const col of [2, 8]) expect(findPathAtCell(buffer, { row: 2, col })?.path).toBe(path);
+  buffer[2][last.length].hyperlink = { uri: "file:///elsewhere" };
+  for (const col of [2, 8]) expect(findPathAtCell(buffer, { row: 2, col })).toBeNull();
+});
+
+test("a geometry cut cannot offer a prefix file, its label, or a root-looking detached suffix", () => {
+  const prefix = "/tmp/existing", width = prefix.length + 3;
+  const buffer = ["", "Open", ` (${prefix}`, " /rest.png)", "", "", ""].map((text, index) =>
+    row(`${index === 3 ? "├" : "│"}${text.padEnd(width)}▕`)[0]);
+  for (const cell of buffer[1].slice(1, 5)) cell.style = { ...DEFAULT_STYLE, underline: true };
+  for (const [y, col] of [[1, 2], [2, 6], [3, 4]]) {
+    expect(findPathAtCell(buffer, { row: y, col })).toBeNull();
+  }
+  buffer[2][6].hyperlink = { uri: "file:///tmp/explicit" };
+  expect(findPathAtCell(buffer, { row: 2, col: 6 })?.path).toBe("/tmp/explicit");
+});
+
+test("a split on a borderless row is not path text or proof that the edge filename is complete", () => {
+  const path = "/tmp/existing", width = path.length + 18;
+  for (const [text, dividerCol, expected] of [
+    [path, path.length + 13, path], // Ample visible separation from the new wall.
+    [`${path}   status`, path.length + 1, null], // Text beyond that wall belongs to a sidebar.
+  ] as const) {
+    const split = `${" /tail".padEnd(dividerCol)}│`;
+    const buffer = [text, split, split, split].map(line => row(line.padEnd(width))[0]);
+    const match = findPathAtCell(buffer, { row: 0, col: 4 });
+    expect(match?.path ?? null).toBe(expected);
+  }
+});
+
+test("an underlined filename is not a fallback when a cut prevents inspecting its target", () => {
+  const label = "/tmp/label", width = 26;
+  const buffer = ["", "", label, " (/tmp/actual)", "", "", ""].map((text, y) =>
+    row(`${y === 3 ? "├" : "│"}${text.padEnd(width)}▕`)[0]);
+  for (const cell of buffer[2].slice(1, 1 + label.length)) cell.style = { ...DEFAULT_STYLE, underline: true };
+  expect(findPathAtCell(buffer, { row: 2, col: 4 })).toBeNull();
+});
+
+test("a full visible rule terminates both sides of a pane without hiding its first or last URL", () => {
+  const first = "https://first.test/doc", last = "https://last.test/end";
+  const width = first.length + 9;
+  for (const [opening, closing] of [["╭", "╮"], ["├", "┤"], ["│", "│"]]) {
+    const rule = opening + "─".repeat(width) + closing;
+    const lines = [rule, `│${first.padEnd(width)}│`, `│${" ".repeat(width)}│`,
+      `│${last.padStart(width)}│`, rule].map(text => row(text)[0]);
+    expect(findUrlAtCell(lines, { row: 1, col: 5 })?.url).toBe(first);
+    expect(findUrlAtCell(lines, { row: 3, col: width - 2 })?.url).toBe(last);
+    lines[0][4].style = { ...DEFAULT_STYLE, hidden: true };
+    lines[4][4].hyperlink = { uri: "https://unrelated.test" };
+    expect(findUrlAtCell(lines, { row: 1, col: 5 })).toBeNull();
+    expect(findUrlAtCell(lines, { row: 3, col: width - 2 })).toBeNull();
+  }
+});
+
+test("a horizontal run clipped out of a wider text row is not a full frame", () => {
+  const inner = "https://inner.test/doc", width = inner.length + 5;
+  const lines = [`previousX${"─".repeat(width)}▕`,
+    ...[inner, "", ""].map(text => `        │${text.padEnd(width)}▕`)].map(text => row(text)[0]);
+  expect(findUrlAtCell(lines, { row: 1, col: 14 })).toBeNull();
+});
+
+test("discarding only padding and a separate pane keeps the surviving path actionable", () => {
+  const parser = new AnsiParser(30, 3);
+  parser.write("\x1b[?1049h\x1b[?7l");
+  for (let y = 0; y < 3; y++) {
+    parser.write(`\x1b[${y + 1};1H${(y === 0 ? "/tmp/keep" : "").padEnd(18)}│/side`);
+  }
+  parser.resize(12, 3);
+  expect(findPathAtCell(parser.getBuffer(), { row: 0, col: 3 })?.path).toBe("/tmp/keep");
 });
 
 test("widening inside a TUI cannot reveal a former first-row fragment", () => {

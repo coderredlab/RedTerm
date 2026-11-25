@@ -6,6 +6,8 @@ import { zlibSync } from "fflate";
 
 import { AnsiParser, type Cell } from "./ansi-parser";
 import { CanvasRenderer, compareTerminalImageOrder } from "./CanvasRenderer";
+import { findUrlAtCell } from "./terminal-links";
+import { findPathAtCell } from "./terminal-paths";
 
 function scrollbackLengthAfter(sequence: string): number {
   const parser = new AnsiParser(20, 3);
@@ -2792,6 +2794,220 @@ describe("AnsiParser Sixel images", () => {
     const [image] = parser.getImages();
     expect(image.data[3]).toBe(255);
     expect(image.data[7]).toBe(0);
+  });
+});
+
+describe("inferred pane link provenance", () => {
+  const sidebar = "/aside.txt".padEnd(16) + "│ ";
+  const left = sidebar.length;
+  function draw(lines: string[], width: number, mode = "\x1b[?1049h") {
+    const parser = new AnsiParser(left + width + 2, lines.length);
+    parser.write(`\x1b[?7l${mode}`);
+    lines.forEach((line, y) => parser.write(`\x1b[${y + 1};1H${sidebar}${line.padEnd(width)} ▕`));
+    return parser;
+  }
+  const urlAt = (parser: AnsiParser, row: number) =>
+    findUrlAtCell(parser.getBuffer(), { row, col: left + 4 })?.url ?? null;
+  const sidebarAt = (parser: AnsiParser, row: number) =>
+    findPathAtCell(parser.getBuffer(), { row, col: 3 })?.path;
+
+  test("dropping the outer URI above an alternate viewport cannot promote its inner URI", () => {
+    const root = "https://accounts.test/authorize?return_to=", inner = "https://app.test/cb&state=ok";
+    for (const height of [3, 1]) {
+      const parser = draw(["", root, inner, "", ""], root.length);
+      expect(urlAt(parser, 2)).toBe(root + inner);
+      if (height === 1) parser.write("\x1b[3;1H"); // Drop rows on both sides of the inner URI.
+      parser.resize(left + root.length + 2, height);
+      expect(urlAt(parser, 0)).toBeNull();
+      expect(sidebarAt(parser, 0)).toBe("/aside.txt");
+      const fresh = "https://fresh.test/redrawn";
+      parser.write(`\x1b[1;${left + 1}H${fresh.padEnd(root.length)}`);
+      expect(urlAt(parser, 0)).toBe(fresh);
+    }
+  });
+
+  test("a lost split predecessor cannot promote a nested URL in the merged pane", () => {
+    const root = "https://origin.test/r?to=", inner = "https://inner.test/doc";
+    const width = root.length + 1 + 23;
+    for (const change of ["drop rows", "overwrite root"]) {
+      const parser = draw([
+        `${" ".repeat(root.length)}│`, `${" ".repeat(root.length)}│`, `${root}│`,
+        inner, "", "",
+      ], width);
+      expect(urlAt(parser, 3)).toBeNull();
+      let retainedRow = 3;
+      if (change === "drop rows") {
+        parser.resize(left + width + 2, 3); // The cursor is on the final merged row.
+        retainedRow = 0;
+      } else {
+        parser.write(`\x1b[3;${left + 1}H${" ".repeat(root.length)}`);
+      }
+      expect(urlAt(parser, retainedRow)).toBeNull();
+      parser.write(`\x1b[${retainedRow + 1};${left + 1}H${inner}`);
+      expect(urlAt(parser, retainedRow)).toBe(inner);
+    }
+  });
+
+  test("padding removed by narrowing remains a real separator until both sides are refreshed", () => {
+    const root = "https://example.test/auth?scope=read", next = "&field=independent";
+    for (const mode of ["\x1b[?1049h", "\x1b[2;4r"]) {
+      const parser = draw(["", root, next, ""], root.length + 10, mode);
+      expect(urlAt(parser, 1)).toBe(root);
+      parser.resize(left + root.length + 1, 4);
+      if (mode === "\x1b[2;4r") parser.write("\x1b[?1049h\x1b[?1049l"); // Deep row clones.
+      expect(urlAt(parser, 1)).toBe(root);
+      expect(urlAt(parser, 2)).toBeNull();
+      expect(sidebarAt(parser, 1)).toBe("/aside.txt");
+      parser.write(`\x1b[2;${left + 1}H${root}`);
+      expect(urlAt(parser, 1)).toBe(root);
+      parser.write(`\x1b[3;${left + 1}H${next}`);
+      expect(urlAt(parser, 1)).toBe(root + next);
+      expect(urlAt(parser, 2)).toBe(root + next);
+    }
+  });
+
+  test("losing just one of two separator spaces cannot attach an independent query field", () => {
+    const root = "https://example.test/auth?scope=read", next = "&field=independent";
+    for (const mode of ["\x1b[?1049h", "\x1b[2;4r"]) {
+      const parser = draw(["", root, next, ""], root.length + 1, mode);
+      expect(urlAt(parser, 1)).toBe(root);
+      parser.resize(left + root.length + 1, 4); // One trailing space now matches the next row's leading space.
+      expect(urlAt(parser, 1)).toBe(root);
+      expect(urlAt(parser, 2)).toBeNull();
+      parser.write(`\x1b[3;${left + 2}HF`); // &field → &Field on the independent row.
+      expect(urlAt(parser, 1)).toBe(root);
+      expect(urlAt(parser, 2)).toBeNull();
+    }
+  });
+
+  test("changing a status cell cannot disable a URL after a visible token separator", () => {
+    const url = "https://other.test/doc", prefix = "done ";
+    const parser = draw(["status".padEnd(32, "x"), prefix + url, ""], 32);
+    const point = { row: 1, col: left + prefix.length };
+    expect(findUrlAtCell(parser.getBuffer(), point)?.url).toBe(url);
+    parser.write(`\x1b[1;${left + 1}HS`);
+    expect(findUrlAtCell(parser.getBuffer(), point)?.url).toBe(url);
+  });
+
+  test("a status repaint leaves the next row's quoted JSON URL actionable", () => {
+    const url = "https://other.test/doc", line = `{"url":"${url}"}`;
+    const parser = draw(["status".padEnd(32, "x"), line, ""], 32);
+    const point = { row: 1, col: left + line.indexOf(url) };
+    expect(findUrlAtCell(parser.getBuffer(), point)?.url).toBe(url);
+    parser.write(`\x1b[1;${left + 1}HS`);
+    expect(findUrlAtCell(parser.getBuffer(), point)?.url).toBe(url);
+  });
+
+  test("printing over the final parameter cannot expose an old prefix; a complete redraw is live", () => {
+    const root = "https://example.test/auth?scope=", middle = "read%20write&client_id=sample-id", tail = "&state=ok";
+    const parser = draw(["", root, middle, tail, ""], root.length);
+    expect(urlAt(parser, 1)).toBe(root + middle + tail);
+    parser.write(`\x1b[3;${left + 1}Hread`); // An identical, partial refresh is not destructive.
+    expect(urlAt(parser, 2)).toBe(root + middle + tail);
+    parser.write(`\x1b[2;${left + 1}Hhttps`);
+    expect(urlAt(parser, 2)).toBe(root + middle + tail);
+    parser.write(`\x1b[4;${left + 1}H${" ".repeat(tail.length)}`);
+    expect(urlAt(parser, 1)).toBeNull();
+    expect(urlAt(parser, 2)).toBeNull();
+    expect(sidebarAt(parser, 2)).toBe("/aside.txt");
+
+    const freshTail = "&state=ready";
+    [root, middle, freshTail].forEach((line, y) => parser.write(`\x1b[${y + 2};${left + 1}H${line}`));
+    for (const row of [1, 2, 3]) expect(urlAt(parser, row)).toBe(root + middle + freshTail);
+  });
+
+  test("destructive printable changes to the source do not expose a nested URI-valued suffix", () => {
+    const root = "https://accounts.test/authorize?return_to=", inner = "https://app.test/cb&state=ok";
+    const parser = draw(["", root, inner, ""], root.length);
+    expect(urlAt(parser, 2)).toBe(root + inner);
+    parser.write(`\x1b[2;${left + 1}H${" ".repeat(root.length)}`);
+    expect(urlAt(parser, 2)).toBeNull();
+    expect(sidebarAt(parser, 2)).toBe("/aside.txt");
+    parser.write(`\x1b[3;${left + 1}H${inner}`);
+    expect(urlAt(parser, 2)).toBe(inner);
+  });
+
+  test("erasing the root cannot promote a nested URL added after an identical repaint", () => {
+    const root = "https://accounts.test/authorize?return_to=", inner = "https://app.test/cb&state=ok";
+    const parser = draw(["x".repeat(root.length - 1) + '"', root, "", ""], root.length);
+    parser.write(`\x1b[1;${left + 1}Hx\x1b[3;${left + 1}H${inner}`);
+    expect(urlAt(parser, 2)).toBe(root + inner);
+    parser.write(`\x1b[2;${left + 1}H${" ".repeat(root.length)}`);
+    expect(urlAt(parser, 2)).toBeNull();
+  });
+
+  test("an identical complete repaint is not an independent destination when the owner disappears", () => {
+    const root = "https://accounts.test/authorize?return_to=", inner = "https://app.test/cb&state=ok";
+    const parser = draw(["", root, inner, ""], root.length);
+    parser.write(`\x1b[3;${left + 1}H${inner}`);
+    expect(urlAt(parser, 2)).toBe(root + inner);
+    parser.write(`\x1b[2;${left + 1}H${" ".repeat(root.length)}`);
+    expect(urlAt(parser, 2)).toBeNull();
+  });
+
+  test("replacing an owner with status text does not promote a recently updated nested URL", () => {
+    const root = "https://accounts.test/authorize?return_to=", inner = "https://app.test/cb&state=ok";
+    for (const status of ["Cancelled", "https cancelled"]) {
+      const parser = draw(["", root, inner, ""], root.length);
+      expect(urlAt(parser, 2)).toBe(root + inner);
+      const edited = inner.replace("=ok", "=no");
+      parser.write(`\x1b[3;${left + 1}H${edited}\x1b[2;${left + 1}H${status.padEnd(root.length)}`);
+      expect(urlAt(parser, 2)).toBeNull();
+      parser.write(`\x1b[3;${left + 1}H${edited}`);
+      expect(urlAt(parser, 2)).toBe(edited);
+    }
+  });
+
+  test("replacing a continuation cannot expose the earlier URL without its final field", () => {
+    const root = "https://example.test/auth?scope=read", tail = "&state=ok", independent = "https://docs.test/help";
+    const parser = draw(["", root, tail, ""], root.length);
+    expect(urlAt(parser, 1)).toBe(root + tail);
+    parser.write(`\x1b[3;${left + tail.length}Hn\x1b[2;${left + 1}H${root}`);
+    parser.write(`\x1b[3;${left + 1}H${independent}`);
+    expect(urlAt(parser, 1)).toBeNull();
+    expect(urlAt(parser, 2)).toBe(independent);
+  });
+
+  test("repainting either independent web link does not invalidate the other", () => {
+    const root = "https://one.test/report", other = "https://two.test/doc", updated = "https://two.test/new";
+    for (const suffix of [",", ";", "%29", ""]) {
+      const first = root + suffix, expected = suffix === "%29" ? first : root;
+      const parser = draw(["", first, other, ""], first.length);
+      expect(urlAt(parser, 1)).toBe(expected);
+      expect(urlAt(parser, 2)).toBe(other);
+      parser.write(`\x1b[3;${left + 1}H${updated}`);
+      expect(urlAt(parser, 1)).toBe(expected);
+      expect(urlAt(parser, 2)).toBe(updated);
+      parser.write(`\x1b[2;${left + 1}H${first.replace("one", "new")}`);
+      expect(urlAt(parser, 1)).toBe(expected.replace("one", "new"));
+      expect(urlAt(parser, 2)).toBe(updated);
+    }
+  });
+
+  test("the top frame is not a lost predecessor when the neighboring URL is repainted", () => {
+    const first = "https://one.test/report", other = "https://two.test/doc", fresh = "https://two.test/new";
+    const width = first.length, parser = new AnsiParser(width + 4, 5);
+    parser.write("\x1b[?7l\x1b[?1049h");
+    const rule = "─".repeat(width + 2);
+    const rows = [`┌${rule}┐`, ...[first, other, ""].map(text => `│ ${text.padEnd(width)} │`), `└${rule}┘`];
+    rows.forEach((text, y) => parser.write(`\x1b[${y + 1};1H${text}`));
+    const hit = (y: number) => findUrlAtCell(parser.getBuffer(), { row: y, col: 9 })?.url;
+    expect(hit(1)).toBe(first);
+    expect(hit(2)).toBe(other);
+    parser.write(`\x1b[3;3H${fresh}`);
+    expect(hit(1)).toBe(first);
+    expect(hit(2)).toBe(fresh);
+  });
+
+  test("erasing a previously invalidated owner also checks its newly painted successor", () => {
+    const root = "https://accounts.test/authorize?return_to=", inner = "https://app.test/cb&state=ok";
+    const parser = draw(["", root, inner, ""], root.length);
+    expect(urlAt(parser, 2)).toBe(root + inner);
+    parser.write(`\x1b[3;${left + 1}H${" ".repeat(inner.length)}\x1b[3;${left + 1}H${inner}`);
+    parser.write(`\x1b[2;${left + 1}H${" ".repeat(root.length)}`);
+    expect(urlAt(parser, 2)).toBeNull();
+    parser.write(`\x1b[3;${left + 1}H${inner}`);
+    expect(urlAt(parser, 2)).toBe(inner);
   });
 });
 

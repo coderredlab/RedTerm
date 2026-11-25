@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 
 import { AnsiParser, DEFAULT_STYLE, type Cell } from "./ansi-parser";
 import { findUrlAtCell, validateTerminalUrl } from "./terminal-links";
+import { findPathAtCell } from "./terminal-paths";
 
 function bufferFromRows(...texts: string[]): Cell[][] {
   return texts.map((text) =>
@@ -48,7 +49,7 @@ function plainPane(lines: string[], width: number, padding = 1) {
   lines.forEach((text, row) => {
     parser.write(`\x1b[${row + 1};1H${sidebar}${margin}${text.padEnd(width)}${margin}▕`);
   });
-  return { buffer: parser.getFullBuffer(), left: sidebar.length + padding };
+  return { parser, buffer: parser.getFullBuffer(), left: sidebar.length + padding };
 }
 
 test("opens a plain pane-wrapped URL from every row, including schemes embedded in its query", () => {
@@ -86,22 +87,241 @@ test("does not extend a pane URL's host or absorb the next link or a line of pro
   }
 });
 
+test("keeps independent pane URLs separate after a comma or a percent-encoded path character", () => {
+  const first = "https://one.test/report", second = "https://two.test/doc";
+  for (const suffix of [",", "%29"]) {
+    const printed = first + suffix;
+    const { buffer, left } = plainPane(["", printed, second, ""], printed.length);
+    for (const [row, url] of [[1, suffix === "," ? first : printed], [2, second]] as const) {
+      expect(findUrlAtCell(buffer, { row, col: left + 8 })).toEqual({
+        url, startCol: left, endCol: left + url.length - 1,
+      });
+    }
+  }
+});
+
+test("never opens the original site or a truncated archive URL at an ambiguous pane boundary", () => {
+  const archive = "https://archive.test/web/20240101/", site = "https://source.test/article";
+  const { buffer, left } = plainPane(["", archive, site, ""], archive.length, 0);
+  for (const row of [1, 2]) {
+    expect([null, archive + site]).toContain(findUrlAtCell(buffer, { row, col: left + 8 })?.url ?? null);
+  }
+});
+
+test("keeps a row-initial URL assigned to a query parameter inside the outer target", () => {
+  const prefix = "https://accounts.test/authorize?return_to=", value = "https://app.test/cb&state=ok";
+  const { buffer, left } = plainPane(["", prefix, value, ""], prefix.length);
+  for (const row of [1, 2]) {
+    expect(findUrlAtCell(buffer, { row, col: left + 8 })?.url).toBe(prefix + value);
+  }
+});
+
+test("does not use a separately parenthesized URL's query as part of the preceding link", () => {
+  const first = "https://one.test/search?q=x", second = "https://two.test/?n=1";
+  const { buffer, left } = plainPane(["", first, `(${second})`, ""], first.length);
+  expect(findUrlAtCell(buffer, { row: 1, col: left + 8 })?.url).toBe(first);
+  expect(findUrlAtCell(buffer, { row: 2, col: left + 8 })?.url).toBe(second);
+});
+
+test("does not borrow query ownership evidence across an unused content column", () => {
+  const first = "https://one.test/?return_to=";
+  const second = "https://two.test/".padEnd(first.length - 1, "x");
+  const { buffer, left } = plainPane(["", first, second, "&state=ok", ""], first.length);
+  expect(findUrlAtCell(buffer, { row: 2, col: left + 8 })).toBeNull();
+  expect(findUrlAtCell(buffer, { row: 3, col: left + 2 })).toBeNull();
+});
+
+test("finds an independently separated URL beyond an earlier ambiguous pair", () => {
+  const first = "https://one.test/path/", last = "https://three.test/";
+  const { buffer, left } = plainPane(["", first, "https://two.test/path", last, ""], first.length);
+  expect(findUrlAtCell(buffer, { row: 3, col: left + 8 })?.url).toBe(last);
+});
+
+test("does not offer an inner URL on the second row of a token cut by a pane merge", () => {
+  const inner = "https://inner.test/doc";
+  const { buffer, left } = plainPane([
+    "S│", "S│", "S│https://one.test/?scope=", "abcdefghijklmnopqrstuvw%20", inner, "",
+  ], 26, 0);
+  expect(findUrlAtCell(buffer, { row: 4, col: left + inner.indexOf("inner") })).toBeNull();
+});
+
+test("does not use a Markdown destination or file URI as evidence for a preceding query", () => {
+  const first = "https://one.test/search?q=ready", web = "https://b.test/a%20b?n=1";
+  for (const [printed, hit, url] of [
+    [`[go](${web})`, "b.test", web],
+    ["file:///tmp/a%20b", "a%20b", null],
+  ] as const) {
+    const { buffer, left } = plainPane(["", first, printed, ""], first.length);
+    const point = { row: 2, col: left + printed.indexOf(hit) };
+    expect(findUrlAtCell(buffer, { row: 1, col: left + 8 })?.url).toBe(first);
+    expect(findUrlAtCell(buffer, point)?.url ?? null).toBe(url);
+    if (url === null) expect(findPathAtCell(buffer, point)?.path).toBe("/tmp/a b");
+  }
+});
+
+test("keeps an unused column before a URL that spans the entire unpadded pane", () => {
+  const first = "https://one.test/?return_to=", second = "https://two.test/cb&state=yes";
+  const { buffer, left } = plainPane(["", first, second, ""], 29, 0);
+  expect(findUrlAtCell(buffer, { row: 1, col: left + 8 })?.url).toBe(first);
+  expect(findUrlAtCell(buffer, { row: 2, col: left + 8 })?.url).toBe(second);
+});
+
+test("a comma after an ambiguous pair separates the third direct URL", () => {
+  const first = "https://one.test/path/", last = "https://three.test/";
+  const { buffer, left } = plainPane(["", first, "https://two.test/path,", last, ""], 22);
+  for (const row of [1, 2]) expect(findUrlAtCell(buffer, { row, col: left + 8 })).toBeNull();
+  expect(findUrlAtCell(buffer, { row: 3, col: left + 8 })?.url).toBe(last);
+});
+
+test("recognizes a spare content column even when earlier text exhausts the backward scan", () => {
+  const url = "https://three.test/";
+  const lines = [...Array(32).fill("x".repeat(24)), "x".repeat(23), url];
+  const { buffer, left } = plainPane(lines, 24);
+  expect(findUrlAtCell(buffer, { row: lines.length - 1, col: left + 8 })?.url).toBe(url);
+});
+
+test("a parenthesized OSC 8 link beyond a visible gap does not hide the earlier plain URL", () => {
+  const first = "https://one.test/path", second = "https://two.test/", explicit = "https://linked.test/";
+  const { parser, left } = plainPane(["", first, "", ""], 22);
+  parser.write(`\x1b[3;${left + 1}H(\x1b]8;;${explicit}\x07${second}\x1b]8;;\x07)`);
+  const buffer = parser.getFullBuffer();
+  expect(findUrlAtCell(buffer, { row: 1, col: left + 8 })?.url).toBe(first);
+  expect(findUrlAtCell(buffer, { row: 2, col: left + 9 })?.url).toBe(explicit);
+});
+
+test("a split redirect host and port stay inside the outer query", () => {
+  const parts = ["https://one.test/?scope=", "x&redirect=http://abcdef", "gh.test:8080/cb&state=ok"];
+  const { buffer, left } = plainPane(["", ...parts, ""], parts[0].length);
+  for (const row of [1, 2, 3]) {
+    expect(findUrlAtCell(buffer, { row, col: left + 6 })?.url).toBe(parts.join(""));
+  }
+});
+
+test("a visible parenthesis ends the target before an independent status or URL", () => {
+  const first = "https://one.test/?x=y", second = "https://two.test/doc";
+  for (const [label, space, next] of [["See", "", "Done"], ["Open", "", second], ["Open", " ", second]]) {
+    const printed = `${label} (${space}${first})`;
+    const { buffer, left } = plainPane(["", printed, next, ""], printed.length);
+    if (label === "Open") {
+      for (const cell of buffer[1].slice(left, left + label.length)) cell.style = { ...DEFAULT_STYLE, underline: true };
+      expect(findUrlAtCell(buffer, { row: 1, col: left + 1 })?.url).toBe(first);
+    }
+    expect(findUrlAtCell(buffer, { row: 1, col: left + printed.indexOf("one") })?.url).toBe(first);
+    expect(findUrlAtCell(buffer, { row: 2, col: left + 1 })?.url ?? null).toBe(next === second ? second : null);
+  }
+});
+
+test("an inner closing parenthesis cannot reveal another host in a clipped soft-wrapped URL", () => {
+  const parser = new AnsiParser(40, 44), prefix = "https://outer.test/".padEnd(1600, "x");
+  const suffix = "p(https://a.test/)https://b.test/";
+  parser.write(prefix + suffix);
+  const offset = prefix.length + suffix.indexOf("b.test");
+  expect(findUrlAtCell(parser.getFullBuffer(), { row: Math.floor(offset / 40), col: offset % 40 })).toBeNull();
+});
+
+test("a status label ending in a colon does not disable the preceding independent URL", () => {
+  const url = "https://one.test/report";
+  const { buffer, left } = plainPane(["", url, "Status: done", ""], url.length);
+  expect(findUrlAtCell(buffer, { row: 1, col: left + 8 })?.url).toBe(url);
+  expect(findUrlAtCell(buffer, { row: 2, col: left + 1 })).toBeNull();
+});
+
+test("a visible spare column after a clipped parenthesized log token starts a new link", () => {
+  const url = "https://three.test/", width = 24;
+  const lines = [...Array(32).fill("x".repeat(width)), "log(https://one.test/a)", url];
+  const { buffer, left } = plainPane(lines, width);
+  expect(findUrlAtCell(buffer, { row: lines.length - 1, col: left + 8 })?.url).toBe(url);
+});
+
+test("preserves a visible quote as a token separator on a proven soft wrap", () => {
+  const url = "https://one.test/", parser = new AnsiParser(24, 3);
+  parser.write("x".repeat(24) + `"${url}"`);
+  expect(findUrlAtCell(parser.getFullBuffer(), { row: 1, col: 6 })?.url).toBe(url);
+});
+
+test("does not attach a one-word status to a URL at or one column short of the pane edge", () => {
+  const url = "https://example.test/report";
+  for (const width of [url.length, url.length + 1]) {
+    const { buffer, left } = plainPane(["", url, "Done", ""], width);
+    expect(findUrlAtCell(buffer, { row: 1, col: left + 8 })?.url).toBe(url);
+    expect(findUrlAtCell(buffer, { row: 2, col: left })).toBeNull();
+  }
+});
+
+const paneQueryRows = [
+  "https://example.test/auth?scope=",
+  "read%20write&client_id=sample-id",
+  "&state=ok",
+];
+
+test("includes the last query parameter but not the prose following it on the final pane row", () => {
+  const [first, middle, last] = paneQueryRows;
+  const { buffer, left } = plainPane(["", first, middle, `${last} done`, ""], first.length);
+  for (const [index, chunk] of paneQueryRows.entries()) {
+    const row = index + 1, endCol = left + chunk.length - 1;
+    for (const col of [left, endCol]) {
+      expect(findUrlAtCell(buffer, { row, col })).toEqual({ url: first + middle + last, startCol: left, endCol });
+    }
+  }
+  expect(findUrlAtCell(buffer, { row: 3, col: left + last.length + 1 })).toBeNull();
+});
+
+test("does not charge 31 full rows of multiword logs against the following independent links", () => {
+  const first = "https://one.test/status", second = "https://two.test/doc";
+  const logs = Array(31).fill("INFO finished job ".padEnd(first.length, "0"));
+  const { buffer, left } = plainPane([...logs, first, second], first.length);
+  for (const [index, url] of [first, second].entries()) {
+    expect(findUrlAtCell(buffer, { row: logs.length + index, col: left + 8 })?.url).toBe(url);
+  }
+});
+
+test("does not offer a partial target when the final query row loses a pane divider", () => {
+  for (const [divider, replacement] of [["│", "├"], ["▕", " "]]) {
+    const { parser, buffer, left } = plainPane(["", ...paneQueryRows, ""], paneQueryRows[0].length);
+    const col = buffer[3].findIndex(cell => cell.char === divider);
+    parser.write(`\x1b[4;${col + 1}H${replacement}`);
+    for (const row of [1, 2, 3]) {
+      expect(findUrlAtCell(parser.getFullBuffer(), { row, col: left + 3 })).toBeNull();
+    }
+  }
+});
+
+test("rejects surviving URL cells after alternate-screen narrowing until the clipped frame is repainted", () => {
+  const lines = ["", ...paneQueryRows, ""], width = paneQueryRows[0].length;
+  const { parser, left } = plainPane(lines, width);
+  const cols = left + width - 4;
+  parser.resize(cols, lines.length); // Crops visible characters from both full URL rows.
+  for (const row of [1, 2, 3]) {
+    expect(findUrlAtCell(parser.getFullBuffer(), { row, col: left + 3 })).toBeNull();
+  }
+  parser.write(`\x1b[2;${left + 1}Hhttps://`);
+  expect(findUrlAtCell(parser.getFullBuffer(), { row: 1, col: left + 3 })).toBeNull();
+
+  const fresh = "https://fresh.test/redrawn";
+  for (let row = 0; row < lines.length; row++) {
+    parser.write(`\x1b[${row + 1};1H${(row === 1 ? fresh : "").padEnd(cols)}`);
+  }
+  expect(findUrlAtCell(parser.getFullBuffer(), { row: 1, col: 8 })?.url).toBe(fresh);
+});
+
 test("never substitutes an embedded URI when a plain pane URL exceeds the scan budget", () => {
-  const width = 40;
-  const prefix = "https://example.test/?scope=".padEnd(width * 18 - 3, "x") + "%20";
-  const url = (prefix + "https://inner.test/resource/").padEnd(width * 40 + 8, "y");
-  const chunks = url.match(/.{1,40}/g)!;
-  const { buffer, left } = plainPane(["", ...chunks, ""], width);
-  for (const row of [1, 19, chunks.length]) {
-    expect(findUrlAtCell(buffer, { row, col: left + 3 })).toBeNull();
+  for (const [width, rowsBeforeInner, fullRows] of [[40, 18, 40], [200, 22, 26]]) {
+    const prefix = "https://example.test/?scope=".padEnd(width * rowsBeforeInner - 3, "x") + "%20";
+    const url = (prefix + "https://inner.test/resource/").padEnd(width * fullRows + 8, "y");
+    const chunks = url.match(new RegExp(`.{1,${width}}`, "g"))!;
+    const { buffer, left } = plainPane(["", ...chunks, ""], width);
+    for (const row of [1, rowsBeforeInner + 1, chunks.length]) {
+      expect(findUrlAtCell(buffer, { row, col: left + 3 })).toBeNull();
+    }
   }
 });
 
 test("does not offer a partial plain pane link across concealed content or an OSC 8 margin", () => {
-  const chunks = ("https://example.test/path?scope=" + "x".repeat(70)).match(/.{1,40}/g)!;
-  for (const hidden of [true, false]) {
-    const { buffer, left } = plainPane(["", ...chunks, ""], 40);
-    const col = hidden ? left + 5 : left - 1;
+  const chunks = paneQueryRows, width = chunks[0].length;
+  for (const [offset, hidden] of [[5, true], [-1, false], [width, true], [width, false]] as const) {
+    const { buffer, left } = plainPane(["", ...chunks, ""], width);
+    expect(findUrlAtCell(buffer, { row: 2, col: left + 3 })?.url).toBe(chunks.join(""));
+    const col = left + offset;
     const cell = buffer[2][col];
     buffer[2][col] = hidden ? { ...cell, style: { ...cell.style, hidden: true } } :
       { ...cell, hyperlink: { uri: "https://other.test/" } };

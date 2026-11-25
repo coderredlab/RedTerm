@@ -1,5 +1,5 @@
-import { hasReflowIncomingContent, hasReflowOutgoingContent, isReflowContinuation, isUnprovenSnapshotRow, printedDirectoryUri, type Cell } from "./ansi-parser";
-import { CONTINUATION_MARGIN_BITS, CONTINUATION_MARGIN_MASK, findInTerminalLinkPane, findRenderedTerminalLabel, terminalLinkContinuationGaps } from "./terminal-rendered-links";
+import { hasReflowIncomingContent, hasReflowOutgoingContent, hasUnprovenPathCells, isReflowContinuation, isUnprovenSnapshotRow, printedDirectoryUri, type Cell } from "./ansi-parser";
+import { CONTINUATION_MARGIN_BITS, CONTINUATION_MARGIN_MASK, findInTerminalLinkPane, findRenderedTerminalLabel, terminalLinkContinuationGaps, touchesTerminalPaneCut, type TerminalLinkPane } from "./terminal-rendered-links";
 
 export interface TerminalPathMatch {
   path: string;
@@ -62,10 +62,11 @@ export function findPathAtCell(
   buffer: Cell[][], point: { row: number; col: number }, cwdUri: string | null = null,
 ): TerminalPathMatch | null {
   if (buffer[point.row]?.[point.col]?.hyperlink) return findPathInRows(buffer, point, cwdUri);
-  return findInTerminalLinkPane(buffer, point, (rows, localPoint, panePadding) => {
+  return findInTerminalLinkPane(buffer, point, (rows, localPoint, pane) => {
+    const panePadding = pane?.hasDivider ?? false;
     const rendered = findRenderedTerminalLabel(rows, localPoint, panePadding,
-      target => findPathInRows(rows, target, cwdUri, panePadding));
-    const match = rendered === undefined ? findPathInRows(rows, localPoint, cwdUri, panePadding) : rendered;
+      target => findPathInRows(rows, target, cwdUri, pane), pane?.cutBottom);
+    const match = rendered === undefined ? findPathInRows(rows, localPoint, cwdUri, pane) : rendered;
     if (!match) return null;
     if (rendered || panePadding) {
       return { ...match, alternativePath: match.alternativePath ?? null,
@@ -81,7 +82,7 @@ function findPathInRows(
   buffer: Cell[][],
   point: { row: number; col: number },
   cwdUri: string | null = null,
-  panePadding = false,
+  pane?: TerminalLinkPane,
 ): TerminalPathMatch | null {
   const row = buffer[point.row];
   if (!row || point.col < 0 || !row[point.col]) return null;
@@ -142,7 +143,7 @@ function findPathInRows(
   // Nested Markdown lists retain their indentation across TUI-internal wraps.
   // Pack trailing and leading margin counts; -1 means no continuation.
   const continuationGaps = (before: Cell[], after: Cell[], ignoreHyperlinks = false) =>
-    terminalLinkContinuationGaps(before, after, panePadding, ignoreHyperlinks);
+    terminalLinkContinuationGaps(before, after, pane?.hasDivider ?? false, ignoreHyperlinks);
   let first = point.row;
   let last = point.row;
   let length = row.length;
@@ -250,6 +251,17 @@ function findPathInRows(
     const after = last + 1 < buffer.length ? continuationGaps(buffer[last], buffer[last + 1]) : -1;
     if ((before >= 0 && /^[ ([{"'`]*$/.test(text.slice(0, offset))) ||
         (after >= 0 && /^[)\]},;."'`]* ?$/.test(text.slice(endOffset)))) continue;
+    // A changed pane can conceal either end of this token. Filesystem lookup
+    // cannot distinguish a real prefix filename from the intended longer path.
+    const tokenStart = match.index!, tokenEnd = tokenStart + match[0].length;
+    const enclosed = quoted || (offset > tokenStart && endOffset < tokenEnd &&
+      ((text[offset - 1] === "(" && text[endOffset] === ")") ||
+        (text[offset - 1] === "[" && text[endOffset] === "]") ||
+        (text[offset - 1] === "{" && text[endOffset] === "}")));
+    if (!enclosed && ((first === 0 && tokenStart < rowStarts[1] &&
+      touchesTerminalPaneCut(pane, buffer[0], columns[tokenStart], true)) ||
+      (last === buffer.length - 1 && tokenEnd > rowStarts[last - first] &&
+        touchesTerminalPaneCut(pane, buffer[last], columns[tokenEnd - 1], false)))) continue;
     const resolvedPath = resolveTerminalPath(candidate, printedCwd(offset, endOffset));
     const wholePath = resolvedPath ?? unresolvedRelativePath(candidate);
     const requiresLookup = !resolvedPath && wholePath !== null;
@@ -303,9 +315,8 @@ function findPathInRows(
       if (ambiguousSpace) return null;
     }
     for (let line = first; line <= last; line++) {
-      const start = Math.max(quoted ? match.index! : offset, rowStarts[line - first]);
-      const end = Math.min(quoted ? match.index! + match[0].length : endOffset,
-        rowStarts[line - first + 1]);
+      const start = Math.max(enclosed ? offset - 1 : offset, rowStarts[line - first]);
+      const end = Math.min(enclosed ? endOffset + 1 : endOffset, rowStarts[line - first + 1]);
       // A skipped margin must not hide part of a path or a different link.
       const leading = line === first ? 0 : continuationGaps(buffer[line - 1], buffer[line]) & CONTINUATION_MARGIN_MASK;
       const trailing = line === last ? 0 : continuationGaps(buffer[line], buffer[line + 1]) >> CONTINUATION_MARGIN_BITS;
@@ -321,8 +332,11 @@ function findPathInRows(
       if (line < last && buffer[line].at(-1)?.char === "" &&
         (buffer[line].at(-1)!.style.hidden || buffer[line].at(-1)!.hyperlink)) return null;
       if (start >= end) continue;
-      if (buffer[line].slice(columns[start], columns[end - 1] + 1)
-        .some(cell => cell.style.hidden || cell.hyperlink)) return null;
+      const from = columns[start], to = columns[end - 1] + 1;
+      if (hasUnprovenPathCells(buffer[line], from, to)) return null;
+      for (let col = from; col < to; col++) {
+        if (buffer[line][col].style.hidden || buffer[line][col].hyperlink) return null;
+      }
     }
     const pointStart = rowStarts[point.row - first];
     const pointEnd = rowStarts[point.row - first + 1];
